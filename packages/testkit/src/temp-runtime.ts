@@ -1,0 +1,408 @@
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import {
+  spawn,
+  type ChildProcess,
+  type StdioOptions,
+} from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { Writable } from 'node:stream';
+
+const DEFAULT_PROCESS_TIMEOUT_MS = 5_000;
+const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+const daemonEntryPoint = fileURLToPath(
+  new URL('../../../services/daemon/src/index.ts', import.meta.url),
+);
+
+const isBootstrapSecretEnvironmentKey = (key: string): boolean => {
+  const normalizedKey = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const bootstrapIndex = normalizedKey.indexOf('bootstrap');
+  return (
+    bootstrapIndex >= 0 &&
+    normalizedKey.indexOf('secret', bootstrapIndex + 'bootstrap'.length) >= 0
+  );
+};
+
+const isStrictlyWithin = (parent: string, child: string): boolean => {
+  const relation = relative(parent, child);
+  return relation !== '' && !relation.startsWith('..') && !isAbsolute(relation);
+};
+
+const assertFixtureBoundary = (fixtureRoot: string): void => {
+  const tempRoot = realpathSync(tmpdir());
+  const resolvedFixtureRoot = realpathSync(fixtureRoot);
+
+  if (!isStrictlyWithin(tempRoot, resolvedFixtureRoot)) {
+    throw new Error('Test fixture must remain inside the operating-system temp directory');
+  }
+};
+
+export interface TempRuntime {
+  readonly rootDir: string;
+  readonly dataDir: string;
+  readonly runtimeDir: string;
+  readonly socketPath: string;
+  readonly alternateSocketPath: string;
+  spawnDaemon(options?: SpawnDaemonOptions): DaemonProcess;
+  cleanup(): Promise<void>;
+}
+
+export interface SpawnDaemonOptions {
+  readonly bootstrapSecret?: Buffer;
+  readonly bootstrapSecretChunks?: readonly Uint8Array[];
+  readonly socketPath?: string;
+  readonly dataDir?: string;
+  readonly additionalArguments?: readonly string[];
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly omitBootstrapFd?: boolean;
+}
+
+export interface ProcessExit {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+const withFailureGuard = async <T>(
+  promise: Promise<T>,
+  description: string | (() => string),
+  timeoutMs = DEFAULT_PROCESS_TIMEOUT_MS,
+): Promise<T> =>
+  await new Promise<T>((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => {
+      const currentDescription =
+        typeof description === 'function' ? description() : description;
+      rejectPromise(new Error(`Timed out waiting for ${currentDescription}`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolvePromise(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        rejectPromise(error);
+      },
+    );
+  });
+
+export class DaemonProcess {
+  readonly child: ChildProcess;
+  readonly bootstrapSecret: Buffer;
+  readonly launchArguments: readonly string[];
+  readonly launchEnvironment: Readonly<NodeJS.ProcessEnv>;
+
+  private readonly completionPromise: Promise<ProcessExit>;
+  private readonly readyPromise: Promise<void>;
+  private stdoutText = '';
+  private stderrText = '';
+  private stdoutLineBuffer = '';
+
+  constructor(
+    child: ChildProcess,
+    bootstrapSecret: Buffer,
+    launchArguments: readonly string[],
+    launchEnvironment: NodeJS.ProcessEnv,
+  ) {
+    this.child = child;
+    this.bootstrapSecret = Buffer.from(bootstrapSecret);
+    this.launchArguments = [...launchArguments];
+    this.launchEnvironment = { ...launchEnvironment };
+
+    child.stdout?.setEncoding('utf8');
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    let ready = false;
+    this.readyPromise = new Promise((resolvePromise, rejectPromise) => {
+      resolveReady = resolvePromise;
+      rejectReady = rejectPromise;
+    });
+    void this.readyPromise.catch(() => {
+      // A process-scaffolding test may intentionally stop before readiness.
+    });
+
+    child.stdout?.on('data', (chunk: string) => {
+      this.stdoutText = this.appendOutputTail(this.stdoutText, chunk);
+      this.stdoutLineBuffer += chunk;
+
+      while (this.stdoutLineBuffer.includes('\n')) {
+        const newlineIndex = this.stdoutLineBuffer.indexOf('\n');
+        const line = this.stdoutLineBuffer.slice(0, newlineIndex);
+        this.stdoutLineBuffer = this.stdoutLineBuffer.slice(newlineIndex + 1);
+
+        try {
+          const event: unknown = JSON.parse(line);
+          if (
+            typeof event === 'object' &&
+            event !== null &&
+            'event' in event &&
+            event.event === 'ready' &&
+            !ready
+          ) {
+            ready = true;
+            resolveReady();
+          }
+        } catch {
+          // Non-JSON output is retained for diagnostics but is not a ready signal.
+        }
+      }
+    });
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+      this.stderrText = this.appendOutputTail(this.stderrText, chunk);
+    });
+
+    this.completionPromise = new Promise((resolvePromise, rejectPromise) => {
+      child.once('error', (error) => {
+        if (!ready) {
+          rejectReady(error);
+        }
+        rejectPromise(error);
+      });
+      child.once('close', (code, signal) => {
+        if (!ready) {
+          rejectReady(new Error(`Daemon exited before ready. ${this.diagnostics()}`));
+        }
+        resolvePromise({ code, signal });
+      });
+    });
+    void this.completionPromise.catch(() => {
+      // The cached failure is observed by waitForExit/stop when the fixture is cleaned.
+    });
+  }
+
+  get stdout(): string {
+    return this.stdoutText;
+  }
+
+  get stderr(): string {
+    return this.stderrText;
+  }
+
+  async waitForExit(timeoutMs = DEFAULT_PROCESS_TIMEOUT_MS): Promise<ProcessExit> {
+    return await withFailureGuard(
+      this.completionPromise,
+      () => `daemon exit. ${this.diagnostics()}`,
+      timeoutMs,
+    );
+  }
+
+  async waitForReady(timeoutMs = DEFAULT_PROCESS_TIMEOUT_MS): Promise<void> {
+    await withFailureGuard(
+      this.readyPromise,
+      () => `daemon readiness. ${this.diagnostics()}`,
+      timeoutMs,
+    );
+  }
+
+  async stop(signal: NodeJS.Signals = 'SIGTERM'): Promise<ProcessExit> {
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      this.child.kill(signal);
+    }
+
+    try {
+      return await this.waitForExit();
+    } catch (error) {
+      if (signal === 'SIGKILL') {
+        throw error;
+      }
+
+      if (this.child.exitCode === null && this.child.signalCode === null) {
+        this.child.kill('SIGKILL');
+      }
+      return await this.waitForExit();
+    }
+  }
+
+  private appendOutputTail(current: string, chunk: string): string {
+    const combined = current + chunk;
+    const combinedBytes = Buffer.byteLength(combined, 'utf8');
+
+    if (combinedBytes <= MAX_CAPTURED_OUTPUT_BYTES) {
+      return combined;
+    }
+
+    return Buffer.from(combined, 'utf8')
+      .subarray(combinedBytes - MAX_CAPTURED_OUTPUT_BYTES)
+      .toString('utf8');
+  }
+
+  private diagnostics(): string {
+    const secretForms = [
+      this.bootstrapSecret.toString('utf8'),
+      this.bootstrapSecret.toString('hex'),
+      this.bootstrapSecret.toString('base64'),
+    ].filter((value) => value.length > 0);
+    let stdout = this.stdoutText;
+    let stderr = this.stderrText;
+
+    for (const secret of secretForms) {
+      stdout = stdout.split(secret).join('[REDACTED]');
+      stderr = stderr.split(secret).join('[REDACTED]');
+    }
+
+    return `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`;
+  }
+}
+
+const requireSecretPipe = (child: ChildProcess): Writable => {
+  const secretPipe = child.stdio[3];
+
+  if (secretPipe === null || typeof (secretPipe as Writable).end !== 'function') {
+    child.kill('SIGKILL');
+    throw new Error('Daemon child fd 3 pipe was not created');
+  }
+
+  return secretPipe as Writable;
+};
+
+export const createTempRuntime = (): TempRuntime => {
+  const tempRoot = realpathSync(tmpdir());
+  const rootDir = mkdtempSync(join(tempRoot, 'awb-'));
+  const dataDir = join(rootDir, 'd');
+  const runtimeDir = join(rootDir, 'r');
+  const socketPath = join(runtimeDir, 'd.sock');
+  const alternateSocketPath = join(runtimeDir, 'x.sock');
+
+  if (
+    Buffer.byteLength(socketPath) > MAX_UNIX_SOCKET_PATH_BYTES ||
+    Buffer.byteLength(alternateSocketPath) > MAX_UNIX_SOCKET_PATH_BYTES
+  ) {
+    rmSync(rootDir, { force: true, recursive: true });
+    throw new Error('Test fixture Unix socket path exceeds the portable byte limit');
+  }
+
+  chmodSync(rootDir, 0o700);
+  mkdirSync(dataDir, { mode: 0o700 });
+  mkdirSync(runtimeDir, { mode: 0o700 });
+  assertFixtureBoundary(rootDir);
+
+  let cleaned = false;
+  const daemons = new Set<DaemonProcess>();
+
+  return {
+    rootDir,
+    dataDir,
+    runtimeDir,
+    socketPath,
+    alternateSocketPath,
+    spawnDaemon(options: SpawnDaemonOptions = {}): DaemonProcess {
+      if (cleaned) {
+        throw new Error('Cannot spawn a daemon from a cleaned test fixture');
+      }
+
+      assertFixtureBoundary(rootDir);
+      const secretChunks = options.bootstrapSecretChunks?.map((chunk) =>
+        Buffer.from(chunk),
+      );
+      const chunkedSecret = secretChunks ? Buffer.concat(secretChunks) : undefined;
+      if (
+        options.bootstrapSecret &&
+        chunkedSecret &&
+        !options.bootstrapSecret.equals(chunkedSecret)
+      ) {
+        throw new Error('Explicit and chunked bootstrap secrets must match');
+      }
+      const bootstrapSecret =
+        options.bootstrapSecret ?? chunkedSecret ?? randomBytes(32);
+      const launchArguments = [
+        '--conditions=development',
+        '--import',
+        'tsx',
+        daemonEntryPoint,
+        '--socket',
+        options.socketPath ?? socketPath,
+        '--data-dir',
+        options.dataDir ?? dataDir,
+        ...(options.additionalArguments ?? []),
+      ];
+      const inheritedEnvironment = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => !isBootstrapSecretEnvironmentKey(key),
+        ),
+      );
+      const launchEnvironment = {
+        ...inheritedEnvironment,
+        ...options.environment,
+      };
+      const stdio: StdioOptions = options.omitBootstrapFd
+        ? ['ignore', 'pipe', 'pipe']
+        : ['ignore', 'pipe', 'pipe', 'pipe'];
+      const child = spawn(process.execPath, launchArguments, {
+        cwd: repositoryRoot,
+        env: launchEnvironment,
+        shell: false,
+        stdio,
+      });
+      const daemon = new DaemonProcess(
+        child,
+        bootstrapSecret,
+        launchArguments,
+        launchEnvironment,
+      );
+      daemons.add(daemon);
+
+      if (!options.omitBootstrapFd) {
+        const secretPipe = requireSecretPipe(child);
+        secretPipe.on('error', () => {
+          // A startup failure may close fd 3 before the parent finishes the bounded write.
+        });
+        if (!secretChunks) {
+          secretPipe.end(bootstrapSecret);
+        } else {
+          let chunkIndex = 0;
+          const writeNextChunk = (): void => {
+            const chunk = secretChunks[chunkIndex];
+            if (!chunk) {
+              secretPipe.end();
+              return;
+            }
+
+            chunkIndex += 1;
+            const canContinue = secretPipe.write(chunk);
+            if (canContinue) {
+              setImmediate(writeNextChunk);
+            } else {
+              secretPipe.once('drain', () => setImmediate(writeNextChunk));
+            }
+          };
+          writeNextChunk();
+        }
+      }
+
+      return daemon;
+    },
+    async cleanup(): Promise<void> {
+      if (cleaned) {
+        return;
+      }
+
+      const stopResults = await Promise.allSettled(
+        [...daemons].map(async (daemon) => await daemon.stop()),
+      );
+      const failures = stopResults.filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures.map((failure) => failure.reason),
+          'One or more daemon children failed to stop during test cleanup',
+        );
+      }
+
+      assertFixtureBoundary(rootDir);
+      rmSync(rootDir, { force: true, recursive: true });
+      cleaned = true;
+    },
+  };
+};

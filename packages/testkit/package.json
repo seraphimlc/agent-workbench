@@ -1,0 +1,25 @@
+{
+  "name": "@agent-workbench/testkit",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./temp-runtime": {
+      "types": "./src/temp-runtime.ts",
+      "development": "./src/temp-runtime.ts",
+      "default": "./dist/temp-runtime.js"
+    },
+    "./rpc-client": {
+      "types": "./src/rpc-client.ts",
+      "development": "./src/rpc-client.ts",
+      "default": "./dist/rpc-client.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@agent-workbench/protocol": "workspace:*"
+  }
+}
