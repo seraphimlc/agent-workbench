@@ -2,8 +2,15 @@ import type { RpcRequest } from '@agent-workbench/protocol';
 
 import { SessionService } from '../runtime/session-service.js';
 
+export interface RouterNotifier {
+  notify(): void;
+}
+
 export class Router {
-  constructor(private readonly sessions: SessionService) {}
+  constructor(
+    private readonly sessions: SessionService,
+    private readonly notifier?: RouterNotifier,
+  ) {}
 
   async handle(request: RpcRequest): Promise<unknown> {
     switch (request.method) {
@@ -22,18 +29,24 @@ export class Router {
           request.payload,
           request.clientRequestId,
         );
-      case 'session.create':
-        return this.sessions.createSession(
+      case 'session.create': {
+        const result = this.sessions.createSession(
           request.payload,
           request.clientRequestId,
         );
+        this.notifier?.notify();
+        return result;
+      }
       case 'session.getSnapshot':
         return this.sessions.getSnapshot(request.payload.sessionId);
-      case 'turn.enqueue':
-        return this.sessions.enqueueTurn(
+      case 'turn.enqueue': {
+        const result = this.sessions.enqueueTurn(
           request.payload,
           request.clientRequestId,
         );
+        this.notifier?.notify();
+        return result;
+      }
       case 'event.listAfter':
         return this.sessions.listEventsAfter(request.payload);
       case 'auth.respond':

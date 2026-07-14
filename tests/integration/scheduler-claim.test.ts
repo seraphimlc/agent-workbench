@@ -233,6 +233,7 @@ describe('single-slot Scheduler claim', () => {
       leaseId,
       daemonEpoch: DAEMON_EPOCH,
       leaseEpoch: 1,
+      executionFence: 1,
     });
 
     expect(
@@ -241,6 +242,7 @@ describe('single-slot Scheduler claim', () => {
       ...beforeFirstTurn,
       status: 'running',
       started_at: NOW,
+      execution_fence: Number(beforeFirstTurn.execution_fence) + 1,
     });
     expect(
       database.prepare('SELECT * FROM turns WHERE id = ?').get(second.turnId),
@@ -567,6 +569,9 @@ describe('single-slot Scheduler claim', () => {
       expect(
         database.prepare('SELECT COUNT(*) AS count FROM runner_leases').get(),
       ).toEqual({ count: 1 });
+      expect(
+        database.prepare('SELECT execution_fence AS executionFence FROM turns').get(),
+      ).toEqual({ executionFence: 1 });
       expect(
         database
           .prepare("SELECT COUNT(*) AS count FROM session_events WHERE type = 'turn.started'")

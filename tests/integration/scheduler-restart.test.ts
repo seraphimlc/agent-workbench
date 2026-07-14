@@ -302,6 +302,7 @@ describe('startup scheduler recovery', () => {
         ).toEqual({
           ...beforeTurn,
           status: 'interrupted',
+          execution_fence: Number(beforeTurn.execution_fence) + 1,
           finished_at: RECOVERY_TIME,
           error_code: null,
           error_message: null,
@@ -777,7 +778,11 @@ describe('startup scheduler recovery', () => {
         recoverySourceTurnId: fixture.turnId,
       });
       expect(snapshot.turns).toEqual([
-        expect.objectContaining({ id: fixture.turnId, status: 'interrupted' }),
+        expect.objectContaining({
+          id: fixture.turnId,
+          status: 'interrupted',
+          executionFence: 2,
+        }),
         expect.objectContaining({ id: fixture.queuedTurnId, status: 'queued' }),
       ]);
       expect(snapshot.events.slice(-2).map((event) => event.type)).toEqual([

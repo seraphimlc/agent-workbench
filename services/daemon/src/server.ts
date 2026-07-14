@@ -31,6 +31,10 @@ import {
 import { mapRpcFailure } from './db/errors.js';
 import { Authenticator } from './rpc/authenticator.js';
 import { Router } from './rpc/router.js';
+import {
+  ExecutionCoordinator,
+  type ExecutionDriver,
+} from './runtime/execution-coordinator.js';
 import { Scheduler } from './runtime/scheduler.js';
 import {
   acquireRuntimeLock,
@@ -46,6 +50,7 @@ import {
   type StartupRecovery,
   type StartupRecoveryHooks,
 } from './runtime/startup-recovery.js';
+import { TurnTerminalizer } from './runtime/turn-terminalizer.js';
 
 const MAX_IN_FLIGHT_REQUESTS = 128;
 const FULL_CLOSE_FALLBACK_MS = 500;
@@ -67,6 +72,7 @@ export interface DaemonServerOptions {
   ) => Promise<void>;
   readonly recoverStartup?: StartupRecovery;
   readonly closeDatabase?: (database: Database.Database) => void | Promise<void>;
+  readonly executionDriver?: ExecutionDriver;
 }
 
 export class DaemonStartCancelledError extends Error {
@@ -90,6 +96,7 @@ type ConnectionContext = {
   inFlightRequests: number;
   overflowed: boolean;
   overflowResponseWritten: boolean;
+  authenticatedCounted: boolean;
 };
 
 class IngressQuiescence {
@@ -213,6 +220,7 @@ export class DaemonServer {
   private readonly closeDatabase: (
     database: Database.Database,
   ) => void | Promise<void>;
+  private readonly executionDriver: ExecutionDriver | undefined;
   private readonly router = {
     handle: async (request: RpcRequest): Promise<unknown> => {
       const databaseRouter = this.databaseRouter;
@@ -227,6 +235,7 @@ export class DaemonServer {
   private server: Server | undefined;
   private database: Database.Database | undefined;
   private scheduler: Scheduler | undefined;
+  private executionCoordinator: ExecutionCoordinator | undefined;
   private databaseRouter: Router | undefined;
   private runtimeLock: RuntimeLock | undefined;
   private activeSocketPath: string | undefined;
@@ -237,6 +246,7 @@ export class DaemonServer {
   private cleanupPromise: Promise<void> | undefined;
   private stopRequested = false;
   private listenAbortController: AbortController | undefined;
+  private authenticatedControlConnectionCount = 0;
 
   constructor(options: DaemonServerOptions) {
     this.requestedSocketPath = resolve(options.socketPath);
@@ -255,6 +265,7 @@ export class DaemonServer {
       ((database) => {
         database.close();
       });
+    this.executionDriver = options.executionDriver;
   }
 
   async start(): Promise<void> {
@@ -294,8 +305,27 @@ export class DaemonServer {
       this.scheduler = new Scheduler(this.database, {
         daemonEpoch: this.daemonEpoch,
       });
+      const terminalizer = new TurnTerminalizer(this.database, {
+        onCommitted: () => {
+          this.executionCoordinator?.notify();
+        },
+      });
+      const coordinator = new ExecutionCoordinator({
+        scheduler: this.scheduler,
+        authenticatedControlConnectionCount: () =>
+          this.authenticatedControlConnectionCount,
+        ...(this.executionDriver
+          ? { executionDriver: this.executionDriver }
+          : {}),
+        terminalizer,
+        onError: (error) => {
+          this.handleExecutionError(error);
+        },
+      });
+      this.executionCoordinator = coordinator;
       this.databaseRouter = new Router(
         new SessionService(this.database, this.sessionServiceHooks),
+        coordinator,
       );
       this.activeSocketPath = this.prepareSocketBoundary();
       this.throwIfStopRequested();
@@ -417,6 +447,12 @@ export class DaemonServer {
     let databaseClosed = this.database === undefined;
 
     try {
+      try {
+        this.executionCoordinator?.quiesce();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+
       const server = this.server;
       const closePromise =
         server && server.listening
@@ -430,6 +466,12 @@ export class DaemonServer {
       }
       try {
         await closePromise;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+
+      try {
+        await this.executionDriver?.shutdown();
       } catch (error) {
         cleanupErrors.push(error);
       }
@@ -562,9 +604,14 @@ export class DaemonServer {
       inFlightRequests: 0,
       overflowed: false,
       overflowResponseWritten: false,
+      authenticatedCounted: false,
     };
     this.connections.add(socket);
     socket.on('close', () => {
+      if (context.authenticatedCounted) {
+        context.authenticatedCounted = false;
+        this.authenticatedControlConnectionCount -= 1;
+      }
       context.authenticator.destroy();
       this.connections.delete(socket);
     });
@@ -651,6 +698,15 @@ export class DaemonServer {
         context.authenticator.reject();
         this.failAuthentication(socket, request);
         return;
+      }
+
+      if (!context.authenticatedCounted) {
+        const previousCount = this.authenticatedControlConnectionCount;
+        context.authenticatedCounted = true;
+        this.authenticatedControlConnectionCount += 1;
+        if (previousCount === 0) {
+          this.executionCoordinator?.notify();
+        }
       }
 
       void this.writeResponse(
@@ -791,6 +847,15 @@ export class DaemonServer {
         encodeFrame(createAuthFailureResponse(request)),
       );
     }
+  }
+
+  private handleExecutionError(error: unknown): void {
+    const executionError =
+      error instanceof Error ? error : new Error('Execution coordinator failed');
+    void this.stop().then(
+      () => this.onFatal(executionError),
+      () => this.onFatal(executionError),
+    );
   }
 
   private endOverflowedConnectionWhenDrained(

@@ -1,7 +1,9 @@
 import type Database from 'better-sqlite3';
-import { v7 as uuidv7 } from 'uuid';
 
-const SLOT_NO = 1;
+import type { Claim } from './scheduler.js';
+import { TurnTerminalizer } from './turn-terminalizer.js';
+
+const SLOT_NO = 1 as const;
 
 type SlotRow = {
   readonly slotNo: number;
@@ -14,6 +16,7 @@ type ActiveTurnRow = {
   readonly sessionId: string;
   readonly status: 'running' | 'cancel_requested';
   readonly queueKind: string;
+  readonly executionFence: number;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
   readonly errorCode: string | null;
@@ -27,8 +30,6 @@ type ActiveSessionRow = {
   readonly queueBlockReason: string | null;
   readonly recoveryEpisode: number;
   readonly currentTurnId: string | null;
-  readonly nextEventSeq: number;
-  readonly revision: number;
 };
 
 type ActiveLeaseRow = {
@@ -54,6 +55,7 @@ type RecoveredTurnRow = {
   readonly sessionId: string;
   readonly queueKind: string;
   readonly status: string;
+  readonly executionFence: number;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
   readonly errorCode: string | null;
@@ -103,15 +105,16 @@ export class StartupRecoveryInvariantError extends Error {
   }
 }
 
-const expectOneChange = (
-  result: Database.RunResult,
-  operation: string,
-): void => {
-  if (result.changes !== 1) {
-    throw new StartupRecoveryInvariantError(
-      `${operation} affected ${result.changes} rows`,
-    );
+const parsePayload = (payloadJson: string): Record<string, unknown> => {
+  try {
+    const payload = JSON.parse(payloadJson) as unknown;
+    if (typeof payload === 'object' && payload !== null && !Array.isArray(payload)) {
+      return payload as Record<string, unknown>;
+    }
+  } catch {
+    // Fall through to the fail-closed invariant below.
   }
+  throw new StartupRecoveryInvariantError('recovery Event payload is invalid');
 };
 
 const assertRecoveredStatesAreComplete = (
@@ -151,6 +154,7 @@ const assertRecoveredStatesAreComplete = (
       .prepare(
         `SELECT id AS turnId, session_id AS sessionId,
                 queue_kind AS queueKind, status,
+                execution_fence AS executionFence,
                 started_at AS startedAt, finished_at AS finishedAt,
                 error_code AS errorCode, error_message AS errorMessage,
                 result_message_id AS resultMessageId
@@ -161,15 +165,13 @@ const assertRecoveredStatesAreComplete = (
         session.recoverySourceTurnId,
         session.sessionId,
       ) as RecoveredTurnRow[];
-    if (recoveredTurns.length !== 1) {
-      throw new StartupRecoveryInvariantError(
-        'already-recovered source Turn is missing or mismatched',
-      );
-    }
-    const turn = recoveredTurns[0] as RecoveredTurnRow;
+    const turn = recoveredTurns[0];
     if (
+      recoveredTurns.length !== 1 ||
+      !turn ||
       turn.queueKind !== 'normal' ||
       turn.status !== 'interrupted' ||
+      turn.executionFence < 2 ||
       turn.startedAt === null ||
       turn.finishedAt === null ||
       turn.errorCode !== null ||
@@ -227,18 +229,25 @@ const assertRecoveredStatesAreComplete = (
       interruptedEvent.blobId !== null ||
       detectedEvent.blobId !== null ||
       interruptedEvent.createdAt !== turn.finishedAt ||
-      detectedEvent.createdAt !== turn.finishedAt ||
-      interruptedEvent.payloadJson !==
-        JSON.stringify({ reason: 'daemon_restart' }) ||
-      detectedEvent.payloadJson !==
-        JSON.stringify({
-          reason: 'daemon_restart',
-          recoveryEpisode: session.recoveryEpisode,
-          recoverySourceTurnId: turn.turnId,
-        })
+      detectedEvent.createdAt !== turn.finishedAt
     ) {
       throw new StartupRecoveryInvariantError(
         'already-recovered Event projection is incomplete',
+      );
+    }
+    const interruptedPayload = parsePayload(interruptedEvent.payloadJson);
+    const detectedPayload = parsePayload(detectedEvent.payloadJson);
+    if (
+      Object.keys(interruptedPayload).length !== 1 ||
+      typeof interruptedPayload.reason !== 'string' ||
+      interruptedPayload.reason.length === 0 ||
+      Object.keys(detectedPayload).length !== 3 ||
+      detectedPayload.reason !== interruptedPayload.reason ||
+      detectedPayload.recoveryEpisode !== session.recoveryEpisode ||
+      detectedPayload.recoverySourceTurnId !== turn.turnId
+    ) {
+      throw new StartupRecoveryInvariantError(
+        'already-recovered Event payload is incomplete',
       );
     }
 
@@ -257,235 +266,145 @@ const assertRecoveredStatesAreComplete = (
   }
 };
 
+const inspectStartupState = (
+  database: Database.Database,
+  daemonEpoch: string,
+): Claim | null => {
+  assertRecoveredStatesAreComplete(database, daemonEpoch);
+
+  const slots = database
+    .prepare(
+      `SELECT slot_no AS slotNo, state, owner_turn_id AS ownerTurnId
+       FROM scheduler_slots ORDER BY slot_no`,
+    )
+    .all() as SlotRow[];
+  if (slots.length !== 1 || slots[0]?.slotNo !== SLOT_NO) {
+    throw new StartupRecoveryInvariantError('slot 1 is missing or duplicated');
+  }
+  const slot = slots[0];
+  const activeTurns = database
+    .prepare(
+      `SELECT id AS turnId, session_id AS sessionId, status,
+              queue_kind AS queueKind, execution_fence AS executionFence,
+              started_at AS startedAt, finished_at AS finishedAt,
+              error_code AS errorCode, error_message AS errorMessage,
+              result_message_id AS resultMessageId
+       FROM turns
+       WHERE status IN ('running', 'cancel_requested')
+       ORDER BY id`,
+    )
+    .all() as ActiveTurnRow[];
+  const activeSessions = database
+    .prepare(
+      `SELECT id AS sessionId, runtime_status AS runtimeStatus,
+              queue_block_reason AS queueBlockReason,
+              recovery_episode AS recoveryEpisode,
+              current_turn_id AS currentTurnId
+       FROM sessions
+       WHERE current_turn_id IS NOT NULL
+          OR runtime_status IN ('running', 'canceling')
+       ORDER BY id`,
+    )
+    .all() as ActiveSessionRow[];
+  const activeLeases = database
+    .prepare(
+      `SELECT id AS leaseId, daemon_epoch AS daemonEpoch,
+              lease_epoch AS leaseEpoch, session_id AS sessionId,
+              current_turn_id AS turnId
+       FROM runner_leases
+       WHERE status = 'active'
+       ORDER BY id`,
+    )
+    .all() as ActiveLeaseRow[];
+
+  if (
+    slot.state === 'free' &&
+    slot.ownerTurnId === null &&
+    activeTurns.length === 0 &&
+    activeSessions.length === 0 &&
+    activeLeases.length === 0
+  ) {
+    return null;
+  }
+  if (
+    slot.state !== 'owned' ||
+    slot.ownerTurnId === null ||
+    activeTurns.length !== 1 ||
+    activeSessions.length !== 1 ||
+    activeLeases.length !== 1
+  ) {
+    throw new StartupRecoveryInvariantError(
+      'persistent ownership facts do not form one complete tuple',
+    );
+  }
+
+  const turn = activeTurns[0] as ActiveTurnRow;
+  const session = activeSessions[0] as ActiveSessionRow;
+  const lease = activeLeases[0] as ActiveLeaseRow;
+  const expectedRuntimeStatus =
+    turn.status === 'running' ? 'running' : 'canceling';
+  if (lease.daemonEpoch === daemonEpoch) {
+    throw new StartupRecoveryInvariantError(
+      'active Lease already uses the new daemon epoch',
+    );
+  }
+  if (
+    slot.ownerTurnId !== turn.turnId ||
+    turn.queueKind !== 'normal' ||
+    turn.executionFence <= 0 ||
+    turn.startedAt === null ||
+    turn.finishedAt !== null ||
+    turn.errorCode !== null ||
+    turn.errorMessage !== null ||
+    turn.resultMessageId !== null ||
+    session.sessionId !== turn.sessionId ||
+    session.currentTurnId !== turn.turnId ||
+    session.runtimeStatus !== expectedRuntimeStatus ||
+    session.queueBlockReason !== null ||
+    lease.sessionId !== turn.sessionId ||
+    lease.turnId !== turn.turnId
+  ) {
+    throw new StartupRecoveryInvariantError(
+      'persistent ownership tuple is inconsistent',
+    );
+  }
+  return {
+    slotNo: SLOT_NO,
+    sessionId: turn.sessionId,
+    turnId: turn.turnId,
+    leaseId: lease.leaseId,
+    daemonEpoch: lease.daemonEpoch,
+    leaseEpoch: lease.leaseEpoch,
+    executionFence: turn.executionFence,
+  };
+};
+
 export const recoverStartupState: StartupRecovery = (database, options) => {
-  const recover = database.transaction(() => {
-    const slotRows = database
-      .prepare(
-        `SELECT slot_no AS slotNo, state, owner_turn_id AS ownerTurnId
-         FROM scheduler_slots
-         ORDER BY slot_no`,
-      )
-      .all() as SlotRow[];
-    if (slotRows.length !== 1 || slotRows[0]?.slotNo !== SLOT_NO) {
-      throw new StartupRecoveryInvariantError('slot 1 is missing or duplicated');
-    }
-    const slot = slotRows[0];
-    const activeTurns = database
-      .prepare(
-        `SELECT id AS turnId, session_id AS sessionId, status,
-                queue_kind AS queueKind, started_at AS startedAt,
-                finished_at AS finishedAt, error_code AS errorCode,
-                error_message AS errorMessage,
-                result_message_id AS resultMessageId
-         FROM turns
-         WHERE status IN ('running', 'cancel_requested')
-         ORDER BY id`,
-      )
-      .all() as ActiveTurnRow[];
-    const activeSessions = database
-      .prepare(
-        `SELECT id AS sessionId, runtime_status AS runtimeStatus,
-                queue_block_reason AS queueBlockReason,
-                recovery_episode AS recoveryEpisode,
-                current_turn_id AS currentTurnId,
-                next_event_seq AS nextEventSeq, revision
-         FROM sessions
-         WHERE current_turn_id IS NOT NULL
-            OR runtime_status IN ('running', 'canceling')
-         ORDER BY id`,
-      )
-      .all() as ActiveSessionRow[];
-    const activeLeases = database
-      .prepare(
-        `SELECT id AS leaseId, daemon_epoch AS daemonEpoch,
-                lease_epoch AS leaseEpoch, session_id AS sessionId,
-                current_turn_id AS turnId
-         FROM runner_leases
-         WHERE status = 'active'
-         ORDER BY id`,
-      )
-      .all() as ActiveLeaseRow[];
+  const inspect = database.transaction(() =>
+    inspectStartupState(database, options.daemonEpoch),
+  );
+  const binding = inspect.immediate();
+  if (!binding) {
+    return;
+  }
 
-    assertRecoveredStatesAreComplete(database, options.daemonEpoch);
-
-    if (
-      slot.state === 'free' &&
-      slot.ownerTurnId === null &&
-      activeTurns.length === 0 &&
-      activeSessions.length === 0 &&
-      activeLeases.length === 0
-    ) {
-      return;
-    }
-
-    if (
-      slot.state !== 'owned' ||
-      slot.ownerTurnId === null ||
-      activeTurns.length !== 1 ||
-      activeSessions.length !== 1 ||
-      activeLeases.length !== 1
-    ) {
-      throw new StartupRecoveryInvariantError(
-        'persistent ownership facts do not form one complete tuple',
-      );
-    }
-
-    const turn = activeTurns[0] as ActiveTurnRow;
-    const session = activeSessions[0] as ActiveSessionRow;
-    const lease = activeLeases[0] as ActiveLeaseRow;
-    const expectedRuntimeStatus =
-      turn.status === 'running' ? 'running' : 'canceling';
-    if (lease.daemonEpoch === options.daemonEpoch) {
-      throw new StartupRecoveryInvariantError(
-        'active Lease already uses the new daemon epoch',
-      );
-    }
-    if (
-      slot.ownerTurnId !== turn.turnId ||
-      turn.queueKind !== 'normal' ||
-      turn.startedAt === null ||
-      turn.finishedAt !== null ||
-      turn.errorCode !== null ||
-      turn.errorMessage !== null ||
-      turn.resultMessageId !== null ||
-      session.sessionId !== turn.sessionId ||
-      session.currentTurnId !== turn.turnId ||
-      session.runtimeStatus !== expectedRuntimeStatus ||
-      session.queueBlockReason !== null ||
-      lease.sessionId !== turn.sessionId ||
-      lease.turnId !== turn.turnId
-    ) {
-      throw new StartupRecoveryInvariantError(
-        'persistent ownership tuple is inconsistent',
-      );
-    }
-
-    const now = (options.now?.() ?? new Date()).toISOString();
-    const createId = options.createId ?? uuidv7;
-    const interruptedEventId = createId();
-    const recoveryEventId = createId();
-    const recoveryEpisode = session.recoveryEpisode + 1;
-
-    expectOneChange(
-      database
-        .prepare(
-          `UPDATE turns
-           SET status = 'interrupted', finished_at = ?,
-               error_code = NULL, error_message = NULL, result_message_id = NULL
-           WHERE id = ? AND session_id = ? AND status = ?
-             AND queue_kind = 'normal' AND started_at = ?
-             AND finished_at IS NULL AND error_code IS NULL
-             AND error_message IS NULL AND result_message_id IS NULL`,
-        )
-        .run(
-          now,
-          turn.turnId,
-          turn.sessionId,
-          turn.status,
-          turn.startedAt,
-        ),
-      'Turn recovery CAS',
-    );
-    expectOneChange(
-      database
-        .prepare(
-          `UPDATE runner_leases
-           SET status = 'expired', lease_expires_at = ?
-           WHERE id = ? AND daemon_epoch = ? AND lease_epoch = ?
-             AND session_id = ? AND current_turn_id = ? AND status = 'active'`,
-        )
-        .run(
-          now,
-          lease.leaseId,
-          lease.daemonEpoch,
-          lease.leaseEpoch,
-          lease.sessionId,
-          lease.turnId,
-        ),
-      'Lease recovery CAS',
-    );
-    expectOneChange(
-      database
-        .prepare(
-          `UPDATE scheduler_slots
-           SET state = 'free', owner_turn_id = NULL, updated_at = ?
-           WHERE slot_no = ? AND state = 'owned' AND owner_turn_id = ?`,
-        )
-        .run(now, SLOT_NO, turn.turnId),
-      'slot recovery CAS',
-    );
-    expectOneChange(
-      database
-        .prepare(
-          `UPDATE sessions
-           SET current_turn_id = NULL,
-               queue_block_reason = 'recovery_review',
-               recovery_episode = recovery_episode + 1,
-               recovery_source_turn_id = ?, runtime_status = 'recovering',
-               next_event_seq = next_event_seq + 2,
-               revision = revision + 1, updated_at = ?
-           WHERE id = ? AND current_turn_id = ? AND runtime_status = ?
-             AND queue_block_reason IS NULL AND recovery_episode = ?
-             AND next_event_seq = ? AND revision = ?`,
-        )
-        .run(
-          turn.turnId,
-          now,
-          session.sessionId,
-          turn.turnId,
-          session.runtimeStatus,
-          session.recoveryEpisode,
-          session.nextEventSeq,
-          session.revision,
-        ),
-      'Session recovery CAS',
-    );
-    expectOneChange(
-      database
-        .prepare(
-          `INSERT INTO session_events (
-            id, session_id, turn_id, tool_run_id, seq, type, actor, audience,
-            payload_json, blob_id, created_at
-          ) VALUES (?, ?, ?, NULL, ?, 'turn.interrupted', 'daemon', 'both', ?, NULL, ?)`,
-        )
-        .run(
-          interruptedEventId,
-          session.sessionId,
-          turn.turnId,
-          session.nextEventSeq,
-          JSON.stringify({ reason: 'daemon_restart' }),
-          now,
-        ),
-      'turn.interrupted Event insert',
-    );
-    expectOneChange(
-      database
-        .prepare(
-          `INSERT INTO session_events (
-            id, session_id, turn_id, tool_run_id, seq, type, actor, audience,
-            payload_json, blob_id, created_at
-          ) VALUES (?, ?, ?, NULL, ?, 'recovery.detected', 'daemon', 'both', ?, NULL, ?)`,
-        )
-        .run(
-          recoveryEventId,
-          session.sessionId,
-          turn.turnId,
-          session.nextEventSeq + 1,
-          JSON.stringify({
-            reason: 'daemon_restart',
-            recoveryEpisode,
-            recoverySourceTurnId: turn.turnId,
-          }),
-          now,
-        ),
-      'recovery.detected Event insert',
-    );
-
-    options.hooks?.beforeCommit?.({
-      sessionId: session.sessionId,
-      turnId: turn.turnId,
-    });
+  const terminalizer = new TurnTerminalizer(database, {
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.createId ? { createId: options.createId } : {}),
+    hooks: {
+      afterWriteGroup: (group) => {
+        if (group === 'events') {
+          options.hooks?.beforeCommit?.({
+            sessionId: binding.sessionId,
+            turnId: binding.turnId,
+          });
+        }
+      },
+    },
   });
-
-  recover.immediate();
+  terminalizer.interrupt({
+    binding,
+    reason: 'daemon_restart',
+    executorExited: true,
+  });
 };

@@ -9,6 +9,7 @@ type ActiveTurnRow = {
   readonly sessionId: string;
   readonly status: 'running' | 'cancel_requested';
   readonly queueKind: string;
+  readonly executionFence: number;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
   readonly errorCode: string | null;
@@ -47,6 +48,7 @@ type CandidateRow = {
   readonly errorCode: string | null;
   readonly errorMessage: string | null;
   readonly resultMessageId: string | null;
+  readonly executionFence: number;
   readonly nextEventSeq: number;
   readonly revision: number;
 };
@@ -58,6 +60,7 @@ export interface Claim {
   readonly leaseId: string;
   readonly daemonEpoch: string;
   readonly leaseEpoch: number;
+  readonly executionFence: number;
 }
 
 export interface SchedulerOptions {
@@ -137,7 +140,8 @@ export class Scheduler {
       candidate.finishedAt !== null ||
       candidate.errorCode !== null ||
       candidate.errorMessage !== null ||
-      candidate.resultMessageId !== null
+      candidate.resultMessageId !== null ||
+      candidate.executionFence !== 0
     ) {
       throw new SchedulerInvariantError(
         'queued candidate has active or terminal projection fields',
@@ -167,9 +171,11 @@ export class Scheduler {
       this.database
         .prepare(
           `UPDATE turns
-           SET status = 'running', started_at = ?
+           SET status = 'running', started_at = ?,
+               execution_fence = execution_fence + 1
            WHERE id = ? AND session_id = ? AND ordinal = ?
              AND status = 'queued' AND queue_kind = 'normal'
+             AND execution_fence = ?
              AND started_at IS NULL AND finished_at IS NULL
              AND error_code IS NULL AND error_message IS NULL
              AND result_message_id IS NULL`,
@@ -179,6 +185,7 @@ export class Scheduler {
           candidate.turnId,
           candidate.sessionId,
           candidate.ordinal,
+          candidate.executionFence,
         ),
       'Turn claim CAS',
     );
@@ -251,6 +258,7 @@ export class Scheduler {
       leaseId,
       daemonEpoch: this.daemonEpoch,
       leaseEpoch,
+      executionFence: candidate.executionFence + 1,
     };
   }
 
@@ -272,7 +280,8 @@ export class Scheduler {
     return this.database
       .prepare(
         `SELECT id AS turnId, session_id AS sessionId, status,
-                queue_kind AS queueKind, started_at AS startedAt,
+                queue_kind AS queueKind, execution_fence AS executionFence,
+                started_at AS startedAt,
                 finished_at AS finishedAt, error_code AS errorCode,
                 error_message AS errorMessage,
                 result_message_id AS resultMessageId
@@ -336,6 +345,7 @@ export class Scheduler {
     if (
       turn.turnId !== slot.ownerTurnId ||
       turn.queueKind !== 'normal' ||
+      turn.executionFence <= 0 ||
       turn.startedAt === null ||
       turn.finishedAt !== null ||
       turn.errorCode !== null ||
@@ -358,6 +368,7 @@ export class Scheduler {
       .prepare(
         `SELECT turns.id AS turnId, turns.session_id AS sessionId,
                 turns.ordinal, turns.queue_kind AS queueKind,
+                turns.execution_fence AS executionFence,
                 turns.started_at AS startedAt,
                 turns.finished_at AS finishedAt,
                 turns.error_code AS errorCode,
