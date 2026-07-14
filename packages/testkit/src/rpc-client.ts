@@ -18,7 +18,8 @@ import {
 
 const DEFAULT_RPC_TIMEOUT_MS = 5_000;
 const MAX_RECEIVED_ENVELOPES = 1_024;
-const MAX_CAPTURED_ENVELOPE_BYTES = 2 * MAX_FRAME_BYTES;
+const FRAME_HEADER_BYTES = 4;
+const MAX_CAPTURED_WIRE_BYTES = 2 * (MAX_FRAME_BYTES + FRAME_HEADER_BYTES);
 
 export type AuthChallengeNotification = ReturnType<
   typeof AuthChallengeNotificationSchema.parse
@@ -59,7 +60,7 @@ export class RpcClient {
   private readonly decoder = new FrameDecoder();
   private readonly pendingResponses = new Map<string, PendingResponse>();
   private readonly capturedEnvelopes: RpcEnvelope[] = [];
-  private capturedEnvelopeBytes = 0;
+  private receivedWireBytes = 0;
   private readonly closePromise: Promise<void>;
   private readonly challengePromise: Promise<AuthChallengeNotification>;
   private resolveChallenge!: (challenge: AuthChallengeNotification) => void;
@@ -284,6 +285,16 @@ export class RpcClient {
   }
 
   private handleData(chunk: Buffer): void {
+    if (
+      this.receivedWireBytes + chunk.byteLength >
+      MAX_CAPTURED_WIRE_BYTES
+    ) {
+      this.fail(new Error('RPC client wire capture limit exceeded'));
+      this.socket.destroy();
+      return;
+    }
+    this.receivedWireBytes += chunk.byteLength;
+
     let values: unknown[];
 
     try {
@@ -308,24 +319,12 @@ export class RpcClient {
       }
 
       const envelope = parsedEnvelope.data;
-      let envelopeBytes: number;
-      try {
-        envelopeBytes = encodeFrame(envelope).byteLength;
-      } catch {
-        this.fail(new Error('RPC client could not size a received envelope'));
-        this.socket.destroy();
-        return;
-      }
-      if (
-        this.capturedEnvelopes.length >= MAX_RECEIVED_ENVELOPES ||
-        this.capturedEnvelopeBytes + envelopeBytes > MAX_CAPTURED_ENVELOPE_BYTES
-      ) {
+      if (this.capturedEnvelopes.length >= MAX_RECEIVED_ENVELOPES) {
         this.fail(new Error('RPC client envelope capture limit exceeded'));
         this.socket.destroy();
         return;
       }
       this.capturedEnvelopes.push(envelope);
-      this.capturedEnvelopeBytes += envelopeBytes;
 
       if (envelope.kind === 'notification' && envelope.method === 'auth.challenge') {
         const parsedChallenge = AuthChallengeNotificationSchema.safeParse(envelope);

@@ -18,6 +18,7 @@ import { getProcessStartIdentity } from '../../services/daemon/src/runtime/runti
 
 const CAPTURE_LIMIT_BYTES = 64 * 1024;
 const RPC_ENVELOPE_LIMIT = 1_024;
+const RPC_WIRE_CAPTURE_BUDGET = 2 * (MAX_FRAME_BYTES + 4);
 
 const waitForCondition = async (
   condition: () => boolean,
@@ -166,12 +167,15 @@ describe('testkit resource bounds', () => {
   });
 
   it(
-    'fails before retaining envelopes whose combined serialized bytes exceed the capture budget',
+    'fails before retaining envelopes whose combined wire bytes exceed the capture budget',
     async () => {
       let acceptedSocket: Socket | undefined;
       const largePayload = 'z'.repeat(Math.floor(MAX_FRAME_BYTES * 0.7));
       const server = createServer((socket) => {
         acceptedSocket = socket;
+        socket.on('error', () => {
+          // The client intentionally closes while the synthetic peer is writing.
+        });
         const frames = Array.from({ length: 3 }, (_, index) =>
           encodeFrame({
             kind: 'response',
@@ -198,7 +202,71 @@ describe('testkit resource bounds', () => {
         await once(socket, 'connect');
         await client.waitForClose(5_000);
 
-        expect(client.receivedEnvelopes).toHaveLength(2);
+        const retainedBytes = client.receivedEnvelopes.reduce(
+          (total, envelope) => total + encodeFrame(envelope).byteLength,
+          0,
+        );
+        expect(retainedBytes).toBeLessThanOrEqual(RPC_WIRE_CAPTURE_BUDGET);
+        expect(client.receivedEnvelopes.length).toBeLessThan(3);
+      } finally {
+        socket.destroy();
+        acceptedSocket?.destroy();
+        await new Promise<void>((resolvePromise) =>
+          server.close(() => resolvePromise()),
+        );
+      }
+    },
+    10_000,
+  );
+
+  it(
+    'retains a legal compact numeric wire frame without canonical reserialization expansion',
+    async () => {
+      let acceptedSocket: Socket | undefined;
+      const compactNumberCount = 800_000;
+      const compactNumbers = `${'1e20,'.repeat(compactNumberCount - 1)}1e20`;
+      const bodyText = JSON.stringify({
+        kind: 'response',
+        protocolVersion: 1,
+        requestId: randomUUID(),
+        traceId: randomUUID(),
+        ok: true,
+        result: { values: '__COMPACT_NUMBERS__' },
+      }).replace('"__COMPACT_NUMBERS__"', `[${compactNumbers}]`);
+      const body = Buffer.from(bodyText, 'utf8');
+      expect(body.byteLength).toBeLessThan(MAX_FRAME_BYTES);
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(body.byteLength, 0);
+      const server = createServer((socket) => {
+        acceptedSocket = socket;
+        socket.on('error', () => {
+          // Cleanup may close the client while the synthetic peer is flushing.
+        });
+        socket.write(Buffer.concat([header, body]));
+      });
+      await new Promise<void>((resolvePromise) => {
+        server.listen(0, '127.0.0.1', resolvePromise);
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('Test RPC server did not publish a TCP address');
+      }
+      const socket = createConnection(address.port, '127.0.0.1');
+      const client = new RpcClient(socket);
+
+      try {
+        await once(socket, 'connect');
+        const outcome = await Promise.race([
+          waitForCondition(
+            () => client.receivedEnvelopes.length === 1,
+            'compact numeric envelope retention',
+          ).then(() => 'retained' as const),
+          client.waitForClose().then(() => 'closed' as const),
+        ]);
+
+        expect(outcome).toBe('retained');
+        expect(client.receivedEnvelopes).toHaveLength(1);
+        await client.close();
       } finally {
         socket.destroy();
         acceptedSocket?.destroy();
