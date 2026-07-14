@@ -189,10 +189,12 @@ const insertActiveSubexecutions = (
   database: Database.Database,
   turn: Pick<ActiveFixture, 'sessionId' | 'turnId'>,
   options: {
-    readonly effectState?: 'not_applied' | 'unknown';
+    readonly effectState?: 'not_applied' | 'applied' | 'unknown';
+    readonly executionMode?: 'read_inline' | 'worker' | 'transactional_intrinsic';
     readonly worker?: boolean;
     readonly callOrdinal?: number;
     readonly dispatchState?: 'prepared' | 'worker_ready' | 'go_sent' | 'acknowledged';
+    readonly toolStatus?: 'queued' | 'running' | 'cancel_requested';
   } = {},
 ): { readonly callId: string; readonly attemptId: string; readonly toolRunId: string } => {
   const callId = 'model-call-active';
@@ -227,7 +229,14 @@ const insertActiveSubexecutions = (
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL)`,
     )
     .run(attemptId, callId, CLAIM_TIME);
-  const worker = options.worker ?? false;
+  const executionMode = options.executionMode ?? (options.worker ? 'worker' : 'read_inline');
+  const worker = executionMode === 'worker';
+  const toolStatus = options.toolStatus ?? 'running';
+  const toolId = worker
+    ? 'fs.write_text'
+    : executionMode === 'read_inline'
+      ? 'fs.read_text'
+      : 'runtime.test';
   database
     .prepare(
       `INSERT INTO tool_runs (
@@ -239,7 +248,7 @@ const insertActiveSubexecutions = (
         effect_state, pid, process_start_identity, error_code, error_message,
         queued_at, started_at, finished_at
       ) VALUES (?, ?, ?, 1, 'logical-call-1', ?, ?, 1,
-        'operation-1', ?, NULL, ?, '1', ?, ?, 'running', ?, ?,
+        'operation-1', ?, NULL, ?, '1', ?, ?, ?, ?, ?,
         'input-hash', '{}', NULL, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
     )
     .run(
@@ -249,14 +258,15 @@ const insertActiveSubexecutions = (
       callId,
       attemptId,
       worker ? 'idempotency-1' : null,
-      worker ? 'fs.write_text' : 'fs.read_text',
-      worker ? 'worker' : 'read_inline',
-      worker ? 'local_write' : 'read',
+      toolId,
+      executionMode,
+      executionMode === 'read_inline' ? 'read' : 'local_write',
+      toolStatus,
       worker ? (options.dispatchState ?? 'go_sent') : null,
       worker ? 'dispatch-1' : null,
       options.effectState ?? 'not_applied',
       CLAIM_TIME,
-      CLAIM_TIME,
+      toolStatus === 'queued' ? null : CLAIM_TIME,
     );
   return { callId, attemptId, toolRunId };
 };
@@ -1386,6 +1396,234 @@ describe('TurnTerminalizer', () => {
     }
   });
 
+  it.each([
+    {
+      name: 'worker prepared unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'prepared' as const,
+      effectState: 'unknown' as const,
+    },
+    {
+      name: 'worker ready unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'worker_ready' as const,
+      effectState: 'unknown' as const,
+    },
+    {
+      name: 'queued read_inline',
+      executionMode: 'read_inline' as const,
+      dispatchState: undefined,
+      effectState: 'not_applied' as const,
+    },
+    {
+      name: 'queued transactional intrinsic',
+      executionMode: 'transactional_intrinsic' as const,
+      dispatchState: undefined,
+      effectState: 'unknown' as const,
+    },
+  ])(
+    'cancels a deterministically unexecuted ToolRun on interrupt: $name',
+    async ({ executionMode, dispatchState, effectState }) => {
+      runtime = createTempRuntime();
+      const fixture = await createActiveFixture(runtime);
+      const active = insertActiveSubexecutions(fixture.database, fixture, {
+        executionMode,
+        ...(dispatchState ? { dispatchState } : {}),
+        effectState,
+        toolStatus: 'queued',
+      });
+      const terminalizer = new TurnTerminalizer(fixture.database, {
+        now: () => new Date(FINISH_TIME),
+        createId: createIdFactory('safe-interrupt'),
+      });
+
+      try {
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason: 'runner_lost',
+          executorExited: true,
+        });
+        expect(
+          fixture.database
+            .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
+            .get(active.toolRunId),
+        ).toEqual({ status: 'canceled', effect_state: 'not_applied' });
+        expect(
+          fixture.database
+            .prepare('SELECT type FROM session_events WHERE turn_id = ? ORDER BY seq DESC LIMIT 5')
+            .all(fixture.turnId)
+            .reverse(),
+        ).toEqual([
+          { type: 'model.attempt_interrupted' },
+          { type: 'model.interrupted' },
+          { type: 'tool.canceled' },
+          { type: 'turn.interrupted' },
+          { type: 'recovery.detected' },
+        ]);
+      } finally {
+        fixture.database.close();
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: 'GO-sent without a Resolution',
+      dispatchState: 'go_sent' as const,
+      resolution: null,
+    },
+    {
+      name: 'acknowledged with confirmed_not_applied',
+      dispatchState: 'acknowledged' as const,
+      resolution: 'confirmed_not_applied' as const,
+    },
+    {
+      name: 'GO-sent with confirmed_applied',
+      dispatchState: 'go_sent' as const,
+      resolution: 'confirmed_applied' as const,
+    },
+  ])(
+    'keeps a dispatched unknown ToolRun interrupted and append-only: $name',
+    async ({ dispatchState, resolution }) => {
+      runtime = createTempRuntime();
+      const fixture = await createActiveFixture(runtime);
+      const active = insertActiveSubexecutions(fixture.database, fixture, {
+        worker: true,
+        dispatchState,
+        effectState: 'unknown',
+        toolStatus: 'queued',
+      });
+      const terminalizer = new TurnTerminalizer(fixture.database, {
+        now: () => new Date(FINISH_TIME),
+        createId: createIdFactory('dispatched-interrupt'),
+      });
+
+      try {
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason: 'runner_lost',
+          executorExited: true,
+          ...(resolution
+            ? {
+                resolutions: [
+                  {
+                    resolutionKey: `dispatched-${resolution}`,
+                    toolRunId: active.toolRunId,
+                    resolution,
+                    evidence: { dispatchState },
+                  },
+                ],
+              }
+            : {}),
+        });
+        expect(
+          fixture.database
+            .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
+            .get(active.toolRunId),
+        ).toEqual({ status: 'interrupted', effect_state: 'unknown' });
+        expect(
+          fixture.database
+            .prepare('SELECT resolution FROM effect_resolutions WHERE tool_run_id = ?')
+            .all(active.toolRunId),
+        ).toEqual(resolution ? [{ resolution }] : []);
+        expect(
+          fixture.database
+            .prepare('SELECT type FROM session_events WHERE turn_id = ? ORDER BY seq DESC LIMIT 5')
+            .all(fixture.turnId)
+            .reverse(),
+        ).toEqual([
+          { type: 'model.attempt_interrupted' },
+          { type: 'model.interrupted' },
+          { type: 'tool.interrupted' },
+          { type: 'turn.interrupted' },
+          { type: 'recovery.detected' },
+        ]);
+      } finally {
+        fixture.database.close();
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: 'pre-GO applied effect',
+      dispatchState: 'prepared' as const,
+      effectState: 'applied' as const,
+    },
+    {
+      name: 'dispatched stale not_applied effect',
+      dispatchState: 'go_sent' as const,
+      effectState: 'not_applied' as const,
+    },
+  ])('rejects interrupt for an invalid worker tuple: $name', async ({
+    dispatchState,
+    effectState,
+  }) => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+      dispatchState,
+      effectState,
+      toolStatus: 'queued',
+    });
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('invalid-tool-interrupt'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason: 'runner_lost',
+          executorExited: true,
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects a confirmed_applied Resolution for a deterministically unexecuted ToolRun', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+      dispatchState: 'worker_ready',
+      effectState: 'unknown',
+      toolStatus: 'queued',
+    });
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('contradictory-resolution'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason: 'runner_lost',
+          executorExited: true,
+          resolutions: [
+            {
+              resolutionKey: 'pre-go-confirmed-applied',
+              toolRunId: active.toolRunId,
+              resolution: 'confirmed_applied',
+              evidence: { dispatchState: 'worker_ready' },
+            },
+          ],
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it('interrupts only after executor exit proof and appends ordered recovery events', async () => {
     runtime = createTempRuntime();
     const fixture = await createActiveFixture(runtime, { queuedFollower: true });
@@ -1428,7 +1666,7 @@ describe('TurnTerminalizer', () => {
         fixture.database.prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?').get(
           active.toolRunId,
         ),
-      ).toEqual({ status: 'interrupted', effect_state: 'unknown' });
+      ).toEqual({ status: 'canceled', effect_state: 'not_applied' });
       expect(
         fixture.database.prepare('SELECT resolution, actor FROM effect_resolutions').all(),
       ).toEqual([{ resolution: 'confirmed_not_applied', actor: 'daemon' }]);
@@ -1458,7 +1696,7 @@ describe('TurnTerminalizer', () => {
       ).toEqual([
         { type: 'model.attempt_interrupted' },
         { type: 'model.interrupted' },
-        { type: 'tool.interrupted' },
+        { type: 'tool.canceled' },
         { type: 'turn.interrupted' },
         { type: 'recovery.detected' },
       ]);

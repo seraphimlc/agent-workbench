@@ -154,7 +154,7 @@ export class ExecutionRepository {
     if (!row) {
       throw new TurnTerminalizationInvariantError('active tuple is missing');
     }
-    this.assertExecutionOwnership(binding);
+    this.assertTurnExecutionOwnership(binding);
 
     const counts = this.database
       .prepare(
@@ -207,9 +207,10 @@ export class ExecutionRepository {
     return row;
   }
 
-  private assertExecutionOwnership(
+  assertTurnExecutionOwnership(
     binding: Pick<Claim, 'sessionId' | 'turnId'>,
   ): void {
+    this.assertCallerTransaction();
     const invalid = this.database
       .prepare(
         `SELECT

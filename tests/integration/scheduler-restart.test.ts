@@ -166,10 +166,172 @@ const captureFacts = (database: RuntimeDatabase): string =>
       .all(),
     slots: database.prepare('SELECT * FROM scheduler_slots ORDER BY slot_no').all(),
     leases: database.prepare('SELECT * FROM runner_leases ORDER BY id').all(),
+    modelCalls: database.prepare('SELECT * FROM model_calls ORDER BY id').all(),
+    modelAttempts: database.prepare('SELECT * FROM model_attempts ORDER BY id').all(),
+    modelToolCalls: database
+      .prepare('SELECT * FROM model_tool_calls ORDER BY model_attempt_id, call_index')
+      .all(),
+    toolRuns: database.prepare('SELECT * FROM tool_runs ORDER BY id').all(),
+    effectResolutions: database
+      .prepare('SELECT * FROM effect_resolutions ORDER BY id')
+      .all(),
     idempotency: database
       .prepare('SELECT * FROM rpc_idempotency ORDER BY method, client_request_id')
       .all(),
   });
+
+const insertRecoveredTerminalCall = (
+  database: RuntimeDatabase,
+  fixture: Pick<ActiveFixture, 'sessionId' | 'turnId'>,
+  options: {
+    readonly callId?: string;
+    readonly ordinal?: number;
+    readonly finishedAt?: string | null;
+  } = {},
+): string => {
+  const callId = options.callId ?? 'recovered-terminal-call';
+  database
+    .prepare(
+      `INSERT INTO model_calls (
+        id, session_id, turn_id, ordinal, kind, status,
+        profile_snapshot_json, input_json, result_json,
+        successful_attempt_id, error_code, error_message,
+        created_at, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, 'craft', 'interrupted', '{}', '{}', NULL,
+        NULL, NULL, NULL, ?, ?, ?)`,
+    )
+    .run(
+      callId,
+      fixture.sessionId,
+      fixture.turnId,
+      options.ordinal ?? 1,
+      CLAIM_TIME,
+      CLAIM_TIME,
+      options.finishedAt === undefined ? RECOVERY_TIME : options.finishedAt,
+    );
+  return callId;
+};
+
+const insertRecoveredSucceededSource = (
+  database: RuntimeDatabase,
+  fixture: Pick<ActiveFixture, 'sessionId' | 'turnId'>,
+  toolId: string,
+): { readonly callId: string; readonly attemptId: string } => {
+  const callId = 'recovered-source-call';
+  const attemptId = 'recovered-source-attempt';
+  const result = JSON.stringify({
+    finishReason: 'tool_calls',
+    content: '',
+    toolCalls: [{ logicalCallId: 'recovered-logical-call', toolId }],
+  });
+  const transaction = database.transaction(() => {
+    database
+      .prepare(
+        `INSERT INTO model_calls (
+          id, session_id, turn_id, ordinal, kind, status,
+          profile_snapshot_json, input_json, result_json,
+          successful_attempt_id, error_code, error_message,
+          created_at, started_at, finished_at
+        ) VALUES (?, ?, ?, 1, 'craft', 'succeeded', '{}', '{}', ?,
+          NULL, NULL, NULL, ?, ?, ?)`,
+      )
+      .run(
+        callId,
+        fixture.sessionId,
+        fixture.turnId,
+        result,
+        CLAIM_TIME,
+        CLAIM_TIME,
+        CLAIM_TIME,
+      );
+    database
+      .prepare(
+        `INSERT INTO model_attempts (
+          id, model_call_id, attempt, status, provider_request_id,
+          partial_output_json, result_json, finish_reason,
+          input_tokens, output_tokens, cached_tokens, latency_ms,
+          error_code, error_message, retryable, started_at, finished_at
+        ) VALUES (?, ?, 1, 'succeeded', NULL, NULL, ?, 'tool_calls',
+          1, 1, 0, 1, NULL, NULL, 0, ?, ?)`,
+      )
+      .run(attemptId, callId, result, CLAIM_TIME, CLAIM_TIME);
+    database
+      .prepare('UPDATE model_calls SET successful_attempt_id = ? WHERE id = ?')
+      .run(attemptId, callId);
+    database
+      .prepare(
+        `INSERT INTO model_tool_calls (
+          model_attempt_id, logical_call_id, call_index, tool_id,
+          arguments_json, normalized_input_hash
+        ) VALUES (?, 'recovered-logical-call', 0, ?, '{}', 'recovered-input')`,
+      )
+      .run(attemptId, toolId);
+  });
+  transaction.immediate();
+  return { callId, attemptId };
+};
+
+const insertRecoveredToolRun = (
+  database: RuntimeDatabase,
+  fixture: Pick<ActiveFixture, 'sessionId' | 'turnId'>,
+  options: {
+    readonly status:
+      | 'queued'
+      | 'running'
+      | 'cancel_requested'
+      | 'succeeded'
+      | 'canceled'
+      | 'interrupted';
+    readonly executionMode?: 'read_inline' | 'worker' | 'transactional_intrinsic';
+    readonly dispatchState?: 'prepared' | 'worker_ready' | 'go_sent' | 'acknowledged' | null;
+    readonly effectState?: 'not_applied' | 'applied' | 'unknown';
+    readonly finishedAt?: string | null;
+  },
+): string => {
+  const executionMode = options.executionMode ?? 'read_inline';
+  const worker = executionMode === 'worker';
+  const status = options.status;
+  const toolRunId = 'recovered-tool-run';
+  const toolId = worker
+    ? 'fs.write_text'
+    : executionMode === 'read_inline'
+      ? 'fs.read_text'
+      : 'runtime.test';
+  const source = insertRecoveredSucceededSource(database, fixture, toolId);
+  database
+    .prepare(
+      `INSERT INTO tool_runs (
+        id, session_id, turn_id, ordinal, logical_call_id,
+        source_model_call_id, source_model_attempt_id, attempt,
+        operation_id, idempotency_key, source_handle, tool_id, tool_version,
+        execution_mode, side_effect_class, status, dispatch_state,
+        dispatch_nonce, normalized_input_hash, input_json, result_json,
+        effect_state, pid, process_start_identity, error_code, error_message,
+        queued_at, started_at, finished_at
+      ) VALUES (?, ?, ?, 1, 'recovered-logical-call', ?, ?, 1,
+        'recovered-operation', ?, NULL, ?, '1', ?, ?, ?, ?, ?,
+        'recovered-input', '{}', NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+    )
+    .run(
+      toolRunId,
+      fixture.sessionId,
+      fixture.turnId,
+      source.callId,
+      source.attemptId,
+      worker ? 'recovered-idempotency' : null,
+      toolId,
+      executionMode,
+      executionMode === 'read_inline' ? 'read' : 'local_write',
+      status,
+      worker ? (options.dispatchState ?? 'prepared') : null,
+      worker ? 'recovered-dispatch' : null,
+      options.effectState ?? (worker ? 'unknown' : 'not_applied'),
+      CLAIM_TIME,
+      status === 'queued' ? null : CLAIM_TIME,
+      options.finishedAt ?? null,
+    );
+  return toolRunId;
+};
 
 const readOwnerEpoch = (runtime: TempRuntime): string => {
   const owner = JSON.parse(
@@ -264,6 +426,7 @@ const recoveryOptions = (
   createId: createIdFactory(
     '018f0000-0000-7000-8000-000000000401',
     '018f0000-0000-7000-8000-000000000402',
+    '018f0000-0000-7000-8000-000000000403',
   ),
   hooks,
 });
@@ -644,6 +807,106 @@ describe('startup scheduler recovery', () => {
           );
       },
     },
+    {
+      name: 'running ModelCall',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        database
+          .prepare(
+            `INSERT INTO model_calls (
+              id, session_id, turn_id, ordinal, kind, status,
+              profile_snapshot_json, input_json, result_json,
+              successful_attempt_id, error_code, error_message,
+              created_at, started_at, finished_at
+            ) VALUES ('recovered-running-call', ?, ?, 1, 'craft', 'running',
+              '{}', '{}', NULL, NULL, NULL, NULL, ?, ?, NULL)`,
+          )
+          .run(fixture.sessionId, fixture.turnId, CLAIM_TIME, CLAIM_TIME);
+      },
+    },
+    {
+      name: 'running ModelAttempt',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        const callId = insertRecoveredTerminalCall(database, fixture);
+        database
+          .prepare(
+            `INSERT INTO model_attempts (
+              id, model_call_id, attempt, status, provider_request_id,
+              partial_output_json, result_json, finish_reason,
+              input_tokens, output_tokens, cached_tokens, latency_ms,
+              error_code, error_message, retryable, started_at, finished_at
+            ) VALUES ('recovered-running-attempt', ?, 1, 'running', NULL,
+              NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+              NULL, NULL, NULL, ?, NULL)`,
+          )
+          .run(callId, CLAIM_TIME);
+      },
+    },
+    ...(['queued', 'running', 'cancel_requested'] as const).map((status) => ({
+      name: `${status} ToolRun`,
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        insertRecoveredToolRun(database, fixture, { status });
+      },
+    })),
+    {
+      name: 'Terminal ModelCall without finished_at',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        insertRecoveredTerminalCall(database, fixture, { finishedAt: null });
+      },
+    },
+    {
+      name: 'succeeded ModelAttempt without a successful Attempt pointer',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        const callId = insertRecoveredTerminalCall(database, fixture);
+        database
+          .prepare(
+            `INSERT INTO model_attempts (
+              id, model_call_id, attempt, status, provider_request_id,
+              partial_output_json, result_json, finish_reason,
+              input_tokens, output_tokens, cached_tokens, latency_ms,
+              error_code, error_message, retryable, started_at, finished_at
+            ) VALUES ('recovered-unowned-success', ?, 1, 'succeeded', NULL,
+              NULL, '{}', 'stop', 1, 1, 0, 1,
+              NULL, NULL, 0, ?, ?)`,
+          )
+          .run(callId, CLAIM_TIME, CLAIM_TIME);
+      },
+    },
+    {
+      name: 'canceled ToolRun with unknown effect',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        insertRecoveredToolRun(database, fixture, {
+          status: 'canceled',
+          executionMode: 'worker',
+          dispatchState: 'prepared',
+          effectState: 'unknown',
+          finishedAt: RECOVERY_TIME,
+        });
+      },
+    },
+    {
+      name: 'succeeded worker ToolRun with unknown effect',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        insertRecoveredToolRun(database, fixture, {
+          status: 'succeeded',
+          executionMode: 'worker',
+          dispatchState: 'acknowledged',
+          effectState: 'unknown',
+          finishedAt: RECOVERY_TIME,
+        });
+      },
+    },
+    {
+      name: 'interrupted worker ToolRun with not_applied effect',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        insertRecoveredToolRun(database, fixture, {
+          status: 'interrupted',
+          executionMode: 'worker',
+          dispatchState: 'go_sent',
+          effectState: 'not_applied',
+          finishedAt: RECOVERY_TIME,
+        });
+      },
+    },
   ])(
     'fails closed with zero writes for an already-recovered state with $name',
     async ({ corrupt }) => {
@@ -668,6 +931,149 @@ describe('startup scheduler recovery', () => {
       }
     },
   );
+
+  it.each([
+    {
+      name: 'worker prepared unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'prepared' as const,
+      effectState: 'unknown' as const,
+      expectedStatus: 'canceled',
+      expectedEffectState: 'not_applied',
+      expectedEvent: 'tool.canceled',
+    },
+    {
+      name: 'worker ready unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'worker_ready' as const,
+      effectState: 'unknown' as const,
+      expectedStatus: 'canceled',
+      expectedEffectState: 'not_applied',
+      expectedEvent: 'tool.canceled',
+    },
+    {
+      name: 'queued read_inline',
+      executionMode: 'read_inline' as const,
+      dispatchState: null,
+      effectState: 'not_applied' as const,
+      expectedStatus: 'canceled',
+      expectedEffectState: 'not_applied',
+      expectedEvent: 'tool.canceled',
+    },
+    {
+      name: 'queued transactional intrinsic',
+      executionMode: 'transactional_intrinsic' as const,
+      dispatchState: null,
+      effectState: 'unknown' as const,
+      expectedStatus: 'canceled',
+      expectedEffectState: 'not_applied',
+      expectedEvent: 'tool.canceled',
+    },
+    {
+      name: 'worker GO-sent unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'go_sent' as const,
+      effectState: 'unknown' as const,
+      expectedStatus: 'interrupted',
+      expectedEffectState: 'unknown',
+      expectedEvent: 'tool.interrupted',
+    },
+    {
+      name: 'worker acknowledged unknown',
+      executionMode: 'worker' as const,
+      dispatchState: 'acknowledged' as const,
+      effectState: 'unknown' as const,
+      expectedStatus: 'interrupted',
+      expectedEffectState: 'unknown',
+      expectedEvent: 'tool.interrupted',
+    },
+  ])(
+    'uses the interrupt Tool recovery truth table for first startup: $name',
+    async ({
+      executionMode,
+      dispatchState,
+      effectState,
+      expectedStatus,
+      expectedEffectState,
+      expectedEvent,
+    }) => {
+      runtime = createTempRuntime();
+      const { database, fixture } = await createDirectActiveFixture(runtime);
+      const toolRunId = insertRecoveredToolRun(database, fixture, {
+        status: 'queued',
+        executionMode,
+        dispatchState,
+        effectState,
+      });
+      try {
+        recoverStartupState(database, recoveryOptions());
+        expect(
+          database
+            .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
+            .get(toolRunId),
+        ).toEqual({ status: expectedStatus, effect_state: expectedEffectState });
+        expect(
+          database
+            .prepare(
+              `SELECT type FROM session_events
+               WHERE turn_id = ?
+                 AND (type LIKE 'tool.%' OR type IN ('turn.interrupted', 'recovery.detected'))
+               ORDER BY seq`,
+            )
+            .all(fixture.turnId),
+        ).toEqual([
+          { type: expectedEvent },
+          { type: 'turn.interrupted' },
+          { type: 'recovery.detected' },
+        ]);
+        const recoveredFacts = captureFacts(database);
+
+        recoverStartupState(database, {
+          daemonEpoch: LATER_DAEMON_EPOCH,
+          createId: () => {
+            throw new Error('Idempotent Tool recovery allocated an id');
+          },
+        });
+        expect(captureFacts(database)).toBe(recoveredFacts);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: 'pre-GO applied effect',
+      dispatchState: 'prepared' as const,
+      effectState: 'applied' as const,
+    },
+    {
+      name: 'dispatched stale not_applied effect',
+      dispatchState: 'go_sent' as const,
+      effectState: 'not_applied' as const,
+    },
+  ])('fails first startup closed for an invalid worker tuple: $name', async ({
+    dispatchState,
+    effectState,
+  }) => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    insertRecoveredToolRun(database, fixture, {
+      status: 'queued',
+      executionMode: 'worker',
+      dispatchState,
+      effectState,
+    });
+    const before = captureFacts(database);
+    try {
+      expect(() => recoverStartupState(database, recoveryOptions())).toThrow(
+        /invariant/i,
+      );
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
 
   it('accepts a complete recovered state even when a later Turn was enqueued', async () => {
     runtime = createTempRuntime();

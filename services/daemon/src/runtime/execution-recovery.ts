@@ -22,7 +22,16 @@ type ActiveModelCallRow = {
 type ActiveToolRunRow = {
   readonly id: string;
   readonly ordinal: number;
+  readonly status: 'queued' | 'running' | 'cancel_requested';
+  readonly executionMode: 'read_inline' | 'worker' | 'transactional_intrinsic';
+  readonly dispatchState: 'prepared' | 'worker_ready' | 'go_sent' | 'acknowledged' | null;
   readonly effectState: 'not_applied' | 'applied' | 'unknown';
+};
+
+type ToolTerminalDecision = ActiveToolRunRow & {
+  readonly outcome: 'failed' | 'canceled' | 'interrupted';
+  readonly terminalEffectState: 'not_applied' | 'applied' | 'unknown';
+  readonly eventSuffix: 'failed' | 'canceled' | 'interrupted';
 };
 
 export interface EffectResolutionInput {
@@ -66,11 +75,15 @@ export class ExecutionRecovery {
   }): SessionEventDraft[] {
     this.assertCallerTransaction();
     this.assertFailSafeEffects(input.sessionId, input.turnId);
+    const tools = this.readActiveToolRuns(input.sessionId, input.turnId).map(
+      (tool) => this.decideFailedTool(tool),
+    );
     return this.closeSubexecutions({
       ...input,
       outcome: 'failed',
       eventSuffix: 'failed',
       payload: { errorCode: input.errorCode },
+      tools,
     });
   }
 
@@ -82,11 +95,16 @@ export class ExecutionRecovery {
     readonly resolutions?: readonly EffectResolutionInput[];
   }): SessionEventDraft[] {
     this.assertCallerTransaction();
+    const tools = this.readActiveToolRuns(input.sessionId, input.turnId).map(
+      (tool) => this.decideInterruptedTool(tool),
+    );
+    const resolutions = input.resolutions ?? [];
+    this.assertInterruptResolutions(tools, resolutions);
     this.insertResolutions(
       input.sessionId,
       input.turnId,
       input.now,
-      input.resolutions ?? [],
+      resolutions,
     );
     this.afterWriteGroup('effectResolutions');
     return this.closeSubexecutions({
@@ -98,6 +116,7 @@ export class ExecutionRecovery {
       outcome: 'interrupted',
       eventSuffix: 'interrupted',
       payload: { reason: input.reason },
+      tools,
     });
   }
 
@@ -248,6 +267,122 @@ export class ExecutionRecovery {
     }
   }
 
+  private assertInterruptResolutions(
+    tools: readonly ToolTerminalDecision[],
+    resolutions: readonly EffectResolutionInput[],
+  ): void {
+    const activeTools = new Map(tools.map((tool) => [tool.id, tool]));
+    for (const resolution of resolutions) {
+      const tool = activeTools.get(resolution.toolRunId);
+      if (
+        tool?.terminalEffectState === 'not_applied' &&
+        resolution.resolution === 'confirmed_applied'
+      ) {
+        throw new TurnTerminalizationInvariantError(
+          'recovery Resolution contradicts a deterministically not-applied ToolRun',
+        );
+      }
+    }
+  }
+
+  private readActiveToolRuns(
+    sessionId: string,
+    turnId: string,
+  ): ActiveToolRunRow[] {
+    return this.database
+      .prepare(
+        `SELECT id, ordinal, status,
+                execution_mode AS executionMode,
+                dispatch_state AS dispatchState,
+                effect_state AS effectState
+         FROM tool_runs
+         WHERE session_id = ? AND turn_id = ?
+           AND status IN ('queued', 'running', 'cancel_requested')
+         ORDER BY ordinal, id`,
+      )
+      .all(sessionId, turnId) as ActiveToolRunRow[];
+  }
+
+  private decideFailedTool(tool: ActiveToolRunRow): ToolTerminalDecision {
+    const deterministicallyNotApplied =
+      tool.executionMode === 'read_inline' ||
+      tool.executionMode === 'transactional_intrinsic' ||
+      (tool.executionMode === 'worker' &&
+        (tool.dispatchState === 'prepared' || tool.dispatchState === 'worker_ready'));
+    return {
+      ...tool,
+      outcome: 'failed',
+      terminalEffectState:
+        tool.effectState === 'unknown' && deterministicallyNotApplied
+          ? 'not_applied'
+          : tool.effectState,
+      eventSuffix: 'failed',
+    };
+  }
+
+  private decideInterruptedTool(tool: ActiveToolRunRow): ToolTerminalDecision {
+    if (tool.executionMode === 'worker') {
+      if (tool.dispatchState === 'prepared' || tool.dispatchState === 'worker_ready') {
+        if (tool.effectState === 'applied') {
+          throw new TurnTerminalizationInvariantError(
+            'pre-GO worker ToolRun cannot have an applied effect',
+          );
+        }
+        return {
+          ...tool,
+          outcome: 'canceled',
+          terminalEffectState: 'not_applied',
+          eventSuffix: 'canceled',
+        };
+      }
+      if (tool.dispatchState === 'go_sent' || tool.dispatchState === 'acknowledged') {
+        if (tool.effectState === 'not_applied') {
+          throw new TurnTerminalizationInvariantError(
+            'dispatched worker ToolRun cannot claim a not-applied effect',
+          );
+        }
+        return {
+          ...tool,
+          outcome: 'interrupted',
+          terminalEffectState: tool.effectState,
+          eventSuffix: 'interrupted',
+        };
+      }
+      throw new TurnTerminalizationInvariantError(
+        'worker ToolRun dispatch state is invalid',
+      );
+    }
+
+    if (tool.dispatchState !== null) {
+      throw new TurnTerminalizationInvariantError(
+        'inline ToolRun cannot have a dispatch state',
+      );
+    }
+    if (
+      tool.executionMode === 'read_inline' &&
+      tool.effectState !== 'not_applied'
+    ) {
+      throw new TurnTerminalizationInvariantError(
+        'read-inline ToolRun effect state is invalid',
+      );
+    }
+    if (
+      tool.executionMode === 'transactional_intrinsic' &&
+      tool.effectState === 'applied'
+    ) {
+      throw new TurnTerminalizationInvariantError(
+        'active transactional ToolRun cannot have an applied effect',
+      );
+    }
+    const canceled = tool.status === 'queued';
+    return {
+      ...tool,
+      outcome: canceled ? 'canceled' : 'interrupted',
+      terminalEffectState: 'not_applied',
+      eventSuffix: canceled ? 'canceled' : 'interrupted',
+    };
+  }
+
   private closeSubexecutions(input: {
     readonly sessionId: string;
     readonly turnId: string;
@@ -257,6 +392,7 @@ export class ExecutionRecovery {
     readonly outcome: 'failed' | 'interrupted';
     readonly eventSuffix: 'failed' | 'interrupted';
     readonly payload: unknown;
+    readonly tools: readonly ToolTerminalDecision[];
   }): SessionEventDraft[] {
     const attempts = this.database
       .prepare(
@@ -277,16 +413,6 @@ export class ExecutionRecovery {
          ORDER BY ordinal, id`,
       )
       .all(input.sessionId, input.turnId) as ActiveModelCallRow[];
-    const tools = this.database
-      .prepare(
-        `SELECT id, ordinal, effect_state AS effectState
-         FROM tool_runs
-         WHERE session_id = ? AND turn_id = ?
-           AND status IN ('queued', 'running', 'cancel_requested')
-         ORDER BY ordinal, id`,
-      )
-      .all(input.sessionId, input.turnId) as ActiveToolRunRow[];
-
     const events: SessionEventDraft[] = [];
     for (const attempt of attempts) {
       expectTerminalizationChange(
@@ -341,31 +467,19 @@ export class ExecutionRecovery {
       });
     }
     this.afterWriteGroup('modelCalls');
-    for (const tool of tools) {
+    for (const tool of input.tools) {
       expectTerminalizationChange(
         this.database
           .prepare(
             `UPDATE tool_runs
-             SET status = ?,
-                 effect_state = CASE
-                   WHEN ? = 'failed' AND effect_state = 'unknown'
-                     AND (
-                       execution_mode IN ('read_inline', 'transactional_intrinsic')
-                       OR (
-                         execution_mode = 'worker'
-                         AND dispatch_state IN ('prepared', 'worker_ready')
-                       )
-                     )
-                   THEN 'not_applied'
-                   ELSE effect_state
-                 END,
+             SET status = ?, effect_state = ?,
                  error_code = ?, error_message = ?, finished_at = ?
              WHERE id = ? AND status IN ('queued', 'running', 'cancel_requested')
                AND finished_at IS NULL`,
           )
           .run(
-            input.outcome,
-            input.outcome,
+            tool.outcome,
+            tool.terminalEffectState,
             input.errorCode,
             input.errorMessage,
             input.now,
@@ -376,7 +490,7 @@ export class ExecutionRecovery {
       events.push({
         turnId: input.turnId,
         toolRunId: tool.id,
-        type: `tool.${input.eventSuffix}`,
+        type: `tool.${tool.eventSuffix}`,
         actor: 'daemon',
         audience: 'both',
         payload: input.payload,

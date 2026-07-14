@@ -1,5 +1,9 @@
 import type Database from 'better-sqlite3';
 
+import {
+  ExecutionRepository,
+  TurnTerminalizationInvariantError,
+} from '../db/execution-repository.js';
 import type { Claim } from './scheduler.js';
 import { TurnTerminalizer } from './turn-terminalizer.js';
 
@@ -117,6 +121,139 @@ const parsePayload = (payloadJson: string): Record<string, unknown> => {
   throw new StartupRecoveryInvariantError('recovery Event payload is invalid');
 };
 
+const assertRecoveredSubexecutionsAreComplete = (
+  database: Database.Database,
+  input: {
+    readonly sessionId: string;
+    readonly turnId: string;
+    readonly turnFinishedAt: string;
+  },
+): void => {
+  try {
+    new ExecutionRepository(database).assertTurnExecutionOwnership({
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+    });
+  } catch (error) {
+    if (error instanceof TurnTerminalizationInvariantError) {
+      throw new StartupRecoveryInvariantError(
+        'already-recovered execution ownership is inconsistent',
+      );
+    }
+    throw error;
+  }
+
+  const invalid = database
+    .prepare(
+      `SELECT
+         EXISTS (
+           SELECT 1
+           FROM model_calls
+           LEFT JOIN model_attempts AS successful_attempt
+             ON successful_attempt.id = model_calls.successful_attempt_id
+           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+             AND (
+               model_calls.status = 'running'
+               OR model_calls.finished_at IS NULL
+               OR model_calls.finished_at > ?
+               OR (
+                 model_calls.status = 'succeeded'
+                 AND (
+                   model_calls.successful_attempt_id IS NULL
+                   OR successful_attempt.status <> 'succeeded'
+                 )
+               )
+               OR (
+                 model_calls.status <> 'succeeded'
+                 AND model_calls.successful_attempt_id IS NOT NULL
+               )
+             )
+         ) AS modelCalls,
+         EXISTS (
+           SELECT 1
+           FROM model_attempts
+           JOIN model_calls ON model_calls.id = model_attempts.model_call_id
+           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+             AND (
+               model_attempts.status = 'running'
+               OR model_attempts.finished_at IS NULL
+               OR model_attempts.finished_at > ?
+               OR (
+                 model_attempts.status = 'succeeded'
+                 AND (
+                   model_calls.successful_attempt_id IS NULL
+                   OR model_calls.successful_attempt_id <> model_attempts.id
+                 )
+               )
+             )
+         ) AS modelAttempts,
+         EXISTS (
+           SELECT 1
+           FROM tool_runs
+           WHERE tool_runs.session_id = ? AND tool_runs.turn_id = ?
+             AND (
+               tool_runs.status IN ('queued', 'running', 'cancel_requested')
+               OR tool_runs.finished_at IS NULL
+               OR tool_runs.finished_at > ?
+               OR (
+                 tool_runs.status = 'canceled'
+                 AND (
+                   tool_runs.effect_state <> 'not_applied'
+                   OR (
+                     tool_runs.execution_mode = 'worker'
+                     AND tool_runs.dispatch_state NOT IN ('prepared', 'worker_ready')
+                   )
+                 )
+               )
+               OR (
+                 tool_runs.status = 'interrupted'
+                 AND tool_runs.execution_mode = 'worker'
+                 AND (
+                   tool_runs.dispatch_state NOT IN ('go_sent', 'acknowledged')
+                   OR tool_runs.effect_state NOT IN ('unknown', 'applied')
+                 )
+               )
+               OR (
+                 tool_runs.status = 'succeeded'
+                 AND (
+                   (
+                     tool_runs.execution_mode = 'worker'
+                     AND (
+                       tool_runs.dispatch_state <> 'acknowledged'
+                       OR tool_runs.effect_state <> 'applied'
+                     )
+                   )
+                   OR (
+                     tool_runs.execution_mode IN ('read_inline', 'transactional_intrinsic')
+                     AND tool_runs.effect_state <> 'not_applied'
+                   )
+                 )
+               )
+             )
+         ) AS toolRuns`,
+    )
+    .get(
+      input.sessionId,
+      input.turnId,
+      input.turnFinishedAt,
+      input.sessionId,
+      input.turnId,
+      input.turnFinishedAt,
+      input.sessionId,
+      input.turnId,
+      input.turnFinishedAt,
+    ) as {
+    readonly modelCalls: number;
+    readonly modelAttempts: number;
+    readonly toolRuns: number;
+  };
+  if (invalid.modelCalls || invalid.modelAttempts || invalid.toolRuns) {
+    throw new StartupRecoveryInvariantError(
+      'already-recovered subexecution projection is incomplete',
+    );
+  }
+};
+
 const assertRecoveredStatesAreComplete = (
   database: Database.Database,
   daemonEpoch: string,
@@ -166,6 +303,7 @@ const assertRecoveredStatesAreComplete = (
         session.sessionId,
       ) as RecoveredTurnRow[];
     const turn = recoveredTurns[0];
+    const turnFinishedAt = turn?.finishedAt ?? null;
     if (
       recoveredTurns.length !== 1 ||
       !turn ||
@@ -173,7 +311,7 @@ const assertRecoveredStatesAreComplete = (
       turn.status !== 'interrupted' ||
       turn.executionFence < 2 ||
       turn.startedAt === null ||
-      turn.finishedAt === null ||
+      turnFinishedAt === null ||
       turn.errorCode !== null ||
       turn.errorMessage !== null ||
       turn.resultMessageId !== null
@@ -182,6 +320,12 @@ const assertRecoveredStatesAreComplete = (
         'already-recovered source Turn projection is incomplete',
       );
     }
+
+    assertRecoveredSubexecutionsAreComplete(database, {
+      sessionId: session.sessionId,
+      turnId: turn.turnId,
+      turnFinishedAt,
+    });
 
     const expiredLeases = database
       .prepare(
@@ -195,7 +339,7 @@ const assertRecoveredStatesAreComplete = (
     if (
       expiredLeases.length !== 1 ||
       expiredLeases[0]?.daemonEpoch === daemonEpoch ||
-      expiredLeases[0]?.leaseExpiresAt !== turn.finishedAt
+      expiredLeases[0]?.leaseExpiresAt !== turnFinishedAt
     ) {
       throw new StartupRecoveryInvariantError(
         'already-recovered Lease projection is incomplete',
@@ -228,8 +372,8 @@ const assertRecoveredStatesAreComplete = (
       detectedEvent.toolRunId !== null ||
       interruptedEvent.blobId !== null ||
       detectedEvent.blobId !== null ||
-      interruptedEvent.createdAt !== turn.finishedAt ||
-      detectedEvent.createdAt !== turn.finishedAt
+      interruptedEvent.createdAt !== turnFinishedAt ||
+      detectedEvent.createdAt !== turnFinishedAt
     ) {
       throw new StartupRecoveryInvariantError(
         'already-recovered Event projection is incomplete',
