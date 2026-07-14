@@ -8,6 +8,7 @@ import {
   type DaemonServerOptions,
 } from './server.js';
 import type { SessionServiceHooks } from './runtime/session-service.js';
+import type { StartupRecoveryHooks } from './runtime/startup-recovery.js';
 
 type CliOptions = {
   readonly socketPath: string;
@@ -140,7 +141,9 @@ const readStartupInputs = (): { options: CliOptions; bootstrapSecret: Buffer } =
 
 export interface RunDaemonOptions {
   readonly sessionServiceHooks?: SessionServiceHooks;
+  readonly startupRecoveryHooks?: StartupRecoveryHooks;
   readonly initializeDatabase?: DaemonServerOptions['initializeDatabase'];
+  readonly recoverStartup?: DaemonServerOptions['recoverStartup'];
 }
 
 export const runDaemon = async (
@@ -156,8 +159,14 @@ export const runDaemon = async (
     ...(dependencies.sessionServiceHooks
       ? { sessionServiceHooks: dependencies.sessionServiceHooks }
       : {}),
+    ...(dependencies.startupRecoveryHooks
+      ? { startupRecoveryHooks: dependencies.startupRecoveryHooks }
+      : {}),
     ...(dependencies.initializeDatabase
       ? { initializeDatabase: dependencies.initializeDatabase }
+      : {}),
+    ...(dependencies.recoverStartup
+      ? { recoverStartup: dependencies.recoverStartup }
       : {}),
     onFatal: () => {
       void shutdown(1).catch(() => {

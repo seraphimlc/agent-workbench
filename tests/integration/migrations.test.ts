@@ -48,6 +48,12 @@ const sourceMigrationPath = fileURLToPath(
     import.meta.url,
   ),
 );
+const sourceSchedulerMigrationPath = fileURLToPath(
+  new URL(
+    '../../services/daemon/src/db/migrations/002_scheduler_invariants.sql',
+    import.meta.url,
+  ),
+);
 const committedWalProducerEntryPoint = fileURLToPath(
   new URL('../fixtures/committed-wal-producer-daemon.ts', import.meta.url),
 );
@@ -113,7 +119,7 @@ describe('daemon SQLite migrations', () => {
         database
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all(),
-      ).toEqual([{ version: 1 }]);
+      ).toEqual([{ version: 1 }, { version: 2 }]);
       expect(database.pragma('foreign_key_check')).toEqual([]);
     } finally {
       database.close();
@@ -1032,6 +1038,136 @@ describe('daemon SQLite migrations', () => {
     }
   });
 
+  it('upgrades the shipped 001 schema with exactly one pre-002 backup', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    copyFileSync(
+      sourceMigrationPath,
+      join(migrationsDirectory, '001_runtime_foundation.sql'),
+    );
+    const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+    const database = openConfiguredDatabase(databasePath);
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      copyFileSync(
+        sourceSchedulerMigrationPath,
+        join(migrationsDirectory, '002_scheduler_invariants.sql'),
+      );
+
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+
+      expect(
+        database.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(
+        database
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'turns_one_active_per_session'",
+          )
+          .get(),
+      ).toEqual({
+        sql: "CREATE UNIQUE INDEX turns_one_active_per_session ON turns(session_id) WHERE status IN ('running','cancel_requested')",
+      });
+      const backups = readdirSync(join(runtime.dataDir, 'backups'));
+      expect(backups).toHaveLength(1);
+      const backup = new Database(
+        join(runtime.dataDir, 'backups', backups[0] as string),
+        { readonly: true },
+      );
+      try {
+        expect(
+          backup.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+        ).toEqual([{ version: 1 }]);
+        expect(
+          backup
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'turns_one_active_per_session'",
+            )
+            .get(),
+        ).toBeUndefined();
+      } finally {
+        backup.close();
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rolls back shipped migration 002 and its version when old rows violate the active-Turn invariant', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    copyFileSync(
+      sourceMigrationPath,
+      join(migrationsDirectory, '001_runtime_foundation.sql'),
+    );
+    const database = openConfiguredDatabase(join(runtime.dataDir, 'runtime.sqlite3'));
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      database.transaction(() => {
+        database.exec(`
+          INSERT INTO workspaces VALUES ('workspace', '/workspace', '/workspace', 'now');
+          INSERT INTO sessions VALUES (
+            'session', 'title', 'workspace', 'active', 'running', NULL, 0, NULL,
+            'turn-1', 'craft', 'full_access', 3, 1, 0, 'now', 'now'
+          );
+          INSERT INTO messages VALUES (
+            'message-1', 'session', 'turn-1', 'user', 'completed', 'one', 'now', 'now'
+          );
+          INSERT INTO messages VALUES (
+            'message-2', 'session', 'turn-2', 'user', 'completed', 'two', 'now', 'now'
+          );
+          INSERT INTO turns VALUES (
+            'turn-1', 'session', 1, 'request-1', 'normal', 'running', 'message-1',
+            'craft', 'full_access', 'now', 'now', NULL, NULL, NULL, NULL
+          );
+          INSERT INTO turns VALUES (
+            'turn-2', 'session', 2, 'request-2', 'normal', 'cancel_requested', 'message-2',
+            'craft', 'full_access', 'now', 'now', NULL, NULL, NULL, NULL
+          );
+        `);
+      }).immediate();
+    } finally {
+      database.close();
+    }
+
+    const daemon = runtime.spawnDaemon();
+    const exit = await daemon.waitForExit();
+    expect(exit.code).not.toBe(0);
+    expect(existsSync(runtime.socketPath)).toBe(false);
+    const inspection = new Database(join(runtime.dataDir, 'runtime.sqlite3'), {
+      readonly: true,
+    });
+    try {
+      expect(
+        inspection
+          .prepare('SELECT version FROM schema_migrations ORDER BY version')
+          .all(),
+      ).toEqual([{ version: 1 }]);
+      expect(
+        inspection
+          .prepare(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'turns_one_active_per_session'",
+          )
+          .get(),
+      ).toBeUndefined();
+      expect(
+        inspection.prepare('SELECT status FROM turns ORDER BY ordinal').all(),
+      ).toEqual([{ status: 'running' }, { status: 'cancel_requested' }]);
+      expect(readdirSync(join(runtime.dataDir, 'backups'))).toHaveLength(1);
+    } finally {
+      inspection.close();
+    }
+  });
+
   it('preserves initialization failure when closing the acquired database also fails', async () => {
     runtime = createTempRuntime();
     const migrationsDirectory = createMigrationDirectory(runtime, {
@@ -1297,6 +1433,9 @@ describe('daemon SQLite migrations', () => {
     expect(
       readFileSync(join(distMigrations, '001_runtime_foundation.sql'), 'utf8'),
     ).toBe(readFileSync(sourceMigrationPath, 'utf8'));
+    expect(
+      readFileSync(join(distMigrations, '002_scheduler_invariants.sql'), 'utf8'),
+    ).toBe(readFileSync(sourceSchedulerMigrationPath, 'utf8'));
 
     const builtModulePath = join(
       repositoryRoot,
@@ -1306,9 +1445,12 @@ describe('daemon SQLite migrations', () => {
       `${pathToFileURL(builtModulePath).href}?test=${randomUUID()}`
     )) as { readonly discoverMigrations: () => Array<{ readonly path: string }> };
     const discovered = builtModule.discoverMigrations();
-    expect(discovered).toHaveLength(1);
+    expect(discovered).toHaveLength(2);
     expect(discovered[0]?.path).toBe(
       join(distMigrations, '001_runtime_foundation.sql'),
+    );
+    expect(discovered[1]?.path).toBe(
+      join(distMigrations, '002_scheduler_invariants.sql'),
     );
 
     runtime = createTempRuntime();
@@ -1345,7 +1487,7 @@ describe('daemon SQLite migrations', () => {
         builtDatabase
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all(),
-      ).toEqual([{ version: 1 }]);
+      ).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       builtDatabase.close();
     }

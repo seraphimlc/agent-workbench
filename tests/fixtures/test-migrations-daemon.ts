@@ -18,4 +18,7 @@ const initializeTestDatabase = async (
   });
 };
 
-await runDaemon({ initializeDatabase: initializeTestDatabase });
+await runDaemon({
+  initializeDatabase: initializeTestDatabase,
+  recoverStartup: () => undefined,
+});

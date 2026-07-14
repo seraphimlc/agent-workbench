@@ -31,6 +31,7 @@ import {
 import { mapRpcFailure } from './db/errors.js';
 import { Authenticator } from './rpc/authenticator.js';
 import { Router } from './rpc/router.js';
+import { Scheduler } from './runtime/scheduler.js';
 import {
   acquireRuntimeLock,
   RuntimeLock,
@@ -40,6 +41,11 @@ import {
   SessionService,
   type SessionServiceHooks,
 } from './runtime/session-service.js';
+import {
+  recoverStartupState,
+  type StartupRecovery,
+  type StartupRecoveryHooks,
+} from './runtime/startup-recovery.js';
 
 const MAX_IN_FLIGHT_REQUESTS = 128;
 const FULL_CLOSE_FALLBACK_MS = 500;
@@ -50,6 +56,8 @@ export interface DaemonServerOptions {
   readonly bootstrapSecret: Uint8Array;
   readonly onFatal?: (error: Error) => void;
   readonly sessionServiceHooks?: SessionServiceHooks;
+  readonly startupRecoveryHooks?: StartupRecoveryHooks;
+  readonly createDaemonEpoch?: () => string;
   readonly acquireDatabase?: (
     options: OpenRuntimeDatabaseOptions,
   ) => Database.Database;
@@ -57,6 +65,7 @@ export interface DaemonServerOptions {
     database: Database.Database,
     options: OpenRuntimeDatabaseOptions,
   ) => Promise<void>;
+  readonly recoverStartup?: StartupRecovery;
   readonly closeDatabase?: (database: Database.Database) => void | Promise<void>;
 }
 
@@ -188,10 +197,11 @@ const createAuthFailureResponse = (request: RpcRequestEnvelope): RpcResponse =>
 export class DaemonServer {
   private readonly requestedSocketPath: string;
   private readonly dataDir: string;
-  private readonly daemonEpoch = uuidv7();
+  private readonly daemonEpoch: string;
   private readonly bootstrapSecret: Buffer;
   private readonly onFatal: (error: Error) => void;
   private readonly sessionServiceHooks: SessionServiceHooks;
+  private readonly startupRecoveryHooks: StartupRecoveryHooks;
   private readonly acquireDatabase: (
     options: OpenRuntimeDatabaseOptions,
   ) => Database.Database;
@@ -199,6 +209,7 @@ export class DaemonServer {
     database: Database.Database,
     options: OpenRuntimeDatabaseOptions,
   ) => Promise<void>;
+  private readonly recoverStartup: StartupRecovery;
   private readonly closeDatabase: (
     database: Database.Database,
   ) => void | Promise<void>;
@@ -215,6 +226,7 @@ export class DaemonServer {
   private readonly closingSockets = new WeakSet<Socket>();
   private server: Server | undefined;
   private database: Database.Database | undefined;
+  private scheduler: Scheduler | undefined;
   private databaseRouter: Router | undefined;
   private runtimeLock: RuntimeLock | undefined;
   private activeSocketPath: string | undefined;
@@ -229,12 +241,15 @@ export class DaemonServer {
   constructor(options: DaemonServerOptions) {
     this.requestedSocketPath = resolve(options.socketPath);
     this.dataDir = resolve(options.dataDir);
+    this.daemonEpoch = options.createDaemonEpoch?.() ?? uuidv7();
     this.bootstrapSecret = Buffer.from(options.bootstrapSecret);
     this.onFatal = options.onFatal ?? (() => undefined);
     this.sessionServiceHooks = options.sessionServiceHooks ?? {};
+    this.startupRecoveryHooks = options.startupRecoveryHooks ?? {};
     this.acquireDatabase = options.acquireDatabase ?? acquireRuntimeDatabase;
     this.initializeDatabase =
       options.initializeDatabase ?? initializeRuntimeDatabase;
+    this.recoverStartup = options.recoverStartup ?? recoverStartupState;
     this.closeDatabase =
       options.closeDatabase ??
       ((database) => {
@@ -270,6 +285,15 @@ export class DaemonServer {
       await this.initializeDatabase(this.database, databaseOptions);
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
+      this.recoverStartup(this.database, {
+        daemonEpoch: this.daemonEpoch,
+        hooks: this.startupRecoveryHooks,
+      });
+      this.throwIfStopRequested();
+      runtimeLock.assertHeld();
+      this.scheduler = new Scheduler(this.database, {
+        daemonEpoch: this.daemonEpoch,
+      });
       this.databaseRouter = new Router(
         new SessionService(this.database, this.sessionServiceHooks),
       );
