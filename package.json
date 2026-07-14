@@ -16,7 +16,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint . --max-warnings=0"
+    "lint": "eslint . --max-warnings=0",
+    "smoke:runtime": "node --conditions=development --import tsx scripts/runtime-smoke.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
