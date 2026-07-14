@@ -16,6 +16,7 @@ import {
 } from '@agent-workbench/protocol';
 
 const DEFAULT_RPC_TIMEOUT_MS = 5_000;
+const MAX_RECEIVED_ENVELOPES = 1_024;
 
 export type AuthChallengeNotification = ReturnType<
   typeof AuthChallengeNotificationSchema.parse
@@ -52,11 +53,10 @@ export const createAuthMac = (secret: Uint8Array, nonce: string): string =>
   createHmac('sha256', secret).update(`${nonce}1`, 'utf8').digest('hex');
 
 export class RpcClient {
-  readonly receivedEnvelopes: RpcEnvelope[] = [];
-
   private readonly socket: Socket;
   private readonly decoder = new FrameDecoder();
   private readonly pendingResponses = new Map<string, PendingResponse>();
+  private readonly capturedEnvelopes: RpcEnvelope[] = [];
   private readonly closePromise: Promise<void>;
   private readonly challengePromise: Promise<AuthChallengeNotification>;
   private resolveChallenge!: (challenge: AuthChallengeNotification) => void;
@@ -88,6 +88,10 @@ export class RpcClient {
     socket.on('close', () => {
       this.fail(new Error('RPC connection closed'));
     });
+  }
+
+  get receivedEnvelopes(): readonly RpcEnvelope[] {
+    return this.capturedEnvelopes;
   }
 
   createRequest(method: RpcMethod, payload: unknown): RpcRequestEnvelope {
@@ -301,7 +305,12 @@ export class RpcClient {
       }
 
       const envelope = parsedEnvelope.data;
-      this.receivedEnvelopes.push(envelope);
+      if (this.capturedEnvelopes.length >= MAX_RECEIVED_ENVELOPES) {
+        this.fail(new Error('RPC client envelope capture limit exceeded'));
+        this.socket.destroy();
+        return;
+      }
+      this.capturedEnvelopes.push(envelope);
 
       if (envelope.kind === 'notification' && envelope.method === 'auth.challenge') {
         const parsedChallenge = AuthChallengeNotificationSchema.safeParse(envelope);

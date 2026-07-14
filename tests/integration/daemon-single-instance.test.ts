@@ -24,6 +24,47 @@ import {
 const ownerMetadataPath = (runtime: TempRuntime): string =>
   join(runtime.dataDir, '.daemon-owner.json');
 
+type OwnerIdentityFixture = {
+  readonly pid: number;
+  readonly processStartIdentity: string;
+  readonly daemonEpoch: string;
+  readonly socketPath: string;
+};
+
+const installNestedPredecessorEvidence = (
+  runtime: TempRuntime,
+  latestSocketOwner: OwnerIdentityFixture,
+): void => {
+  const ownerPath = ownerMetadataPath(runtime);
+  const crashedOwner = JSON.parse(readFileSync(ownerPath, 'utf8')) as
+    OwnerIdentityFixture & { readonly predecessor: readonly OwnerIdentityFixture[] };
+  const originalSocketOwner: OwnerIdentityFixture = {
+    pid: crashedOwner.pid,
+    processStartIdentity: crashedOwner.processStartIdentity,
+    daemonEpoch: crashedOwner.daemonEpoch,
+    socketPath: crashedOwner.socketPath,
+  };
+  const nestedOwner = {
+    pid: crashedOwner.pid,
+    processStartIdentity: crashedOwner.processStartIdentity,
+    daemonEpoch: '01890f3e-7b1c-7cc0-8f00-000000000010',
+    socketPath: runtime.alternateSocketPath,
+    predecessor: [originalSocketOwner, latestSocketOwner],
+  };
+  writeFileSync(ownerPath, JSON.stringify(nestedOwner), { mode: 0o600 });
+};
+
+const waitForStartupOutcome = async (
+  daemon: ReturnType<TempRuntime['spawnDaemon']>,
+): Promise<'ready' | 'exited'> =>
+  await Promise.race([
+    daemon.waitForReady(2_000).then(
+      () => 'ready' as const,
+      () => 'exited' as const,
+    ),
+    daemon.waitForExit(2_000).then(() => 'exited' as const),
+  ]);
+
 describe('daemon single-instance lifecycle', () => {
   let runtime: TempRuntime | undefined;
 
@@ -65,6 +106,96 @@ describe('daemon single-instance lifecycle', () => {
     expect(
       JSON.parse(readFileSync(ownerMetadataPath(runtime), 'utf8')).predecessor,
     ).toEqual([]);
+  });
+
+  it('preserves unresolved predecessor evidence across a different-socket owner graceful release', async () => {
+    runtime = createTempRuntime();
+    const first = runtime.spawnDaemon();
+    await first.waitForReady();
+    await first.stop('SIGKILL');
+    expect(existsSync(runtime.socketPath)).toBe(true);
+
+    const intermediary = runtime.spawnDaemon({
+      socketPath: runtime.alternateSocketPath,
+    });
+    await intermediary.waitForReady();
+    await intermediary.stop();
+
+    const releasedRecord = JSON.parse(
+      readFileSync(ownerMetadataPath(runtime), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(releasedRecord).toMatchObject({
+      state: 'released',
+      predecessor: [expect.objectContaining({ socketPath: runtime.socketPath })],
+    });
+
+    const recovered = runtime.spawnDaemon();
+    await recovered.waitForReady();
+    expect(
+      JSON.parse(readFileSync(ownerMetadataPath(runtime), 'utf8')),
+    ).toMatchObject({ state: 'active', predecessor: [] });
+
+    await recovered.stop();
+    expect(existsSync(ownerMetadataPath(runtime))).toBe(false);
+  });
+
+  it.each([
+    {
+      name: 'live',
+      pid: process.pid,
+      processStartIdentity: getProcessStartIdentity(process.pid),
+      daemonEpoch: '01890f3e-7b1c-7cc0-8f00-000000000011',
+    },
+    {
+      name: 'ambiguous',
+      pid: 2_147_483_648,
+      processStartIdentity: 'unprobeable-process-start',
+      daemonEpoch: '01890f3e-7b1c-7cc0-8f00-000000000012',
+    },
+  ])(
+    'fails closed and preserves a stale socket when the latest nested predecessor is $name',
+    async ({ pid, processStartIdentity, daemonEpoch }) => {
+      runtime = createTempRuntime();
+      const first = runtime.spawnDaemon();
+      await first.waitForReady();
+      await first.stop('SIGKILL');
+      const staleSocket = lstatSync(runtime.socketPath, { bigint: true });
+      installNestedPredecessorEvidence(runtime, {
+        pid,
+        processStartIdentity,
+        daemonEpoch,
+        socketPath: runtime.socketPath,
+      });
+
+      const blocked = runtime.spawnDaemon();
+      const outcome = await waitForStartupOutcome(blocked);
+
+      expect(outcome).toBe('exited');
+      const preservedSocket = lstatSync(runtime.socketPath, { bigint: true });
+      expect(preservedSocket.dev).toBe(staleSocket.dev);
+      expect(preservedSocket.ino).toBe(staleSocket.ino);
+    },
+  );
+
+  it('treats the latest nested predecessor with a reused PID as stale before unlinking', async () => {
+    runtime = createTempRuntime();
+    const first = runtime.spawnDaemon();
+    await first.waitForReady();
+    await first.stop('SIGKILL');
+    const staleSocket = lstatSync(runtime.socketPath, { bigint: true });
+    installNestedPredecessorEvidence(runtime, {
+      pid: process.pid,
+      processStartIdentity: 'definitely-not-this-process-start',
+      daemonEpoch: '01890f3e-7b1c-7cc0-8f00-000000000013',
+      socketPath: runtime.socketPath,
+    });
+
+    const replacement = runtime.spawnDaemon();
+    await replacement.waitForReady();
+
+    const replacementSocket = lstatSync(runtime.socketPath, { bigint: true });
+    expect(replacementSocket.isSocket()).toBe(true);
+    expect(replacementSocket.ino).not.toBe(staleSocket.ino);
   });
 
   it('refuses and preserves a regular file even when stale owner evidence exists', async () => {

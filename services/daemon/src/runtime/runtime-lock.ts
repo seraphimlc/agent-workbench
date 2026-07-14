@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   accessSync,
   chmodSync,
@@ -49,7 +50,7 @@ const OwnerIdentitySchema = z
   })
   .strict();
 
-const OwnerRecordSchema = OwnerIdentitySchema.extend({
+const LegacyOwnerRecordSchema = OwnerIdentitySchema.extend({
   predecessor: z.array(OwnerIdentitySchema).max(MAX_PREDECESSORS),
 })
   .strict()
@@ -67,6 +68,51 @@ const OwnerRecordSchema = OwnerIdentitySchema.extend({
     });
   });
 
+const OwnerRecordSchema = OwnerIdentitySchema.extend({
+  state: z.literal('active'),
+  predecessor: z.array(OwnerIdentitySchema).max(MAX_PREDECESSORS),
+})
+  .strict()
+  .superRefine((owner, context) => {
+    const epochs = new Set<string>([owner.daemonEpoch]);
+    owner.predecessor.forEach((predecessor, index) => {
+      if (epochs.has(predecessor.daemonEpoch)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Runtime predecessor epochs must be unique',
+          path: ['predecessor', index, 'daemonEpoch'],
+        });
+      }
+      epochs.add(predecessor.daemonEpoch);
+    });
+  });
+
+const ReleasedOwnerRecordSchema = z
+  .object({
+    state: z.literal('released'),
+    predecessor: z.array(OwnerIdentitySchema).max(MAX_PREDECESSORS),
+  })
+  .strict()
+  .superRefine((owner, context) => {
+    const epochs = new Set<string>();
+    owner.predecessor.forEach((predecessor, index) => {
+      if (epochs.has(predecessor.daemonEpoch)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Runtime predecessor epochs must be unique',
+          path: ['predecessor', index, 'daemonEpoch'],
+        });
+      }
+      epochs.add(predecessor.daemonEpoch);
+    });
+  });
+
+const PersistedOwnerRecordSchema = z.union([
+  OwnerRecordSchema,
+  ReleasedOwnerRecordSchema,
+  LegacyOwnerRecordSchema,
+]);
+
 const LockAckSchema = z
   .object({
     event: z.literal('LOCKED'),
@@ -77,6 +123,8 @@ const LockAckSchema = z
 
 export type OwnerIdentity = z.infer<typeof OwnerIdentitySchema>;
 export type OwnerRecord = z.infer<typeof OwnerRecordSchema>;
+type ReleasedOwnerRecord = z.infer<typeof ReleasedOwnerRecordSchema>;
+type PersistedOwnerRecord = OwnerRecord | ReleasedOwnerRecord;
 type LockAck = z.infer<typeof LockAckSchema>;
 
 export class SingleInstanceError extends Error {
@@ -230,7 +278,7 @@ const ensureLockFile = (dataDir: string): string => {
 
 const ownerFilePath = (dataDir: string): string => join(dataDir, OWNER_FILE_NAME);
 
-const readOwnerRecord = (dataDir: string): OwnerRecord => {
+const readOwnerRecord = (dataDir: string): PersistedOwnerRecord => {
   const path = ownerFilePath(dataDir);
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 
@@ -246,14 +294,21 @@ const readOwnerRecord = (dataDir: string): OwnerRecord => {
       throw new RuntimeLockError('Runtime owner metadata boundary is invalid');
     }
 
-    const parsed = OwnerRecordSchema.safeParse(
+    const parsed = PersistedOwnerRecordSchema.safeParse(
       JSON.parse(readFileSync(descriptor, 'utf8')),
     );
     if (!parsed.success) {
       throw new RuntimeLockError('Runtime owner metadata is invalid');
     }
 
-    return parsed.data;
+    if ('state' in parsed.data) {
+      return parsed.data;
+    }
+
+    return OwnerRecordSchema.parse({
+      ...parsed.data,
+      state: 'active',
+    });
   } catch (error) {
     if (error instanceof RuntimeLockError) {
       throw error;
@@ -281,11 +336,14 @@ const writeAll = (descriptor: number, bytes: Uint8Array): void => {
   }
 };
 
-const replaceOwnerRecordAtomically = (dataDir: string, owner: OwnerRecord): void => {
+const replaceOwnerRecordAtomically = (
+  dataDir: string,
+  owner: PersistedOwnerRecord,
+): void => {
   const path = ownerFilePath(dataDir);
   const temporaryPath = join(
     dataDir,
-    `${OWNER_TEMP_PREFIX}${owner.daemonEpoch}${OWNER_TEMP_SUFFIX}`,
+    `${OWNER_TEMP_PREFIX}${randomUUID()}${OWNER_TEMP_SUFFIX}`,
   );
   const descriptor = openSync(
     temporaryPath,
@@ -517,19 +575,36 @@ const waitForLockAck = async (
     });
   });
 
-const removeOwnOwnerRecord = (dataDir: string, expected: OwnerRecord): void => {
+const ownerRecordsMatch = (
+  current: PersistedOwnerRecord,
+  expected: OwnerRecord,
+): boolean =>
+  current.state === 'active' &&
+  current.daemonEpoch === expected.daemonEpoch &&
+  current.pid === expected.pid &&
+  current.processStartIdentity === expected.processStartIdentity &&
+  current.socketPath === expected.socketPath &&
+  JSON.stringify(current.predecessor) === JSON.stringify(expected.predecessor);
+
+const releaseOwnOwnerRecord = (dataDir: string, expected: OwnerRecord): void => {
   const current = readOwnerRecord(dataDir);
-  if (
-    current.daemonEpoch !== expected.daemonEpoch ||
-    current.pid !== expected.pid ||
-    current.processStartIdentity !== expected.processStartIdentity ||
-    current.socketPath !== expected.socketPath
-  ) {
+  if (!ownerRecordsMatch(current, expected)) {
     throw new RuntimeLockError('Runtime owner metadata no longer belongs to this daemon');
   }
 
-  unlinkSync(ownerFilePath(dataDir));
-  fsyncDirectory(dataDir);
+  if (expected.predecessor.length === 0) {
+    unlinkSync(ownerFilePath(dataDir));
+    fsyncDirectory(dataDir);
+    return;
+  }
+
+  replaceOwnerRecordAtomically(
+    dataDir,
+    ReleasedOwnerRecordSchema.parse({
+      state: 'released',
+      predecessor: expected.predecessor,
+    }),
+  );
 };
 
 export interface AcquireRuntimeLockOptions {
@@ -608,14 +683,38 @@ export class RuntimeLock {
     }
 
     const current = readOwnerRecord(this.dataDir);
-    if (
-      current.daemonEpoch !== this.currentOwner.daemonEpoch ||
-      current.pid !== this.currentOwner.pid ||
-      current.processStartIdentity !== this.currentOwner.processStartIdentity ||
-      current.socketPath !== this.currentOwner.socketPath
-    ) {
+    if (!ownerRecordsMatch(current, this.currentOwner)) {
       throw new RuntimeLockError('Runtime owner metadata changed unexpectedly');
     }
+  }
+
+  assertPredecessorStaleForSocket(socketPath: string): OwnerIdentity {
+    this.assertHeld();
+    const resolvedSocketPath = resolve(socketPath);
+    let responsibleOwner: OwnerIdentity | undefined;
+
+    for (let index = this.currentOwner.predecessor.length - 1; index >= 0; index -= 1) {
+      const predecessor = this.currentOwner.predecessor[index];
+      if (predecessor && resolve(predecessor.socketPath) === resolvedSocketPath) {
+        responsibleOwner = predecessor;
+        break;
+      }
+    }
+
+    if (!responsibleOwner) {
+      throw new RuntimeLockError('No predecessor owns the pre-existing socket path');
+    }
+
+    const processState = probeProcess(responsibleOwner);
+    if (processState === 'live') {
+      throw new RuntimeLockError('Socket predecessor is still live');
+    }
+    if (processState === 'ambiguous') {
+      throw new RuntimeLockError('Socket predecessor liveness is ambiguous');
+    }
+
+    this.assertHeld();
+    return responsibleOwner;
   }
 
   markPredecessorResolved(socketPath: string): void {
@@ -653,7 +752,7 @@ export class RuntimeLock {
       this.child.signalCode === null
     ) {
       try {
-        removeOwnOwnerRecord(this.dataDir, this.currentOwner);
+        releaseOwnOwnerRecord(this.dataDir, this.currentOwner);
       } catch (error) {
         metadataError = error;
       }
@@ -698,6 +797,7 @@ export const acquireRuntimeLock = async (
   const dataDir = ensureOwnedDirectory(options.dataDir);
   const lockPath = ensureLockFile(dataDir);
   const requestedOwner = OwnerRecordSchema.parse({
+    state: 'active',
     pid: process.pid,
     processStartIdentity: getProcessStartIdentity(process.pid),
     daemonEpoch: options.daemonEpoch,
@@ -725,22 +825,28 @@ const runLockHelper = async (dataDirInput: string, encodedOwner: string): Promis
     throw new RuntimeLockError('Unexpected runtime owner files are present');
   }
 
-  let staleOwner: OwnerRecord | undefined;
+  let predecessor: OwnerIdentity[] = [];
   if (pathExistsNoFollow(ownerFilePath(dataDir))) {
-    staleOwner = readOwnerRecord(dataDir);
-    const processState = probeProcess(staleOwner);
+    const persistedOwner = readOwnerRecord(dataDir);
+    if (persistedOwner.state === 'released') {
+      predecessor = [...persistedOwner.predecessor];
+    } else {
+      const processState = probeProcess(persistedOwner);
 
-    if (processState === 'live') {
-      throw new SingleInstanceError();
-    }
-    if (processState === 'ambiguous') {
-      throw new RuntimeLockError('Runtime owner liveness is ambiguous');
+      if (processState === 'live') {
+        throw new SingleInstanceError();
+      }
+      if (processState === 'ambiguous') {
+        throw new RuntimeLockError('Runtime owner liveness is ambiguous');
+      }
+
+      predecessor = [
+        ...persistedOwner.predecessor,
+        stripPredecessor(persistedOwner),
+      ];
     }
   }
 
-  const predecessor = staleOwner
-    ? [...staleOwner.predecessor, stripPredecessor(staleOwner)]
-    : [];
   if (predecessor.length > MAX_PREDECESSORS) {
     throw new RuntimeLockError('Runtime predecessor evidence exceeds its bound');
   }

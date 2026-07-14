@@ -1,11 +1,15 @@
 import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
-import { relative, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { join, relative, resolve } from 'node:path';
+import type { Writable } from 'node:stream';
 import { tmpdir } from 'node:os';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   createTempRuntime,
+  DaemonProcess,
   type TempRuntime,
 } from '../../packages/testkit/src/temp-runtime.js';
 import {
@@ -20,6 +24,38 @@ import type {
 import { computeAuthMac } from '../../services/daemon/src/rpc/authenticator.js';
 
 const permissionBits = (path: string): number => lstatSync(path).mode & 0o777;
+const daemonEntryPoint = fileURLToPath(
+  new URL('../../services/daemon/src/index.ts', import.meta.url),
+);
+const tsxImport = import.meta.resolve('tsx');
+const spawnDaemonWithRawOptions = (
+  runtime: TempRuntime,
+  daemonOptions: readonly string[],
+  bootstrapSecret = Buffer.alloc(32, 0x71),
+): DaemonProcess => {
+  const launchArguments = [
+    '--conditions=development',
+    '--import',
+    tsxImport,
+    daemonEntryPoint,
+    ...daemonOptions,
+  ];
+  const child = spawn(process.execPath, launchArguments, {
+    cwd: runtime.rootDir,
+    env: process.env,
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+  });
+  const daemon = new DaemonProcess(
+    child,
+    bootstrapSecret,
+    launchArguments,
+    process.env,
+  );
+  const secretPipe = child.stdio[3] as Writable;
+  secretPipe.end(bootstrapSecret);
+  return daemon;
+};
 const expectNoDaemonRuntimeState = (runtime: TempRuntime): void => {
   expect(readdirSync(runtime.dataDir)).toEqual([]);
   expect(existsSync(runtime.socketPath)).toBe(false);
@@ -356,6 +392,56 @@ describe('daemon authentication', () => {
       expectNoDaemonRuntimeState(runtime);
     },
   );
+
+  it('rejects a forbidden bootstrap-secret token consumed as the --socket value before creating runtime state', async () => {
+    runtime = createTempRuntime();
+    const forbiddenValue = '--bootstrap-secret=forbidden-argv-value';
+    const daemon = spawnDaemonWithRawOptions(runtime, [
+      '--socket',
+      forbiddenValue,
+      '--data-dir',
+      runtime.dataDir,
+    ]);
+
+    try {
+      const exit = await daemon.waitForExit(1_500);
+
+      expect(exit.code).not.toBe(0);
+      expect(readdirSync(runtime.dataDir)).toEqual([]);
+      expect(existsSync(join(runtime.rootDir, forbiddenValue))).toBe(false);
+      const output = `${daemon.stdout}\n${daemon.stderr}`;
+      expect(output).not.toContain('forbidden-argv-value');
+      expect(output).not.toContain(
+        Buffer.from('forbidden-argv-value').toString('hex'),
+      );
+      expect(output).not.toContain(
+        Buffer.from('forbidden-argv-value').toString('base64'),
+      );
+    } finally {
+      await daemon.stop('SIGKILL');
+    }
+  });
+
+  it('rejects an option token consumed as a separated daemon option value', async () => {
+    runtime = createTempRuntime();
+    const disguisedSocketValue = '--data-dir';
+    const daemon = spawnDaemonWithRawOptions(runtime, [
+      '--socket',
+      disguisedSocketValue,
+      '--data-dir',
+      runtime.dataDir,
+    ]);
+
+    try {
+      const exit = await daemon.waitForExit(1_500);
+
+      expect(exit.code).not.toBe(0);
+      expect(readdirSync(runtime.dataDir)).toEqual([]);
+      expect(existsSync(join(runtime.rootDir, disguisedSocketValue))).toBe(false);
+    } finally {
+      await daemon.stop('SIGKILL');
+    }
+  });
 
   it.each([
     'AGENT_WORKBENCH_BOOTSTRAP_SECRET',

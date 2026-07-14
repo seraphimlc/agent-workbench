@@ -1,19 +1,30 @@
 import { closeSync, readSync } from 'node:fs';
 
-import { DaemonServer } from './server.js';
+import { DaemonServer, DaemonStartCancelledError } from './server.js';
 
 type CliOptions = {
   readonly socketPath: string;
   readonly dataDir: string;
 };
 
+const isForbiddenBootstrapSecretToken = (argument: string): boolean =>
+  argument === '--bootstrap-secret' ||
+  argument.startsWith('--bootstrap-secret=');
+
 const parseCli = (arguments_: readonly string[]): CliOptions => {
+  if (arguments_.some(isForbiddenBootstrapSecretToken)) {
+    throw new Error('Bootstrap secret transport is forbidden');
+  }
+
   let socketPath: string | undefined;
   let dataDir: string | undefined;
 
   const assign = (name: 'socket' | 'data-dir', value: string): void => {
     if (value.length === 0) {
       throw new Error('Daemon option value must not be empty');
+    }
+    if (value.startsWith('--')) {
+      throw new Error('Daemon option value must not be an option token');
     }
 
     if (name === 'socket') {
@@ -31,13 +42,6 @@ const parseCli = (arguments_: readonly string[]): CliOptions => {
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
-
-    if (
-      argument === '--bootstrap-secret' ||
-      argument?.startsWith('--bootstrap-secret=')
-    ) {
-      throw new Error('Bootstrap secret transport is forbidden');
-    }
 
     if (argument === '--socket' || argument === '--data-dir') {
       const value = arguments_[index + 1];
@@ -163,6 +167,10 @@ const main = async (): Promise<void> => {
   try {
     await server.start();
   } catch (error) {
+    if (error instanceof DaemonStartCancelledError) {
+      await shutdown(0);
+      return;
+    }
     await shutdown(1);
     throw error;
   }

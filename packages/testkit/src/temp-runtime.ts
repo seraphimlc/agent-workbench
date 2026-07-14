@@ -7,6 +7,7 @@ import {
 } from 'node:fs';
 import {
   spawn,
+  spawnSync,
   type ChildProcess,
   type StdioOptions,
 } from 'node:child_process';
@@ -19,6 +20,9 @@ import type { Writable } from 'node:stream';
 const DEFAULT_PROCESS_TIMEOUT_MS = 5_000;
 const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+const HELPER_EXIT_GRACE_MS = 750;
+const HELPER_SIGNAL_GRACE_MS = 750;
+const PROCESS_POLL_INTERVAL_MS = 25;
 const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const daemonEntryPoint = fileURLToPath(
   new URL('../../../services/daemon/src/index.ts', import.meta.url),
@@ -96,6 +100,146 @@ const withFailureGuard = async <T>(
     );
   });
 
+type ProcessIdentity = {
+  readonly pid: number;
+  readonly processStartIdentity: string;
+};
+
+type ProcessState = 'live' | 'stale' | 'ambiguous';
+
+const normalizeProcessStartIdentity = (identity: string): string =>
+  identity.trim().replace(/\s+/g, ' ');
+
+const runPs = (arguments_: readonly string[]): string => {
+  for (const executable of ['/bin/ps', '/usr/bin/ps']) {
+    const result = spawnSync(executable, [...arguments_], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 2_000,
+    });
+    if (!result.error && result.status === 0) {
+      return result.stdout;
+    }
+  }
+
+  throw new Error('Unable to inspect child process identities');
+};
+
+const readProcessStartIdentity = (pid: number): string => {
+  const identity = normalizeProcessStartIdentity(
+    runPs(['-o', 'lstart=', '-p', String(pid)]),
+  );
+  if (identity.length === 0) {
+    throw new Error('Unable to determine child process start identity');
+  }
+  return identity;
+};
+
+const captureDescendantIdentities = (parentPid: number): ProcessIdentity[] => {
+  const processes = runPs(['-axo', 'pid=,ppid=,lstart='])
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+      if (!match) {
+        throw new Error('Unable to parse child process identity');
+      }
+      return {
+        pid: Number(match[1]),
+        parentPid: Number(match[2]),
+        processStartIdentity: normalizeProcessStartIdentity(match[3] as string),
+      };
+    });
+  const descendants: ProcessIdentity[] = [];
+  const pendingParents = [parentPid];
+
+  while (pendingParents.length > 0) {
+    const currentParent = pendingParents.shift() as number;
+    for (const processEntry of processes) {
+      if (processEntry.parentPid !== currentParent) {
+        continue;
+      }
+      descendants.push({
+        pid: processEntry.pid,
+        processStartIdentity: processEntry.processStartIdentity,
+      });
+      pendingParents.push(processEntry.pid);
+    }
+  }
+
+  return descendants;
+};
+
+const probeProcessIdentity = (identity: ProcessIdentity): ProcessState => {
+  try {
+    process.kill(identity.pid, 0);
+  } catch (error) {
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? error.code
+        : undefined;
+    if (code === 'ESRCH') {
+      return 'stale';
+    }
+    if (code !== 'EPERM') {
+      return 'ambiguous';
+    }
+  }
+
+  try {
+    return readProcessStartIdentity(identity.pid) === identity.processStartIdentity
+      ? 'live'
+      : 'stale';
+  } catch {
+    return 'ambiguous';
+  }
+};
+
+const unresolvedProcessIdentities = (
+  identities: readonly ProcessIdentity[],
+): ProcessIdentity[] =>
+  identities.filter((identity) => probeProcessIdentity(identity) !== 'stale');
+
+const waitForProcessIdentitiesToExit = async (
+  identities: readonly ProcessIdentity[],
+  timeoutMs: number,
+): Promise<ProcessIdentity[]> => {
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const unresolved = unresolvedProcessIdentities(identities);
+    if (unresolved.length === 0 || Date.now() >= deadline) {
+      return unresolved;
+    }
+    await new Promise((resolvePromise) =>
+      setTimeout(resolvePromise, PROCESS_POLL_INTERVAL_MS),
+    );
+  }
+};
+
+const signalMatchingProcessIdentities = (
+  identities: readonly ProcessIdentity[],
+  signal: NodeJS.Signals,
+): void => {
+  for (const identity of identities) {
+    if (probeProcessIdentity(identity) !== 'live') {
+      continue;
+    }
+    try {
+      process.kill(identity.pid, signal);
+    } catch (error) {
+      const code =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? error.code
+          : undefined;
+      if (code !== 'ESRCH') {
+        throw error;
+      }
+    }
+  }
+};
+
 export class DaemonProcess {
   readonly child: ChildProcess;
   readonly bootstrapSecret: Buffer;
@@ -104,9 +248,13 @@ export class DaemonProcess {
 
   private readonly completionPromise: Promise<ProcessExit>;
   private readonly readyPromise: Promise<void>;
+  private readonly secretForms: readonly string[];
+  private capturedDescendantIdentities: readonly ProcessIdentity[] = [];
+  private stopPromise: Promise<ProcessExit> | undefined;
   private stdoutText = '';
   private stderrText = '';
   private stdoutLineBuffer = '';
+  private stdoutLineBufferTruncated = false;
 
   constructor(
     child: ChildProcess,
@@ -118,6 +266,11 @@ export class DaemonProcess {
     this.bootstrapSecret = Buffer.from(bootstrapSecret);
     this.launchArguments = [...launchArguments];
     this.launchEnvironment = { ...launchEnvironment };
+    this.secretForms = [
+      this.bootstrapSecret.toString('utf8'),
+      this.bootstrapSecret.toString('hex'),
+      this.bootstrapSecret.toString('base64'),
+    ].filter((value) => value.length > 0);
 
     child.stdout?.setEncoding('utf8');
     let resolveReady!: () => void;
@@ -132,13 +285,21 @@ export class DaemonProcess {
     });
 
     child.stdout?.on('data', (chunk: string) => {
-      this.stdoutText = this.appendOutputTail(this.stdoutText, chunk);
-      this.stdoutLineBuffer += chunk;
+      this.stdoutText = this.appendOutputTail(this.stdoutText, chunk).text;
+      const lineCapture = this.appendOutputTail(this.stdoutLineBuffer, chunk);
+      this.stdoutLineBuffer = lineCapture.text;
+      this.stdoutLineBufferTruncated ||= lineCapture.truncated;
 
       while (this.stdoutLineBuffer.includes('\n')) {
         const newlineIndex = this.stdoutLineBuffer.indexOf('\n');
         const line = this.stdoutLineBuffer.slice(0, newlineIndex);
         this.stdoutLineBuffer = this.stdoutLineBuffer.slice(newlineIndex + 1);
+        const lineWasTruncated = this.stdoutLineBufferTruncated;
+        this.stdoutLineBufferTruncated = false;
+
+        if (lineWasTruncated) {
+          continue;
+        }
 
         try {
           const event: unknown = JSON.parse(line);
@@ -159,7 +320,7 @@ export class DaemonProcess {
     });
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => {
-      this.stderrText = this.appendOutputTail(this.stderrText, chunk);
+      this.stderrText = this.appendOutputTail(this.stderrText, chunk).text;
     });
 
     this.completionPromise = new Promise((resolvePromise, rejectPromise) => {
@@ -206,47 +367,106 @@ export class DaemonProcess {
   }
 
   async stop(signal: NodeJS.Signals = 'SIGTERM'): Promise<ProcessExit> {
+    this.stopPromise ??= this.performStop(signal);
+    return await this.stopPromise;
+  }
+
+  private async performStop(signal: NodeJS.Signals): Promise<ProcessExit> {
     if (this.child.exitCode === null && this.child.signalCode === null) {
+      if (this.child.pid === undefined) {
+        throw new Error('Daemon child has no process id');
+      }
+      this.capturedDescendantIdentities = captureDescendantIdentities(
+        this.child.pid,
+      );
       this.child.kill(signal);
     }
 
+    let exit: ProcessExit;
     try {
-      return await this.waitForExit();
+      exit = await this.waitForExit();
     } catch (error) {
       if (signal === 'SIGKILL') {
+        await this.ensureCapturedDescendantsExited();
         throw error;
       }
 
       if (this.child.exitCode === null && this.child.signalCode === null) {
         this.child.kill('SIGKILL');
       }
-      return await this.waitForExit();
+      exit = await this.waitForExit();
+    }
+
+    await this.ensureCapturedDescendantsExited();
+    return exit;
+  }
+
+  private async ensureCapturedDescendantsExited(): Promise<void> {
+    let unresolved = await waitForProcessIdentitiesToExit(
+      this.capturedDescendantIdentities,
+      HELPER_EXIT_GRACE_MS,
+    );
+    if (unresolved.length === 0) {
+      return;
+    }
+
+    signalMatchingProcessIdentities(unresolved, 'SIGTERM');
+    unresolved = await waitForProcessIdentitiesToExit(
+      unresolved,
+      HELPER_SIGNAL_GRACE_MS,
+    );
+    if (unresolved.length === 0) {
+      return;
+    }
+
+    signalMatchingProcessIdentities(unresolved, 'SIGKILL');
+    unresolved = await waitForProcessIdentitiesToExit(
+      unresolved,
+      HELPER_SIGNAL_GRACE_MS,
+    );
+    if (unresolved.length > 0) {
+      throw new Error('Daemon lock helper did not exit after forced cleanup');
     }
   }
 
-  private appendOutputTail(current: string, chunk: string): string {
-    const combined = current + chunk;
-    const combinedBytes = Buffer.byteLength(combined, 'utf8');
+  private appendOutputTail(
+    current: string,
+    chunk: string,
+  ): { readonly text: string; readonly truncated: boolean } {
+    const combined = this.redactOutput(current + chunk);
+    const combinedBytes = Buffer.from(combined, 'utf8');
 
-    if (combinedBytes <= MAX_CAPTURED_OUTPUT_BYTES) {
-      return combined;
+    if (combinedBytes.byteLength <= MAX_CAPTURED_OUTPUT_BYTES) {
+      return { text: combined, truncated: false };
     }
 
-    return Buffer.from(combined, 'utf8')
-      .subarray(combinedBytes - MAX_CAPTURED_OUTPUT_BYTES)
-      .toString('utf8');
+    let start = combinedBytes.byteLength - MAX_CAPTURED_OUTPUT_BYTES;
+    while (
+      start < combinedBytes.byteLength &&
+      ((combinedBytes[start] as number) & 0xc0) === 0x80
+    ) {
+      start += 1;
+    }
+
+    return {
+      text: combinedBytes.subarray(start).toString('utf8'),
+      truncated: true,
+    };
+  }
+
+  private redactOutput(value: string): string {
+    let redacted = value;
+    for (const secret of this.secretForms) {
+      redacted = redacted.split(secret).join('[REDACTED]');
+    }
+    return redacted;
   }
 
   private diagnostics(): string {
-    const secretForms = [
-      this.bootstrapSecret.toString('utf8'),
-      this.bootstrapSecret.toString('hex'),
-      this.bootstrapSecret.toString('base64'),
-    ].filter((value) => value.length > 0);
     let stdout = this.stdoutText;
     let stderr = this.stderrText;
 
-    for (const secret of secretForms) {
+    for (const secret of this.secretForms) {
       stdout = stdout.split(secret).join('[REDACTED]');
       stderr = stderr.split(secret).join('[REDACTED]');
     }

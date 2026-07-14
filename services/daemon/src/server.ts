@@ -4,7 +4,6 @@ import {
   mkdirSync,
   realpathSync,
   type BigIntStats,
-  type Stats,
   unlinkSync,
 } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
@@ -28,7 +27,6 @@ import {
   acquireRuntimeLock,
   RuntimeLock,
   RuntimeLockError,
-  type OwnerIdentity,
 } from './runtime/runtime-lock.js';
 
 const MAX_IN_FLIGHT_REQUESTS = 128;
@@ -39,6 +37,15 @@ export interface DaemonServerOptions {
   readonly bootstrapSecret: Uint8Array;
   readonly onFatal?: (error: Error) => void;
 }
+
+export class DaemonStartCancelledError extends Error {
+  constructor() {
+    super('Daemon startup was cancelled');
+    this.name = 'DaemonStartCancelledError';
+  }
+}
+
+type LifecycleState = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
 
 type BoundSocketIdentity = {
   readonly dev: bigint;
@@ -98,21 +105,6 @@ class IngressQuiescence {
 }
 
 const modeBits = (mode: number): number => mode & 0o777;
-const lstatIfExists = (path: string): Stats | undefined => {
-  try {
-    return lstatSync(path);
-  } catch (error) {
-    const code =
-      typeof error === 'object' && error !== null && 'code' in error
-        ? error.code
-        : undefined;
-    if (code === 'ENOENT') {
-      return undefined;
-    }
-    throw error;
-  }
-};
-
 const lstatBigIntIfExists = (
   path: string,
 ): BigIntStats | undefined => {
@@ -179,7 +171,12 @@ export class DaemonServer {
   private runtimeLock: RuntimeLock | undefined;
   private activeSocketPath: string | undefined;
   private boundSocketIdentity: BoundSocketIdentity | undefined;
+  private lifecycleState: LifecycleState = 'idle';
+  private startPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
+  private cleanupPromise: Promise<void> | undefined;
+  private stopRequested = false;
+  private listenAbortController: AbortController | undefined;
 
   constructor(options: DaemonServerOptions) {
     this.requestedSocketPath = resolve(options.socketPath);
@@ -189,6 +186,16 @@ export class DaemonServer {
   }
 
   async start(): Promise<void> {
+    if (this.lifecycleState !== 'idle') {
+      throw new Error('Daemon server can only be started once');
+    }
+
+    this.lifecycleState = 'starting';
+    this.startPromise = this.performStart();
+    await this.startPromise;
+  }
+
+  private async performStart(): Promise<void> {
     try {
       const runtimeLock = await acquireRuntimeLock({
         dataDir: this.dataDir,
@@ -199,31 +206,57 @@ export class DaemonServer {
         },
       });
       this.runtimeLock = runtimeLock;
+      this.throwIfStopRequested();
       runtimeLock.assertHeld();
-      this.activeSocketPath = this.prepareSocketBoundary(runtimeLock.predecessor);
-      runtimeLock.markPredecessorResolved(this.requestedSocketPath);
+      this.activeSocketPath = this.prepareSocketBoundary();
+      this.throwIfStopRequested();
       runtimeLock.assertHeld();
 
       const server = createServer((socket) => {
         this.acceptConnection(socket);
       });
       this.server = server;
+      this.throwIfStopRequested();
 
+      const listenAbortController = new AbortController();
+      this.listenAbortController = listenAbortController;
       await new Promise<void>((resolvePromise, rejectPromise) => {
-        const handleError = (error: Error): void => {
+        let settled = false;
+        const finish = (action: () => void): void => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          server.off('error', handleError);
           server.off('listening', handleListening);
-          rejectPromise(error);
+          listenAbortController.signal.removeEventListener('abort', handleAbort);
+          action();
+        };
+        const handleError = (error: Error): void => {
+          finish(() => rejectPromise(error));
         };
         const handleListening = (): void => {
-          server.off('error', handleError);
-          resolvePromise();
+          finish(resolvePromise);
+        };
+        const handleAbort = (): void => {
+          finish(() => rejectPromise(new DaemonStartCancelledError()));
         };
 
         server.once('error', handleError);
         server.once('listening', handleListening);
-        server.listen(this.activeSocketPath);
+        listenAbortController.signal.addEventListener('abort', handleAbort, {
+          once: true,
+        });
+        server.listen({
+          path: this.activeSocketPath,
+          signal: listenAbortController.signal,
+        });
       });
+      if (this.listenAbortController === listenAbortController) {
+        this.listenAbortController = undefined;
+      }
 
+      this.throwIfStopRequested();
       runtimeLock.assertHeld();
       const createdSocketStatus = lstatSync(this.activeSocketPath, {
         bigint: true,
@@ -252,9 +285,11 @@ export class DaemonServer {
         throw new Error('Invalid daemon socket boundary');
       }
       runtimeLock.assertHeld();
+      this.throwIfStopRequested();
+      this.lifecycleState = 'running';
     } catch (error) {
       try {
-        await this.stop();
+        await this.cleanup();
       } catch (cleanupError) {
         throw new AggregateError(
           [error, cleanupError],
@@ -262,16 +297,33 @@ export class DaemonServer {
           { cause: cleanupError },
         );
       }
+      if (!this.stopRequested) {
+        this.lifecycleState = 'stopped';
+      }
       throw error;
     }
   }
 
   async stop(): Promise<void> {
+    this.stopRequested = true;
+    this.listenAbortController?.abort();
     this.stopPromise ??= this.performStop();
     await this.stopPromise;
   }
 
   private async performStop(): Promise<void> {
+    this.lifecycleState = 'stopping';
+    await this.startPromise?.catch(() => undefined);
+    await this.cleanup();
+    this.lifecycleState = 'stopped';
+  }
+
+  private async cleanup(): Promise<void> {
+    this.cleanupPromise ??= this.performCleanup();
+    await this.cleanupPromise;
+  }
+
+  private async performCleanup(): Promise<void> {
     const cleanupErrors: unknown[] = [];
 
     try {
@@ -305,6 +357,7 @@ export class DaemonServer {
       }
     } finally {
       this.bootstrapSecret.fill(0);
+      this.listenAbortController = undefined;
     }
 
     if (cleanupErrors.length === 1) {
@@ -315,9 +368,13 @@ export class DaemonServer {
     }
   }
 
-  private prepareSocketBoundary(
-    predecessor: readonly OwnerIdentity[],
-  ): string {
+  private throwIfStopRequested(): void {
+    if (this.stopRequested) {
+      throw new DaemonStartCancelledError();
+    }
+  }
+
+  private prepareSocketBoundary(): string {
     const runtimeDirectory = dirname(this.requestedSocketPath);
     mkdirSync(runtimeDirectory, { mode: 0o700, recursive: true });
     const initialStatus = lstatSync(runtimeDirectory);
@@ -350,25 +407,41 @@ export class DaemonServer {
       throw new Error('Daemon socket path escapes its runtime directory');
     }
 
-    const existingSocketPath = lstatIfExists(socketPath);
+    const runtimeLock = this.runtimeLock;
+    if (!runtimeLock) {
+      throw new Error('Daemon runtime lock is unavailable');
+    }
+
+    const existingSocketPath = lstatBigIntIfExists(socketPath);
     if (existingSocketPath) {
-      this.runtimeLock?.assertHeld();
-      const hasStaleEvidence = predecessor.some(
-        (owner) => resolve(owner.socketPath) === this.requestedSocketPath,
-      );
+      runtimeLock.assertHeld();
       const status = existingSocketPath;
 
       if (
-        !hasStaleEvidence ||
         !status.isSocket() ||
         status.isSymbolicLink() ||
-        status.uid !== currentUid()
+        status.uid !== BigInt(currentUid())
       ) {
         throw new Error('Refusing to remove an unsafe pre-existing socket path');
       }
 
+      runtimeLock.assertPredecessorStaleForSocket(socketPath);
+      const confirmedSocketPath = lstatBigIntIfExists(socketPath);
+      if (
+        !confirmedSocketPath ||
+        !confirmedSocketPath.isSocket() ||
+        confirmedSocketPath.isSymbolicLink() ||
+        confirmedSocketPath.uid !== BigInt(currentUid()) ||
+        confirmedSocketPath.dev !== status.dev ||
+        confirmedSocketPath.ino !== status.ino
+      ) {
+        throw new Error('Pre-existing daemon socket changed during recovery');
+      }
+
       unlinkSync(socketPath);
     }
+
+    runtimeLock.markPredecessorResolved(socketPath);
 
     return socketPath;
   }
