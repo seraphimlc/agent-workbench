@@ -274,67 +274,111 @@ Not in this plan: Keychain, Model Profile, Session Runner, ToolRun, Audit intent
 ### Task 4: Persist Workspace, Session, Turn, Message, and Event facts
 
 **Files:**
+- Modify: `services/daemon/package.json`
+- Create: `services/daemon/scripts/copy-migrations.mjs`
 - Create: `services/daemon/src/db/database.ts`
+- Create: `services/daemon/src/db/canonical-json.ts`
+- Create: `services/daemon/src/db/errors.ts`
 - Create: `services/daemon/src/db/migrations.ts`
 - Create: `services/daemon/src/db/migrations/001_runtime_foundation.sql`
 - Create: `services/daemon/src/db/idempotency-repository.ts`
 - Create: `services/daemon/src/db/session-repository.ts`
 - Create: `services/daemon/src/runtime/session-service.ts`
+- Modify: `services/daemon/src/index.ts`
 - Modify: `services/daemon/src/rpc/router.ts`
 - Modify: `services/daemon/src/server.ts`
+- Modify: `packages/testkit/src/temp-runtime.ts`
+- Create: `tests/fixtures/crash-before-commit-daemon.ts`
+- Create: `tests/integration/migrations.test.ts`
 - Create: `tests/integration/session-persistence.test.ts`
 - Create: `tests/integration/mutation-idempotency.test.ts`
 - Create: `tests/integration/event-list-after.test.ts`
 
+**Locked implementation clarifications from the Task 4 preflight:**
+
+- `clientRequestId` is method-scoped because `rpc_idempotency` is keyed by `(method, client_request_id)`. Remove `UNIQUE(session_id,client_request_id)` from `turns`; the idempotency transaction is the single duplicate-mutation authority. A `session.create` and later `turn.enqueue` may use the same key and must create distinct Turns.
+- `workspace.register` has no Session Event. It atomically writes or reuses a Workspace plus its idempotency response. `session.create` appends exactly `session.created` then `turn.queued`; `turn.enqueue` appends exactly one `turn.queued`.
+- Initial Session projection is: `lifecycle_status=active`, `runtime_status=queued`, `queue_block_reason=null`, `recovery_episode=0`, `recovery_source_turn_id=null`, `current_turn_id=null`, `mode=craft`, `access_mode=full_access`, `next_turn_ordinal=2`, `next_event_seq=3`, `revision=1`, and one shared `created_at=updated_at=now`. The first Message has `role=user`, `status=completed`, the first Turn id, `created_at=completed_at=now`; the first Turn has `ordinal=1`, the `session.create` client key, `queue_kind=normal`, `status=queued`, the Message id, Craft/Full Access snapshots, `queued_at=now`, and all start/finish/error/result fields null.
+- Event actors are `daemon`, audiences are `both`, `toolRunId/blobId` are null. `session.created` has `turnId=null` and payload `{workspaceId,title,mode:"craft",accessMode:"full_access"}`. `turn.queued` has the created Turn id and payload `{ordinal,queueKind:"normal"}`.
+- The database filename is `<dataDir>/runtime.sqlite3`. Runtime order is kernel lock → open/configure DB → backup/migrate → construct DB-backed Router → socket listen/ready. Stop order closes connections/server, removes the owned socket, closes SQLite, then releases owner metadata/helper lock.
+- PRAGMAs are configured and verified outside migration transactions: WAL, foreign keys on, `busy_timeout=5000`, `synchronous=NORMAL`. Database and backup files are `0600`; backup directory is `0700`.
+- A fresh database with no applied migration gets no backup, even when several migrations are installed at first boot. If at least one version is already applied and any migration is pending, create one awaited Online Backup before the first pending migration at `backups/runtime-before-vNNN-<timestamp>-<uuid>.sqlite3`; backup failure aborts startup and no migration runs. No copy/WAL stitching, rotation, down migration, or checksum framework is added.
+- Crash injection is test-only dependency injection, never a production CLI flag, environment variable, or RPC method. A separate child entrypoint imports the normal daemon bootstrap and injects `beforeCommit`; it kills that child after facts and idempotency are staged but before the synchronous transaction callback returns.
+- Idempotency stores the method result only, never a complete RPC Envelope. The table column is `result_json`; an identical retry validates and returns that result, then the server wraps it with the retry's current `requestId` and `traceId`.
+- Stable domain and storage Error Envelopes use the exact mapping below; every row has `detailsRef=null` and the current request `traceId`. Driver codes are matched by prefix so extended SQLite codes inherit the row. Expected constraint conflicts are converted to domain errors before generic mapping. Unlisted SQLite codes such as `SQLITE_ERROR`, `SQLITE_MISUSE`, or unexpected `SQLITE_CONSTRAINT*`, plus non-SQLite programming failures, use redacted `RPC_INTERNAL_ERROR`.
+
+  | Source | code | category | retryable | message | userAction |
+  |---|---|---|---:|---|---|
+  | Idempotency hash mismatch | `IDEMPOTENCY_CONFLICT` | `validation` | false | `Client request id was already used with different input` | `Retry with a new client request id` |
+  | Missing/non-directory workspace path | `WORKSPACE_PATH_INVALID` | `validation` | false | `Workspace path must reference an existing directory` | `Choose an existing workspace directory` |
+  | Unknown workspace id | `WORKSPACE_NOT_FOUND` | `validation` | false | `Workspace was not found` | `Register or choose an existing workspace` |
+  | Unknown session id | `SESSION_NOT_FOUND` | `validation` | false | `Session was not found` | `Refresh and choose an existing session` |
+  | afterSeq greater than highWaterSeq | `EVENT_CURSOR_AHEAD` | `validation` | false | `Event cursor is ahead of the current session history` | `Reload the session snapshot` |
+  | `SQLITE_BUSY*` / `SQLITE_LOCKED*` | `STORAGE_BUSY` | `storage` | true | `Local storage is temporarily busy` | `Retry the request` |
+  | `SQLITE_FULL*` | `STORAGE_FULL` | `storage` | false | `Local storage is full` | `Free disk space and retry` |
+  | `SQLITE_READONLY*` | `STORAGE_READ_ONLY` | `storage` | false | `Local storage is read-only` | `Restore write permission and retry` |
+  | `SQLITE_CORRUPT*` / `SQLITE_NOTADB*` | `STORAGE_CORRUPT` | `storage` | false | `Local storage is corrupted` | `Restore from a verified backup or contact support` |
+  | `SQLITE_IOERR*` / `SQLITE_CANTOPEN*` | `STORAGE_IO_ERROR` | `storage` | false | `Local storage could not be accessed` | `Check disk availability and permissions, then restart the app` |
+  | Other/unexpected driver or programming error | `RPC_INTERNAL_ERROR` | `internal` | false | `RPC request failed internally` | null |
+
 - [ ] **Step 1: Write the failing persistence test**
 
-  Register a canonical temp workspace, create a Craft/Full Access Session with prompt, restart Daemon on the same data directory, and assert Snapshot contains the same Session, user Message, queued first Turn, and ordered Events.
+  Register a canonical temp workspace, create a Craft/Full Access Session with prompt, restart Daemon on the same data directory, and assert Snapshot contains the same Session, user Message, queued first Turn, `session.created` seq 1, `turn.queued` seq 2, `highWaterSeq=2`, and `nextEventSeq=3`. Repeat after a committed-WAL unclean exit.
 
 - [ ] **Step 2: Write failing idempotency and Event tests**
 
-  Repeat each mutation with the same `clientRequestId` and identical normalized payload; assert the original result is returned and row counts do not change. Reuse the key with a different payload; assert `IDEMPOTENCY_CONFLICT`. Verify `event.listAfter` returns strictly consecutive seq up to its limit and highWaterSeq in the same read transaction.
+  Repeat each mutation with the same `clientRequestId` and identical normalized payload, including recursively reordered object keys; assert the original result is returned and row counts do not change. Reuse the key with a different payload; assert `IDEMPOTENCY_CONFLICT`. Prove method scope by reusing one key for `session.create` and `turn.enqueue` in the same Session. Concurrent identical requests create one result; concurrent different payloads yield one winner and one conflict. Two distinct concurrent enqueues receive consecutive ordinals and Event seq values.
 
-  Add a crash-atomicity case using a test hook immediately before transaction commit: abort the connection, retry the same mutation, and prove either the whole transaction was absent and is created once, or the committed response is reused; facts and idempotency record may never diverge.
+  Verify `event.listAfter` returns exactly `min(limit, highWaterSeq-afterSeq)` consecutive Events and highWaterSeq from the same read transaction. `afterSeq=highWaterSeq` returns empty; `afterSeq>highWaterSeq` returns `EVENT_CURSOR_AHEAD`.
+
+  Add a crash-atomicity case using the dedicated child harness and `beforeCommit` hook immediately before transaction commit. Kill the child, restart the normal Daemon, retry the same `session.create`, and prove the first transaction was wholly absent and the retry creates exactly one Session, Message, Turn, Event pair, and idempotency record. Sequential replay separately proves the committed-response-reuse branch. Facts and idempotency may never diverge.
 
 - [ ] **Step 3: Run and confirm RED**
 
-  Run: `pnpm test tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts`
+  Run: `pnpm test tests/integration/migrations.test.ts tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts`
 
 - [ ] **Step 4: Implement the migration exactly**
 
   Create these tables and constraints:
 
-  - `schema_migrations(version PRIMARY KEY, applied_at)`;
-  - `workspaces(id PRIMARY KEY, path, canonical_path UNIQUE, created_at)`;
-  - `sessions(id PRIMARY KEY, title, workspace_id FK, lifecycle_status, runtime_status, queue_block_reason, recovery_episode, recovery_source_turn_id, current_turn_id, mode, access_mode, next_turn_ordinal, next_event_seq, revision, created_at, updated_at)`;
-  - `messages(id PRIMARY KEY, session_id FK, turn_id, role, status, content, created_at, completed_at)`;
-  - `turns(id PRIMARY KEY, session_id FK, ordinal, client_request_id, queue_kind, status, input_message_id FK, mode_snapshot, access_mode_snapshot, queued_at, started_at, finished_at, error_code, error_message, result_message_id, UNIQUE(session_id,ordinal), UNIQUE(session_id,client_request_id))`;
-  - `session_events(id PRIMARY KEY, session_id FK, turn_id, seq, type, actor, audience, payload_json, created_at, UNIQUE(session_id,seq))`;
-  - `scheduler_slots(slot_no PRIMARY KEY, state, owner_turn_id, updated_at)` with exactly row `slot_no=1,state='free'`;
-  - `runner_leases(id PRIMARY KEY, daemon_epoch, lease_epoch, session_id, current_turn_id, status, heartbeat_at, lease_expires_at)`;
-  - `rpc_idempotency(method, client_request_id, normalized_payload_hash, response_json, created_at, PRIMARY KEY(method,client_request_id))`.
+  - `schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`;
+  - `workspaces(id TEXT PRIMARY KEY, path TEXT NOT NULL, canonical_path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)`;
+  - `sessions(id TEXT PRIMARY KEY, title, workspace_id FK, lifecycle_status, runtime_status, queue_block_reason, recovery_episode, recovery_source_turn_id, current_turn_id, mode, access_mode, next_turn_ordinal, next_event_seq, revision, created_at, updated_at)` with required values and status/counter checks;
+  - `messages(id TEXT PRIMARY KEY, session_id FK, turn_id FK, role, status, content, created_at, completed_at)`;
+  - `turns(id TEXT PRIMARY KEY, session_id FK, ordinal, client_request_id, queue_kind, status, input_message_id FK, mode_snapshot, access_mode_snapshot, queued_at, started_at, finished_at, error_code, error_message, result_message_id FK, UNIQUE(session_id,ordinal))`;
+  - `session_events(id TEXT PRIMARY KEY, session_id FK, turn_id FK, tool_run_id, seq, type, actor, audience, payload_json, blob_id, created_at, UNIQUE(session_id,seq))`;
+  - `scheduler_slots(slot_no INTEGER PRIMARY KEY CHECK(slot_no=1), state TEXT NOT NULL CHECK(state IN ('free','owned')), owner_turn_id TEXT UNIQUE REFERENCES turns(id), updated_at TEXT NOT NULL, CHECK((state='free' AND owner_turn_id IS NULL) OR (state='owned' AND owner_turn_id IS NOT NULL)))`, with exactly the initial row `slot_no=1,state='free',owner_turn_id=null,updated_at=now`;
+  - `runner_leases(id TEXT PRIMARY KEY, daemon_epoch TEXT NOT NULL, lease_epoch INTEGER NOT NULL CHECK(lease_epoch>0), session_id TEXT NOT NULL REFERENCES sessions(id), current_turn_id TEXT NOT NULL REFERENCES turns(id), status TEXT NOT NULL CHECK(status IN ('active','expired')), heartbeat_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, UNIQUE(daemon_epoch,lease_epoch))`;
+  - `rpc_idempotency(method TEXT NOT NULL, client_request_id TEXT NOT NULL, normalized_payload_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(method,client_request_id))`.
 
-  Preallocate UUIDv7 ids before inserts. Declare the Message↔Turn and Session.current_turn_id foreign keys deferrable so Session + first Message + first Turn can commit atomically without disabling foreign keys. Enable WAL, foreign keys, `busy_timeout=5000`, and `synchronous=NORMAL`. `migrations.ts` discovers files matching `NNN_*.sql`, sorts by numeric prefix, checks `schema_migrations`, and applies every unapplied file transactionally; Task 5's `002` therefore needs no hard-coded registry edit. Before any non-initial future migration, create a consistent Online Backup API copy that includes committed WAL content; the empty first migration does not need a backup.
+  Preallocate UUIDv7 ids before inserts. `messages.turn_id`, `turns.input_message_id`, `turns.result_message_id`, and `sessions.current_turn_id` are the explicit circular foreign keys and are `DEFERRABLE INITIALLY DEFERRED`; ordinary parent foreign keys remain immediate. Migration 001 itself creates `schema_migrations`, and the runner inserts version 1 in that same transaction; it must not create the table out of band. Test every migration failure rolls back both schema/data and its version row.
+
+  `migrations.ts` enumerates every `.sql` asset, and startup fails if any SQL filename is not exactly `NNN_name.sql`, uses version `000`, duplicates a version, or creates a gap in the contiguous installed sequence beginning at `001`. It sorts numerically and requires the database's applied versions to be exactly the continuous prefix `001..k`; missing, out-of-order, duplicate, or ahead-of-install history fails closed rather than backfilling old migrations. It then applies each pending file transactionally; Task 5's `002` needs no registry edit. The Daemon build must copy SQL assets beside compiled DB code, and a built-package test must prove discovery works from `dist`.
 
 - [ ] **Step 5: Implement transactional RPC handlers**
 
-  `workspace.register`, `session.create`, and `turn.enqueue` each allocate ids, rows, Events, and their `rpc_idempotency` response in the same `BEGIN IMMEDIATE` transaction. Canonicalize payloads by recursively sorting object keys, preserving array order, encoding UTF-8 JSON without insignificant whitespace, then hashing SHA-256. `session.create` creates Session + first user Message + first queued Turn + events atomically. `session.getSnapshot` reads materialized rows and highWaterSeq in one read transaction. No Renderer/Runner path receives the SQLite filename.
+  Every mutation checks `(method,clientRequestId)` and the normalized payload hash inside one synchronous `BEGIN IMMEDIATE` transaction before semantic filesystem validation. An identical hit returns the method's stored `result_json` without allocating ids or re-checking a now-missing workspace path; the server creates a fresh response Envelope with the retry request's correlation fields. A different hash throws `IDEMPOTENCY_CONFLICT`. Canonicalize payloads by recursively sorting object keys, preserving array order, encoding UTF-8 JSON without insignificant whitespace, then hashing SHA-256.
+
+  `workspace.register` requires an existing directory, stores `path=resolve(input)` and `canonical_path=realpathSync.native(input)`, and returns the existing Workspace for a fresh key that resolves to the same canonical path. It writes no Session Event. `session.create` atomically creates Session + first completed user Message + first queued Turn + the two locked Events. `turn.enqueue` atomically allocates the next ordinal, Message, Turn, one `turn.queued` Event, increments Session counters/revision once, and changes `runtime_status` only from `idle` to `queued`; it never clears or overwrites `running`, `waiting_for_user`, `canceling`, `recovering`, `error`, `queue_block_reason`, `current_turn_id`, or recovery fields. All facts and the `rpc_idempotency` result commit together.
+
+  `session.getSnapshot` reads Session, ordered Messages/Turns, highWaterSeq, and Events `1..highWaterSeq` in one read transaction. `event.listAfter` captures highWaterSeq and its exact page in one read transaction. Convert domain/SQLite failures to the locked stable Error Envelopes only after the transaction has rolled back; never expose SQL text, database paths, or raw driver messages. No Renderer/Runner path receives the SQLite filename.
 
 - [ ] **Step 6: Run and confirm GREEN**
 
   Run:
 
   ```bash
-  pnpm test tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts
+  pnpm test tests/integration/migrations.test.ts tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts
   pnpm --filter @agent-workbench/daemon typecheck
+  pnpm --filter @agent-workbench/daemon build
   ```
 
-  Test teardown must assert `PRAGMA foreign_key_check` returns zero rows.
+  Test teardown must assert `PRAGMA foreign_key_check` returns zero rows. Migration tests also prove: fresh install/no backup; existing 001 plus committed WAL data/one Online Backup before a synthetic 002; the backup contains the WAL data; built SQL discovery; invalid/000/duplicate/gapped SQL filenames fail closed; corrupted non-prefix applied histories such as `{002}` or `{001,003}` fail closed; and failed migration rollback.
 
 - [ ] **Step 7: Commit**
 
   ```bash
-  git add services/daemon/src/db services/daemon/src/runtime/session-service.ts services/daemon/src/rpc/router.ts services/daemon/src/server.ts tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts
+  git add services/daemon/package.json services/daemon/scripts services/daemon/src/db services/daemon/src/index.ts services/daemon/src/runtime/session-service.ts services/daemon/src/rpc/router.ts services/daemon/src/server.ts packages/testkit/src/temp-runtime.ts tests/fixtures/crash-before-commit-daemon.ts tests/integration/migrations.test.ts tests/integration/session-persistence.test.ts tests/integration/mutation-idempotency.test.ts tests/integration/event-list-after.test.ts
   git commit -m "feat: persist craft session facts"
   ```
 
