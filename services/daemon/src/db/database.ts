@@ -1,4 +1,11 @@
-import { chmodSync, mkdirSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -35,17 +42,52 @@ export interface OpenRuntimeDatabaseOptions
   readonly dataDir: string;
 }
 
+export const acquireRuntimeDatabase = (
+  options: OpenRuntimeDatabaseOptions,
+): Database.Database => {
+  mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
+  const databasePath = join(options.dataDir, DATABASE_FILENAME);
+  const descriptor = openSync(
+    databasePath,
+    constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    const initialStatus = fstatSync(descriptor);
+    if (
+      !initialStatus.isFile() ||
+      typeof process.getuid !== 'function' ||
+      initialStatus.uid !== process.getuid()
+    ) {
+      throw new Error('Invalid SQLite database file boundary');
+    }
+    fchmodSync(descriptor, 0o600);
+    const securedStatus = fstatSync(descriptor);
+    if ((securedStatus.mode & 0o777) !== 0o600) {
+      throw new Error('SQLite database file must have mode 0600');
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+
+  return new Database(databasePath);
+};
+
+export const initializeRuntimeDatabase = async (
+  database: Database.Database,
+  options: OpenRuntimeDatabaseOptions,
+): Promise<void> => {
+  configureDatabase(database);
+  await migrateDatabase(database, options);
+};
+
 export const openRuntimeDatabase = async (
   options: OpenRuntimeDatabaseOptions,
 ): Promise<Database.Database> => {
-  mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
-  const databasePath = join(options.dataDir, DATABASE_FILENAME);
-  const database = new Database(databasePath);
+  const database = acquireRuntimeDatabase(options);
 
   try {
-    chmodSync(databasePath, 0o600);
-    configureDatabase(database);
-    await migrateDatabase(database, options);
+    await initializeRuntimeDatabase(database, options);
     return database;
   } catch (error) {
     database.close();

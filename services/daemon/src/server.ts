@@ -23,7 +23,11 @@ import {
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
-import { openRuntimeDatabase } from './db/database.js';
+import {
+  acquireRuntimeDatabase,
+  initializeRuntimeDatabase,
+  type OpenRuntimeDatabaseOptions,
+} from './db/database.js';
 import { mapRpcFailure } from './db/errors.js';
 import { Authenticator } from './rpc/authenticator.js';
 import { Router } from './rpc/router.js';
@@ -46,6 +50,13 @@ export interface DaemonServerOptions {
   readonly bootstrapSecret: Uint8Array;
   readonly onFatal?: (error: Error) => void;
   readonly sessionServiceHooks?: SessionServiceHooks;
+  readonly acquireDatabase?: (
+    options: OpenRuntimeDatabaseOptions,
+  ) => Database.Database;
+  readonly initializeDatabase?: (
+    database: Database.Database,
+    options: OpenRuntimeDatabaseOptions,
+  ) => Promise<void>;
   readonly closeDatabase?: (database: Database.Database) => void | Promise<void>;
 }
 
@@ -181,6 +192,13 @@ export class DaemonServer {
   private readonly bootstrapSecret: Buffer;
   private readonly onFatal: (error: Error) => void;
   private readonly sessionServiceHooks: SessionServiceHooks;
+  private readonly acquireDatabase: (
+    options: OpenRuntimeDatabaseOptions,
+  ) => Database.Database;
+  private readonly initializeDatabase: (
+    database: Database.Database,
+    options: OpenRuntimeDatabaseOptions,
+  ) => Promise<void>;
   private readonly closeDatabase: (
     database: Database.Database,
   ) => void | Promise<void>;
@@ -214,6 +232,9 @@ export class DaemonServer {
     this.bootstrapSecret = Buffer.from(options.bootstrapSecret);
     this.onFatal = options.onFatal ?? (() => undefined);
     this.sessionServiceHooks = options.sessionServiceHooks ?? {};
+    this.acquireDatabase = options.acquireDatabase ?? acquireRuntimeDatabase;
+    this.initializeDatabase =
+      options.initializeDatabase ?? initializeRuntimeDatabase;
     this.closeDatabase =
       options.closeDatabase ??
       ((database) => {
@@ -244,7 +265,9 @@ export class DaemonServer {
       this.runtimeLock = runtimeLock;
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
-      this.database = await openRuntimeDatabase({ dataDir: this.dataDir });
+      const databaseOptions = { dataDir: this.dataDir };
+      this.database = this.acquireDatabase(databaseOptions);
+      await this.initializeDatabase(this.database, databaseOptions);
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
       this.databaseRouter = new Router(

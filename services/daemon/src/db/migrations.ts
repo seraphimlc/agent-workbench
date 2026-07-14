@@ -89,21 +89,28 @@ const hasMigrationTable = (database: Database.Database): boolean => {
 };
 
 const assertMigrationTableShape = (database: Database.Database): void => {
-  const columns = database.pragma('table_info(schema_migrations)') as Array<{
+  const columns = database.pragma('table_xinfo(schema_migrations)') as Array<{
+    readonly cid: number;
     readonly name: string;
     readonly type: string;
     readonly notnull: number;
     readonly pk: number;
+    readonly hidden: number;
   }>;
   const exactShape =
     columns.length === 2 &&
+    columns[0]?.cid === 0 &&
     columns[0]?.name === 'version' &&
     columns[0]?.type.toUpperCase() === 'INTEGER' &&
+    columns[0]?.notnull === 0 &&
     columns[0]?.pk === 1 &&
+    columns[0]?.hidden === 0 &&
+    columns[1]?.cid === 1 &&
     columns[1]?.name === 'applied_at' &&
     columns[1]?.type.toUpperCase() === 'TEXT' &&
     columns[1]?.notnull === 1 &&
-    columns[1]?.pk === 0;
+    columns[1]?.pk === 0 &&
+    columns[1]?.hidden === 0;
   if (!exactShape) {
     throw migrationError('schema_migrations has an invalid shape');
   }

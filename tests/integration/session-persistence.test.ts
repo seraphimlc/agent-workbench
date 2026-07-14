@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   realpathSync,
   symlinkSync,
@@ -694,5 +695,71 @@ describe('craft session persistence', () => {
     await runtimeLock?.release();
     const replacement = runtime.spawnDaemon();
     await replacement.waitForReady();
+  }, 12_000);
+
+  it('retains ownership when database initialization and cleanup close both fail', async () => {
+    runtime = createTempRuntime();
+    const ownerPath = join(runtime.dataDir, '.daemon-owner.json');
+    let initializeCalled = false;
+    let closeCalled = false;
+    const server = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: Buffer.alloc(32, 0x64),
+      initializeDatabase: async () => {
+        initializeCalled = true;
+        throw new Error('injected initialize failure');
+      },
+      closeDatabase: () => {
+        closeCalled = true;
+        throw new Error('injected close failure');
+      },
+    } as never);
+
+    try {
+      const startOutcome = await server.start().then(
+        () => 'fulfilled' as const,
+        () => 'rejected' as const,
+      );
+      expect(startOutcome).toBe('rejected');
+      await expect(server.stop()).rejects.toThrow();
+      expect(initializeCalled).toBe(true);
+      expect(closeCalled).toBe(true);
+      expect(existsSync(ownerPath)).toBe(true);
+      expect(existsSync(runtime.socketPath)).toBe(false);
+      const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+      expect(existsSync(databasePath)).toBe(true);
+      const databaseIdentity = lstatSync(databasePath, { bigint: true });
+
+      let contenderAcquireCalled = false;
+      const contender = new DaemonServer({
+        socketPath: runtime.alternateSocketPath,
+        dataDir: runtime.dataDir,
+        bootstrapSecret: Buffer.alloc(32, 0x65),
+        acquireDatabase: () => {
+          contenderAcquireCalled = true;
+          throw new Error('contender must not acquire SQLite');
+        },
+      } as never);
+      await expect(contender.start()).rejects.toThrow();
+      await contender.stop();
+      expect(contenderAcquireCalled).toBe(false);
+      expect(existsSync(runtime.alternateSocketPath)).toBe(false);
+      const unchangedDatabase = lstatSync(databasePath, { bigint: true });
+      expect(unchangedDatabase.dev).toBe(databaseIdentity.dev);
+      expect(unchangedDatabase.ino).toBe(databaseIdentity.ino);
+    } finally {
+      await server.stop().catch(() => undefined);
+      const internals = server as unknown as {
+        readonly database?: { close(): void };
+        readonly runtimeLock?: { release(): Promise<void> };
+      };
+      try {
+        internals.database?.close();
+      } catch {
+        // The database may already have been closed by a future implementation.
+      }
+      await internals.runtimeLock?.release();
+    }
   }, 12_000);
 });

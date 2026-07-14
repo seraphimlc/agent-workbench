@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -19,6 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  acquireRuntimeDatabase,
   configureDatabase,
   openRuntimeDatabase,
 } from '../../services/daemon/src/db/database.js';
@@ -112,6 +114,29 @@ describe('daemon SQLite migrations', () => {
     expect(
       existsSync(backupDirectory) ? readdirSync(backupDirectory) : [],
     ).toEqual([]);
+  });
+
+  it('rejects a symlink database boundary before opening native SQLite', () => {
+    runtime = createTempRuntime();
+    const targetPath = join(runtime.rootDir, 'outside-target.sqlite3');
+    const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+    writeFileSync(targetPath, 'must-not-open', { mode: 0o640 });
+    chmodSync(targetPath, 0o640);
+    symlinkSync(targetPath, databasePath);
+    let acquired: import('better-sqlite3').Database | undefined;
+
+    try {
+      expect(() => {
+        acquired = acquireRuntimeDatabase({ dataDir: runtime?.dataDir ?? '' });
+      }).toThrow();
+      expect(lstatSync(databasePath).isSymbolicLink()).toBe(true);
+      expect(readFileSync(targetPath, 'utf8')).toBe('must-not-open');
+      expect(lstatSync(targetPath).mode & 0o777).toBe(0o640);
+      expect(existsSync(`${databasePath}-wal`)).toBe(false);
+      expect(existsSync(`${databasePath}-shm`)).toBe(false);
+    } finally {
+      acquired?.close();
+    }
   });
 
   it('does not create a database artifact when the kernel lock is already held', async () => {
@@ -384,6 +409,54 @@ describe('daemon SQLite migrations', () => {
       }
     },
   );
+
+  it('rejects a hidden generated schema_migrations column before backup or migration', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {
+      '001_base.sql': `
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        );
+      `,
+      '002_pending.sql': 'CREATE TABLE must_not_install (value TEXT NOT NULL);',
+    });
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'hidden-history.sqlite3'),
+    );
+    try {
+      database.exec(`
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL,
+          hidden_copy TEXT GENERATED ALWAYS AS (applied_at) VIRTUAL
+        );
+        INSERT INTO schema_migrations (version, applied_at) VALUES (1, 'before');
+      `);
+      expect(database.pragma('table_info(schema_migrations)')).toHaveLength(2);
+      expect(
+        database.pragma('table_xinfo(schema_migrations)'),
+      ).toEqual([
+        expect.objectContaining({ name: 'version', hidden: 0 }),
+        expect.objectContaining({ name: 'applied_at', hidden: 0 }),
+        expect.objectContaining({ name: 'hidden_copy', hidden: 2 }),
+      ]);
+
+      await expect(
+        migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        }),
+      ).rejects.toThrow(/Invalid migration installation/);
+      expect(existsSync(join(runtime.dataDir, 'backups'))).toBe(false);
+      expect(tableExists(database, 'must_not_install')).toBe(false);
+      expect(
+        database.prepare('SELECT version FROM schema_migrations').all(),
+      ).toEqual([{ version: 1 }]);
+    } finally {
+      database.close();
+    }
+  });
 
   it('rolls back schema, data, and version when migration 001 fails', async () => {
     runtime = createTempRuntime();
