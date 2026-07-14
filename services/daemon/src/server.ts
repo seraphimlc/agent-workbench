@@ -18,16 +18,24 @@ import {
   type RpcRequest,
   type RpcRequestEnvelope,
   type RpcResponse,
+  type ErrorCategory,
 } from '@agent-workbench/protocol';
+import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
+import { openRuntimeDatabase } from './db/database.js';
+import { mapRpcFailure } from './db/errors.js';
 import { Authenticator } from './rpc/authenticator.js';
-import { Router, RouterError } from './rpc/router.js';
+import { Router } from './rpc/router.js';
 import {
   acquireRuntimeLock,
   RuntimeLock,
   RuntimeLockError,
 } from './runtime/runtime-lock.js';
+import {
+  SessionService,
+  type SessionServiceHooks,
+} from './runtime/session-service.js';
 
 const MAX_IN_FLIGHT_REQUESTS = 128;
 const FULL_CLOSE_FALLBACK_MS = 500;
@@ -37,6 +45,8 @@ export interface DaemonServerOptions {
   readonly dataDir: string;
   readonly bootstrapSecret: Uint8Array;
   readonly onFatal?: (error: Error) => void;
+  readonly sessionServiceHooks?: SessionServiceHooks;
+  readonly closeDatabase?: (database: Database.Database) => void | Promise<void>;
 }
 
 export class DaemonStartCancelledError extends Error {
@@ -134,9 +144,10 @@ const createErrorResponse = (
   request: RpcRequestEnvelope,
   error: {
     readonly code: string;
-    readonly category: 'validation' | 'runtime' | 'internal';
+    readonly category: ErrorCategory;
     readonly message: string;
     readonly retryable: boolean;
+    readonly userAction?: string | null;
   },
 ): RpcResponse => ({
   kind: 'response',
@@ -145,8 +156,11 @@ const createErrorResponse = (
   traceId: request.traceId,
   ok: false,
   error: {
-    ...error,
-    userAction: null,
+    code: error.code,
+    category: error.category,
+    message: error.message,
+    retryable: error.retryable,
+    userAction: error.userAction ?? null,
     detailsRef: null,
     traceId: request.traceId,
   },
@@ -166,10 +180,24 @@ export class DaemonServer {
   private readonly daemonEpoch = uuidv7();
   private readonly bootstrapSecret: Buffer;
   private readonly onFatal: (error: Error) => void;
-  private readonly router = new Router();
+  private readonly sessionServiceHooks: SessionServiceHooks;
+  private readonly closeDatabase: (
+    database: Database.Database,
+  ) => void | Promise<void>;
+  private readonly router = {
+    handle: async (request: RpcRequest): Promise<unknown> => {
+      const databaseRouter = this.databaseRouter;
+      if (!databaseRouter) {
+        throw new Error('RPC router is unavailable');
+      }
+      return await databaseRouter.handle(request);
+    },
+  };
   private readonly connections = new Set<Socket>();
   private readonly closingSockets = new WeakSet<Socket>();
   private server: Server | undefined;
+  private database: Database.Database | undefined;
+  private databaseRouter: Router | undefined;
   private runtimeLock: RuntimeLock | undefined;
   private activeSocketPath: string | undefined;
   private boundSocketIdentity: BoundSocketIdentity | undefined;
@@ -185,6 +213,12 @@ export class DaemonServer {
     this.dataDir = resolve(options.dataDir);
     this.bootstrapSecret = Buffer.from(options.bootstrapSecret);
     this.onFatal = options.onFatal ?? (() => undefined);
+    this.sessionServiceHooks = options.sessionServiceHooks ?? {};
+    this.closeDatabase =
+      options.closeDatabase ??
+      ((database) => {
+        database.close();
+      });
   }
 
   async start(): Promise<void> {
@@ -210,6 +244,12 @@ export class DaemonServer {
       this.runtimeLock = runtimeLock;
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
+      this.database = await openRuntimeDatabase({ dataDir: this.dataDir });
+      this.throwIfStopRequested();
+      runtimeLock.assertHeld();
+      this.databaseRouter = new Router(
+        new SessionService(this.database, this.sessionServiceHooks),
+      );
       this.activeSocketPath = this.prepareSocketBoundary();
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
@@ -327,6 +367,7 @@ export class DaemonServer {
 
   private async performCleanup(): Promise<void> {
     const cleanupErrors: unknown[] = [];
+    let databaseClosed = this.database === undefined;
 
     try {
       const server = this.server;
@@ -353,9 +394,20 @@ export class DaemonServer {
       }
 
       try {
-        await this.runtimeLock?.release();
+        if (this.database) {
+          await this.closeDatabase(this.database);
+          databaseClosed = true;
+        }
       } catch (error) {
         cleanupErrors.push(error);
+      }
+
+      if (databaseClosed) {
+        try {
+          await this.runtimeLock?.release();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
       }
     } finally {
       this.bootstrapSecret.fill(0);
@@ -631,19 +683,7 @@ export class DaemonServer {
         socket,
         createErrorResponse(
           request,
-          error instanceof RouterError
-            ? {
-                code: error.code,
-                category: 'runtime',
-                message: error.message,
-                retryable: false,
-              }
-            : {
-                code: 'RPC_INTERNAL_ERROR',
-                category: 'internal',
-                message: 'RPC request failed internally',
-                retryable: false,
-          },
+          mapRpcFailure(error),
         ),
         context,
       );

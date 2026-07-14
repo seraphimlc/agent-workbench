@@ -1,6 +1,9 @@
 import { closeSync, readSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { DaemonServer, DaemonStartCancelledError } from './server.js';
+import type { SessionServiceHooks } from './runtime/session-service.js';
 
 type CliOptions = {
   readonly socketPath: string;
@@ -131,7 +134,13 @@ const readStartupInputs = (): { options: CliOptions; bootstrapSecret: Buffer } =
   }
 };
 
-const main = async (): Promise<void> => {
+export interface RunDaemonOptions {
+  readonly sessionServiceHooks?: SessionServiceHooks;
+}
+
+export const runDaemon = async (
+  dependencies: RunDaemonOptions = {},
+): Promise<void> => {
   const { options, bootstrapSecret } = readStartupInputs();
   let shutdownPromise: Promise<void> | undefined;
   let requestedExitCode = 0;
@@ -139,6 +148,9 @@ const main = async (): Promise<void> => {
     socketPath: options.socketPath,
     dataDir: options.dataDir,
     bootstrapSecret,
+    ...(dependencies.sessionServiceHooks
+      ? { sessionServiceHooks: dependencies.sessionServiceHooks }
+      : {}),
     onFatal: () => {
       void shutdown(1).catch(() => {
         process.exitCode = 1;
@@ -180,9 +192,15 @@ const main = async (): Promise<void> => {
   );
 };
 
-void main().catch(() => {
-  process.stderr.write(
-    `${JSON.stringify({ event: 'startup_error', code: 'DAEMON_STARTUP_FAILED' })}\n`,
-  );
-  process.exitCode = 1;
-});
+const isMainEntryPoint =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainEntryPoint) {
+  void runDaemon().catch(() => {
+    process.stderr.write(
+      `${JSON.stringify({ event: 'startup_error', code: 'DAEMON_STARTUP_FAILED' })}\n`,
+    );
+    process.exitCode = 1;
+  });
+}

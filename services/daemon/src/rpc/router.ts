@@ -1,22 +1,43 @@
 import type { RpcRequest } from '@agent-workbench/protocol';
 
-export class RouterError extends Error {
-  readonly code = 'RPC_NOT_IMPLEMENTED';
-}
+import { SessionService } from '../runtime/session-service.js';
 
 export class Router {
-  async handle(request: RpcRequest): Promise<unknown> {
-    if (request.method === 'app.health') {
-      await new Promise<void>((resolvePromise) => {
-        setImmediate(resolvePromise);
-      });
-      return {
-        status: 'ready',
-        protocolVersion: 1,
-        pid: process.pid,
-      };
-    }
+  constructor(private readonly sessions: SessionService) {}
 
-    throw new RouterError('RPC method is not implemented in Slice 1A');
+  async handle(request: RpcRequest): Promise<unknown> {
+    switch (request.method) {
+      case 'app.health': {
+        await new Promise<void>((resolvePromise) => {
+          setImmediate(resolvePromise);
+        });
+        return {
+          status: 'ready',
+          protocolVersion: 1,
+          pid: process.pid,
+        };
+      }
+      case 'workspace.register':
+        return this.sessions.registerWorkspace(
+          request.payload,
+          request.clientRequestId,
+        );
+      case 'session.create':
+        return this.sessions.createSession(
+          request.payload,
+          request.clientRequestId,
+        );
+      case 'session.getSnapshot':
+        return this.sessions.getSnapshot(request.payload.sessionId);
+      case 'turn.enqueue':
+        return this.sessions.enqueueTurn(
+          request.payload,
+          request.clientRequestId,
+        );
+      case 'event.listAfter':
+        return this.sessions.listEventsAfter(request.payload);
+      case 'auth.respond':
+        throw new Error('Authentication requests do not route to handlers');
+    }
   }
 }

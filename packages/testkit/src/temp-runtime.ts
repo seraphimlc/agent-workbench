@@ -62,6 +62,8 @@ export interface TempRuntime {
 }
 
 export interface SpawnDaemonOptions {
+  readonly entryPoint?: string;
+  readonly useDevelopmentConditions?: boolean;
   readonly bootstrapSecret?: Buffer;
   readonly bootstrapSecretChunks?: readonly Uint8Array[];
   readonly socketPath?: string;
@@ -571,10 +573,12 @@ export const createTempRuntime = (): TempRuntime => {
       const bootstrapSecret =
         options.bootstrapSecret ?? chunkedSecret ?? randomBytes(32);
       const launchArguments = [
-        '--conditions=development',
+        ...(options.useDevelopmentConditions === false
+          ? []
+          : ['--conditions=development']),
         '--import',
         'tsx',
-        daemonEntryPoint,
+        options.entryPoint ?? daemonEntryPoint,
         '--socket',
         options.socketPath ?? socketPath,
         '--data-dir',
