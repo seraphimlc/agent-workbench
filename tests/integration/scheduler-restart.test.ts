@@ -613,6 +613,37 @@ describe('startup scheduler recovery', () => {
           );
       },
     },
+    {
+      name: 'whitespace-only recovery reason',
+      corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        database
+          .prepare(
+            `UPDATE session_events
+             SET payload_json = ?
+             WHERE session_id = ? AND turn_id = ? AND type = 'turn.interrupted'`,
+          )
+          .run(
+            JSON.stringify({ reason: '   ' }),
+            fixture.sessionId,
+            fixture.turnId,
+          );
+        database
+          .prepare(
+            `UPDATE session_events
+             SET payload_json = ?
+             WHERE session_id = ? AND turn_id = ? AND type = 'recovery.detected'`,
+          )
+          .run(
+            JSON.stringify({
+              reason: '   ',
+              recoveryEpisode: 1,
+              recoverySourceTurnId: fixture.turnId,
+            }),
+            fixture.sessionId,
+            fixture.turnId,
+          );
+      },
+    },
   ])(
     'fails closed with zero writes for an already-recovered state with $name',
     async ({ corrupt }) => {

@@ -240,7 +240,7 @@ const assertRecoveredStatesAreComplete = (
     if (
       Object.keys(interruptedPayload).length !== 1 ||
       typeof interruptedPayload.reason !== 'string' ||
-      interruptedPayload.reason.length === 0 ||
+      interruptedPayload.reason.trim().length === 0 ||
       Object.keys(detectedPayload).length !== 3 ||
       detectedPayload.reason !== interruptedPayload.reason ||
       detectedPayload.recoveryEpisode !== session.recoveryEpisode ||

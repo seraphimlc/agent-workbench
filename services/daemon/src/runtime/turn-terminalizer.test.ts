@@ -7,6 +7,7 @@ import type Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { configureDatabase, openRuntimeDatabase } from '../db/database.js';
+import { SessionEventWriter } from '../db/session-event-writer.js';
 import { Scheduler, type Claim } from './scheduler.js';
 import { SessionService } from './session-service.js';
 import {
@@ -32,6 +33,11 @@ type ActiveFixture = {
   readonly sessionId: string;
   readonly turnId: string;
   readonly queuedTurnId: string | null;
+};
+
+type ForeignSession = {
+  readonly sessionId: string;
+  readonly turnId: string;
 };
 
 const createTempRuntime = (): TempRuntime => {
@@ -93,6 +99,24 @@ const createActiveFixture = async (
     turnId: created.turnId,
     queuedTurnId,
   };
+};
+
+const createForeignSession = (
+  database: Database.Database,
+  fixture: Pick<ActiveFixture, 'sessionId'>,
+): ForeignSession => {
+  const workspace = database
+    .prepare('SELECT workspace_id AS workspaceId FROM sessions WHERE id = ?')
+    .get(fixture.sessionId) as { readonly workspaceId: string };
+  const created = new SessionService(database).createSession(
+    {
+      workspaceId: workspace.workspaceId,
+      title: 'Foreign session',
+      prompt: 'Foreign prompt',
+    },
+    'foreign-session-create',
+  );
+  return { sessionId: created.sessionId, turnId: created.turnId };
 };
 
 const insertSucceededAttempt = (
@@ -429,6 +453,33 @@ describe('TurnTerminalizer', () => {
       ).toEqual(attemptBefore);
       expect(committed).toBe(1);
       expect(fixture.database.pragma('foreign_key_check')).toEqual([]);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects success when the final ModelCall belongs to another Session', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const finalAttempt = insertSucceededAttempt(fixture.database, fixture);
+    const foreign = createForeignSession(fixture.database, fixture);
+    fixture.database
+      .prepare('UPDATE model_calls SET session_id = ? WHERE id = ?')
+      .run(foreign.sessionId, finalAttempt.callId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('cross-session-success'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.succeed({
+          binding: fixture.claim,
+          modelAttemptId: finalAttempt.attemptId,
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
     } finally {
       fixture.database.close();
     }
@@ -837,6 +888,108 @@ describe('TurnTerminalizer', () => {
     }
   });
 
+  it('rejects fail when a running ModelCall belongs to another Session', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture);
+    const foreign = createForeignSession(fixture.database, fixture);
+    fixture.database
+      .prepare('UPDATE model_calls SET session_id = ? WHERE id = ?')
+      .run(foreign.sessionId, active.callId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('cross-session-fail'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'MODEL_FAILED',
+          errorMessage: 'Model failed',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects fail when a ToolRun source Attempt belongs to another ModelCall', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture);
+    const other = insertSucceededAttempt(fixture.database, fixture, {
+      callId: 'model-call-other-source',
+      attemptId: 'model-attempt-other-source',
+      callOrdinal: 2,
+    });
+    fixture.database
+      .prepare('UPDATE tool_runs SET source_model_attempt_id = ? WHERE id = ?')
+      .run(other.attemptId, active.toolRunId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('mismatched-source-fail'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'MODEL_FAILED',
+          errorMessage: 'Model failed',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects fail when a ToolRun sources a ModelCall and Attempt from another Turn', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime, { queuedFollower: true });
+    if (!fixture.queuedTurnId) {
+      throw new Error('Fixture did not create the queued Turn');
+    }
+    const active = insertActiveSubexecutions(fixture.database, fixture);
+    const foreignSource = insertSucceededAttempt(
+      fixture.database,
+      { sessionId: fixture.sessionId, turnId: fixture.queuedTurnId },
+      {
+        callId: 'model-call-other-turn',
+        attemptId: 'model-attempt-other-turn',
+      },
+    );
+    fixture.database
+      .prepare(
+        `UPDATE tool_runs
+         SET source_model_call_id = ?, source_model_attempt_id = ?
+         WHERE id = ?`,
+      )
+      .run(foreignSource.callId, foreignSource.attemptId, active.toolRunId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('cross-turn-source-fail'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'MODEL_FAILED',
+          errorMessage: 'Model failed',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it('optionally persists an assistant result from an earlier successful Attempt on fail', async () => {
     runtime = createTempRuntime();
     const fixture = await createActiveFixture(runtime);
@@ -972,6 +1125,184 @@ describe('TurnTerminalizer', () => {
     }
   });
 
+  it('rejects fail when a Terminal ToolRun has an applied effect', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+    });
+    fixture.database
+      .prepare("UPDATE model_attempts SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.attemptId);
+    fixture.database
+      .prepare("UPDATE model_calls SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.callId);
+    fixture.database
+      .prepare(
+        "UPDATE tool_runs SET status = 'interrupted', effect_state = 'applied', finished_at = ? WHERE id = ?",
+      )
+      .run(FINISH_TIME, active.toolRunId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('terminal-applied-fail'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'MODEL_FAILED',
+          errorMessage: 'Model failed after Tool execution',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects fail when a Terminal ToolRun unknown effect is confirmed applied', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+      effectState: 'unknown',
+    });
+    fixture.database
+      .prepare("UPDATE model_attempts SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.attemptId);
+    fixture.database
+      .prepare("UPDATE model_calls SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.callId);
+    fixture.database
+      .prepare("UPDATE tool_runs SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.toolRunId);
+    fixture.database
+      .prepare(
+        `INSERT INTO effect_resolutions (
+          id, resolution_key, tool_run_id, resolution,
+          evidence_json, actor, created_at
+        ) VALUES (?, ?, ?, 'confirmed_applied', '{}', 'daemon', ?)`,
+      )
+      .run(
+        'terminal-confirmed-applied-resolution',
+        'terminal-confirmed-applied-key',
+        active.toolRunId,
+        FINISH_TIME,
+      );
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('terminal-confirmed-applied-fail'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'MODEL_FAILED',
+          errorMessage: 'Model failed after Tool execution',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('allows fail when a Terminal ToolRun unknown effect is confirmed not applied', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+      effectState: 'unknown',
+    });
+    fixture.database
+      .prepare("UPDATE model_attempts SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.attemptId);
+    fixture.database
+      .prepare("UPDATE model_calls SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.callId);
+    fixture.database
+      .prepare("UPDATE tool_runs SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.toolRunId);
+    fixture.database
+      .prepare(
+        `INSERT INTO effect_resolutions (
+          id, resolution_key, tool_run_id, resolution,
+          evidence_json, actor, created_at
+        ) VALUES (?, ?, ?, 'confirmed_not_applied', '{}', 'daemon', ?)`,
+      )
+      .run(
+        'terminal-confirmed-not-applied-resolution',
+        'terminal-confirmed-not-applied-key',
+        active.toolRunId,
+        FINISH_TIME,
+      );
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('terminal-confirmed-not-applied-fail'),
+    });
+
+    try {
+      terminalizer.fail({
+        binding: fixture.claim,
+        errorCode: 'MODEL_FAILED',
+        errorMessage: 'Model failed after Tool execution',
+      });
+      expect(
+        fixture.database
+          .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
+          .get(active.toolRunId),
+      ).toEqual({ status: 'interrupted', effect_state: 'unknown' });
+      expect(
+        fixture.database.prepare('SELECT status FROM turns WHERE id = ?').get(fixture.turnId),
+      ).toEqual({ status: 'failed' });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('allows fail when a Terminal ToolRun effect is not applied', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture, {
+      worker: true,
+    });
+    fixture.database
+      .prepare("UPDATE model_attempts SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.attemptId);
+    fixture.database
+      .prepare("UPDATE model_calls SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.callId);
+    fixture.database
+      .prepare("UPDATE tool_runs SET status = 'interrupted', finished_at = ? WHERE id = ?")
+      .run(FINISH_TIME, active.toolRunId);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('terminal-not-applied-fail'),
+    });
+
+    try {
+      terminalizer.fail({
+        binding: fixture.claim,
+        errorCode: 'MODEL_FAILED',
+        errorMessage: 'Model failed after Tool execution',
+      });
+      expect(
+        fixture.database
+          .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
+          .get(active.toolRunId),
+      ).toEqual({ status: 'interrupted', effect_state: 'not_applied' });
+      expect(
+        fixture.database.prepare('SELECT status FROM turns WHERE id = ?').get(fixture.turnId),
+      ).toEqual({ status: 'failed' });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it('normalizes a pre-GO worker unknown effect to not_applied before failing', async () => {
     runtime = createTempRuntime();
     const fixture = await createActiveFixture(runtime);
@@ -996,6 +1327,60 @@ describe('TurnTerminalizer', () => {
           .prepare('SELECT status, effect_state FROM tool_runs WHERE id = ?')
           .get(active.toolRunId),
       ).toEqual({ status: 'failed', effect_state: 'not_applied' });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects interrupt when a running ModelCall belongs to another Session', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const active = insertActiveSubexecutions(fixture.database, fixture);
+    const foreign = createForeignSession(fixture.database, fixture);
+    fixture.database
+      .prepare('UPDATE model_calls SET session_id = ? WHERE id = ?')
+      .run(foreign.sessionId, active.callId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('cross-session-interrupt'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason: 'runner_lost',
+          executorExited: true,
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it.each([
+    { name: 'empty', reason: '' },
+    { name: 'whitespace-only', reason: ' \t ' },
+  ])('rejects interrupt with an $name reason before any write', async ({ reason }) => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('blank-reason-interrupt'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interrupt({
+          binding: fixture.claim,
+          reason,
+          executorExited: true,
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
     } finally {
       fixture.database.close();
     }
@@ -1171,4 +1556,77 @@ describe('TurnTerminalizer', () => {
       }
     },
   );
+});
+
+describe('SessionEventWriter', () => {
+  let runtime: TempRuntime | undefined;
+
+  afterEach(() => {
+    runtime?.cleanup();
+    runtime = undefined;
+  });
+
+  it('rejects an Event whose Turn belongs to another Session before allocation', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const foreign = createForeignSession(fixture.database, fixture);
+    const before = captureFacts(fixture.database);
+    const writer = new SessionEventWriter(fixture.database, {
+      createId: createIdFactory('cross-session-event'),
+    });
+    const append = fixture.database.transaction(() =>
+      writer.append({
+        sessionId: fixture.sessionId,
+        now: FINISH_TIME,
+        events: [
+          {
+            turnId: foreign.turnId,
+            type: 'test.cross_session',
+            payload: {},
+          },
+        ],
+      }),
+    );
+
+    try {
+      expect(() => append.immediate()).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects an Event whose ToolRun belongs to another Turn before allocation', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime, { queuedFollower: true });
+    if (!fixture.queuedTurnId) {
+      throw new Error('Fixture did not create the queued Turn');
+    }
+    const active = insertActiveSubexecutions(fixture.database, fixture);
+    const before = captureFacts(fixture.database);
+    const writer = new SessionEventWriter(fixture.database, {
+      createId: createIdFactory('cross-turn-tool-event'),
+    });
+    const append = fixture.database.transaction(() =>
+      writer.append({
+        sessionId: fixture.sessionId,
+        now: FINISH_TIME,
+        events: [
+          {
+            turnId: fixture.queuedTurnId,
+            toolRunId: active.toolRunId,
+            type: 'test.cross_turn_tool',
+            payload: {},
+          },
+        ],
+      }),
+    );
+
+    try {
+      expect(() => append.immediate()).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
 });

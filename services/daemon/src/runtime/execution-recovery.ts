@@ -117,33 +117,25 @@ export class ExecutionRecovery {
          FROM tool_runs
          WHERE session_id = ? AND turn_id = ?
            AND (
-             (
+             effect_state = 'applied'
+             OR EXISTS (
+               SELECT 1 FROM effect_resolutions
+               WHERE effect_resolutions.tool_run_id = tool_runs.id
+                 AND resolution = 'confirmed_applied'
+             )
+             OR (
                status NOT IN ('queued', 'running', 'cancel_requested')
                AND effect_state = 'unknown'
-               AND (
-                 NOT EXISTS (
-                   SELECT 1 FROM effect_resolutions
-                   WHERE effect_resolutions.tool_run_id = tool_runs.id
-                 )
-                 OR (
-                   EXISTS (
-                     SELECT 1 FROM effect_resolutions
-                     WHERE effect_resolutions.tool_run_id = tool_runs.id
-                       AND resolution = 'confirmed_applied'
-                   )
-                   AND EXISTS (
-                     SELECT 1 FROM effect_resolutions
-                     WHERE effect_resolutions.tool_run_id = tool_runs.id
-                       AND resolution = 'confirmed_not_applied'
-                   )
-                 )
+               AND NOT EXISTS (
+                 SELECT 1 FROM effect_resolutions
+                 WHERE effect_resolutions.tool_run_id = tool_runs.id
+                   AND resolution = 'confirmed_not_applied'
                )
              )
              OR (
                status IN ('queued', 'running', 'cancel_requested')
                AND (
-                 effect_state = 'applied'
-                 OR (
+                 (
                    execution_mode = 'worker'
                    AND dispatch_state IN ('go_sent', 'acknowledged')
                    AND NOT (

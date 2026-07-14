@@ -83,6 +83,7 @@ export class TurnTerminalizer {
       const now = this.now().toISOString();
       const tuple = this.repository.readActiveTuple(input.binding, ['running']);
       const content = this.repository.readFinalAssistantContent(
+        input.binding.sessionId,
         input.binding.turnId,
         input.modelAttemptId,
       );
@@ -153,6 +154,7 @@ export class TurnTerminalizer {
       let resultMessageId: string | null = null;
       if (input.assistantResult) {
         const content = this.repository.readPersistedAssistantContent(
+          input.binding.sessionId,
           input.binding.turnId,
           input.assistantResult.modelAttemptId,
         );
@@ -207,6 +209,11 @@ export class TurnTerminalizer {
     readonly executorExited: boolean;
     readonly resolutions?: readonly EffectResolutionInput[];
   }): void {
+    if (input.reason.trim().length === 0) {
+      throw new TurnTerminalizationInvariantError(
+        'interrupt reason must be non-blank',
+      );
+    }
     this.commit(() => {
       if (!input.executorExited) {
         throw new TurnTerminalizationInvariantError(

@@ -154,6 +154,7 @@ export class ExecutionRepository {
     if (!row) {
       throw new TurnTerminalizationInvariantError('active tuple is missing');
     }
+    this.assertExecutionOwnership(binding);
 
     const counts = this.database
       .prepare(
@@ -206,20 +207,97 @@ export class ExecutionRepository {
     return row;
   }
 
-  readFinalAssistantContent(turnId: string, modelAttemptId: string): string {
+  private assertExecutionOwnership(
+    binding: Pick<Claim, 'sessionId' | 'turnId'>,
+  ): void {
+    const invalid = this.database
+      .prepare(
+        `SELECT
+           EXISTS (
+             SELECT 1
+             FROM model_calls
+             LEFT JOIN model_attempts AS successful_attempt
+               ON successful_attempt.id = model_calls.successful_attempt_id
+             WHERE model_calls.turn_id = ?
+               AND (
+                 model_calls.session_id <> ?
+                 OR (
+                   model_calls.successful_attempt_id IS NOT NULL
+                   AND (
+                     successful_attempt.id IS NULL
+                     OR successful_attempt.model_call_id <> model_calls.id
+                   )
+                 )
+               )
+           ) AS modelCalls,
+           EXISTS (
+             SELECT 1
+             FROM tool_runs
+             LEFT JOIN model_calls AS source_call
+               ON source_call.id = tool_runs.source_model_call_id
+             LEFT JOIN model_attempts AS source_attempt
+               ON source_attempt.id = tool_runs.source_model_attempt_id
+             LEFT JOIN model_calls AS attempt_call
+               ON attempt_call.id = source_attempt.model_call_id
+             WHERE (
+               tool_runs.turn_id = ?
+               OR source_call.turn_id = ?
+               OR attempt_call.turn_id = ?
+             )
+               AND (
+                 tool_runs.session_id <> ?
+                 OR tool_runs.turn_id <> ?
+                 OR source_call.id IS NULL
+                 OR source_call.session_id <> ?
+                 OR source_call.turn_id <> ?
+                 OR source_attempt.id IS NULL
+                 OR attempt_call.id IS NULL
+                 OR attempt_call.session_id <> ?
+                 OR attempt_call.turn_id <> ?
+                 OR source_attempt.model_call_id <> source_call.id
+               )
+           ) AS toolRuns`,
+      )
+      .get(
+        binding.turnId,
+        binding.sessionId,
+        binding.turnId,
+        binding.turnId,
+        binding.turnId,
+        binding.sessionId,
+        binding.turnId,
+        binding.sessionId,
+        binding.turnId,
+        binding.sessionId,
+        binding.turnId,
+      ) as { readonly modelCalls: number; readonly toolRuns: number };
+    if (invalid.modelCalls || invalid.toolRuns) {
+      throw new TurnTerminalizationInvariantError(
+        'execution ownership is inconsistent',
+      );
+    }
+  }
+
+  readFinalAssistantContent(
+    sessionId: string,
+    turnId: string,
+    modelAttemptId: string,
+  ): string {
     this.assertCallerTransaction();
     const nonterminal = this.database
       .prepare(
         `SELECT
            EXISTS(SELECT 1 FROM model_calls
-             WHERE turn_id = ? AND status = 'running') AS modelCalls,
+             WHERE session_id = ? AND turn_id = ? AND status = 'running') AS modelCalls,
            EXISTS(SELECT 1 FROM model_attempts
              JOIN model_calls ON model_calls.id = model_attempts.model_call_id
-             WHERE model_calls.turn_id = ? AND model_attempts.status = 'running') AS attempts,
+             WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+               AND model_attempts.status = 'running') AS attempts,
            EXISTS(SELECT 1 FROM tool_runs
-             WHERE turn_id = ? AND status IN ('queued', 'running', 'cancel_requested')) AS tools`,
+             WHERE session_id = ? AND turn_id = ?
+               AND status IN ('queued', 'running', 'cancel_requested')) AS tools`,
       )
-      .get(turnId, turnId, turnId) as {
+      .get(sessionId, turnId, sessionId, turnId, sessionId, turnId) as {
       readonly modelCalls: number;
       readonly attempts: number;
       readonly tools: number;
@@ -244,11 +322,12 @@ export class ExecutionRepository {
            model_calls.successful_attempt_id AS successfulAttemptId
          FROM model_attempts
          JOIN model_calls ON model_calls.id = model_attempts.model_call_id
-         WHERE model_calls.turn_id = ? AND model_attempts.status = 'succeeded'
+         WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+           AND model_attempts.status = 'succeeded'
            AND model_calls.ordinal = (
              SELECT MAX(latest_call.ordinal)
              FROM model_calls AS latest_call
-             WHERE latest_call.turn_id = ?
+             WHERE latest_call.session_id = ? AND latest_call.turn_id = ?
            )
            AND NOT EXISTS (
              SELECT 1 FROM model_attempts AS later_attempt
@@ -258,7 +337,7 @@ export class ExecutionRepository {
          ORDER BY model_attempts.attempt DESC, model_attempts.id DESC
          LIMIT 1`,
       )
-      .get(turnId, turnId) as FinalAttemptRow | undefined;
+      .get(sessionId, turnId, sessionId, turnId) as FinalAttemptRow | undefined;
     if (
       !latest ||
       latest.attemptId !== modelAttemptId ||
@@ -286,7 +365,7 @@ export class ExecutionRepository {
       .prepare(
         `SELECT COUNT(*) AS count
          FROM tool_runs
-         WHERE turn_id = ? AND effect_state = 'unknown'
+         WHERE session_id = ? AND turn_id = ? AND effect_state = 'unknown'
            AND (
              NOT EXISTS (
                SELECT 1 FROM effect_resolutions
@@ -306,7 +385,7 @@ export class ExecutionRepository {
              )
            )`,
       )
-      .get(turnId) as { readonly count: number };
+      .get(sessionId, turnId) as { readonly count: number };
     if (unresolvedEffects.count !== 0) {
       throw new TurnTerminalizationInvariantError(
         'success requires every Tool effect to be resolved',
@@ -315,7 +394,11 @@ export class ExecutionRepository {
     return parseFinalResult(latest.resultJson).content;
   }
 
-  readPersistedAssistantContent(turnId: string, modelAttemptId: string): string {
+  readPersistedAssistantContent(
+    sessionId: string,
+    turnId: string,
+    modelAttemptId: string,
+  ): string {
     this.assertCallerTransaction();
     const attempt = this.database
       .prepare(
@@ -331,9 +414,10 @@ export class ExecutionRepository {
            model_calls.successful_attempt_id AS successfulAttemptId
          FROM model_attempts
          JOIN model_calls ON model_calls.id = model_attempts.model_call_id
-         WHERE model_attempts.id = ? AND model_calls.turn_id = ?`,
+         WHERE model_attempts.id = ? AND model_calls.session_id = ?
+           AND model_calls.turn_id = ?`,
       )
-      .get(modelAttemptId, turnId) as FinalAttemptRow | undefined;
+      .get(modelAttemptId, sessionId, turnId) as FinalAttemptRow | undefined;
     if (
       !attempt ||
       attempt.attemptStatus !== 'succeeded' ||

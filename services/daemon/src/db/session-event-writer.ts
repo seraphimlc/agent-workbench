@@ -63,6 +63,7 @@ export class SessionEventWriter {
         'SessionEventWriter requires an exact positive Event count',
       );
     }
+    this.assertEventOwnership(input.sessionId, input.events);
 
     const allocation = this.database
       .prepare(
@@ -123,5 +124,36 @@ export class SessionEventWriter {
       firstSeq: allocation.nextEventSeq,
       nextEventSeq: allocation.nextEventSeq + input.events.length,
     };
+  }
+
+  private assertEventOwnership(
+    sessionId: string,
+    events: readonly SessionEventDraft[],
+  ): void {
+    const ownsTurn = this.database.prepare(
+      'SELECT 1 FROM turns WHERE id = ? AND session_id = ?',
+    );
+    const ownsToolRun = this.database.prepare(
+      `SELECT 1 FROM tool_runs
+       WHERE id = ? AND session_id = ? AND turn_id = ?`,
+    );
+
+    for (const event of events) {
+      if (event.turnId !== null && !ownsTurn.get(event.turnId, sessionId)) {
+        throw new SessionEventWriterInvariantError(
+          'Event Turn does not belong to the Session',
+        );
+      }
+      if (
+        event.toolRunId !== undefined &&
+        event.toolRunId !== null &&
+        (event.turnId === null ||
+          !ownsToolRun.get(event.toolRunId, sessionId, event.turnId))
+      ) {
+        throw new SessionEventWriterInvariantError(
+          'Event ToolRun does not belong to the Session and Turn',
+        );
+      }
+    }
   }
 }
