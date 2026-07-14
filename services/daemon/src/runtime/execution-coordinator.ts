@@ -6,6 +6,10 @@ export interface ExecutionRun {
 
 export interface ExecutionDriver {
   start(claim: Claim): Promise<ExecutionRun>;
+  /**
+   * Stops and reaps every executor, settling pending starts and execution
+   * completions before this promise resolves.
+   */
   shutdown(): Promise<void>;
 }
 
@@ -40,6 +44,7 @@ export class ExecutionCoordinator {
   private drainScheduled = false;
   private draining = false;
   private activeRunner = false;
+  private readonly joinWaiters = new Set<() => void>();
 
   constructor(options: ExecutionCoordinatorOptions) {
     this.scheduler = options.scheduler;
@@ -61,6 +66,16 @@ export class ExecutionCoordinator {
   quiesce(): void {
     this.running = false;
     this.dirty = false;
+    this.settleJoinWaiters();
+  }
+
+  join(): Promise<void> {
+    if (this.isJoined()) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolvePromise) => {
+      this.joinWaiters.add(resolvePromise);
+    });
   }
 
   private scheduleDrain(): void {
@@ -71,6 +86,7 @@ export class ExecutionCoordinator {
     queueMicrotask(() => {
       this.drainScheduled = false;
       void this.drain();
+      this.settleJoinWaiters();
     });
   }
 
@@ -78,18 +94,21 @@ export class ExecutionCoordinator {
     if (!this.running || this.draining || !this.dirty) {
       return;
     }
-    if (
-      this.activeRunner ||
-      !this.executionDriver ||
-      !this.terminalizer ||
-      this.authenticatedControlConnectionCount() <= 0
-    ) {
-      return;
-    }
 
     this.draining = true;
-    this.dirty = false;
+    let gatesPassed = false;
     try {
+      if (
+        this.activeRunner ||
+        !this.executionDriver ||
+        !this.terminalizer ||
+        this.authenticatedControlConnectionCount() <= 0 ||
+        !this.running
+      ) {
+        return;
+      }
+      gatesPassed = true;
+      this.dirty = false;
       const claim = this.scheduler.claimNext();
       if (!claim || !this.running) {
         return;
@@ -112,12 +131,21 @@ export class ExecutionCoordinator {
         }
       }
     } catch (error) {
+      if (!gatesPassed) {
+        this.dirty = false;
+      }
       this.reportError(error);
     } finally {
       this.draining = false;
-      if (this.running && this.dirty && !this.activeRunner) {
+      if (
+        gatesPassed &&
+        this.running &&
+        this.dirty &&
+        !this.activeRunner
+      ) {
         this.scheduleDrain();
       }
+      this.settleJoinWaiters();
     }
   }
 
@@ -128,6 +156,7 @@ export class ExecutionCoordinator {
         if (this.running && this.dirty) {
           this.scheduleDrain();
         }
+        this.settleJoinWaiters();
       },
       (error: unknown) => {
         this.activeRunner = false;
@@ -135,8 +164,29 @@ export class ExecutionCoordinator {
         if (this.running && this.dirty) {
           this.scheduleDrain();
         }
+        this.settleJoinWaiters();
       },
     );
+  }
+
+  private isJoined(): boolean {
+    return (
+      !this.running &&
+      !this.drainScheduled &&
+      !this.draining &&
+      !this.activeRunner
+    );
+  }
+
+  private settleJoinWaiters(): void {
+    if (!this.isJoined() || this.joinWaiters.size === 0) {
+      return;
+    }
+    const waiters = [...this.joinWaiters];
+    this.joinWaiters.clear();
+    for (const resolvePromise of waiters) {
+      resolvePromise();
+    }
   }
 
   private reportError(error: unknown): void {

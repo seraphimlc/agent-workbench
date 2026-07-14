@@ -424,6 +424,7 @@ export class DaemonServer {
   }
 
   async stop(): Promise<void> {
+    this.executionCoordinator?.quiesce();
     this.stopRequested = true;
     this.listenAbortController?.abort();
     this.stopPromise ??= this.performStop();
@@ -445,6 +446,8 @@ export class DaemonServer {
   private async performCleanup(): Promise<void> {
     const cleanupErrors: unknown[] = [];
     let databaseClosed = this.database === undefined;
+    let executionShutdownSucceeded = true;
+    let executionJoinSucceeded = this.executionCoordinator === undefined;
 
     try {
       try {
@@ -473,29 +476,41 @@ export class DaemonServer {
       try {
         await this.executionDriver?.shutdown();
       } catch (error) {
+        executionShutdownSucceeded = false;
         cleanupErrors.push(error);
       }
 
-      try {
-        this.unlinkOwnedSocket();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-
-      try {
-        if (this.database) {
-          await this.closeDatabase(this.database);
-          databaseClosed = true;
-        }
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-
-      if (databaseClosed) {
+      if (executionShutdownSucceeded) {
         try {
-          await this.runtimeLock?.release();
+          await this.executionCoordinator?.join();
+          executionJoinSucceeded = true;
         } catch (error) {
           cleanupErrors.push(error);
+        }
+      }
+
+      if (executionShutdownSucceeded && executionJoinSucceeded) {
+        try {
+          this.unlinkOwnedSocket();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+
+        try {
+          if (this.database) {
+            await this.closeDatabase(this.database);
+            databaseClosed = true;
+          }
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+
+        if (databaseClosed) {
+          try {
+            await this.runtimeLock?.release();
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
         }
       }
     } finally {

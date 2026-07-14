@@ -275,4 +275,92 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     expect(scheduler.claimCalls).toBe(0);
     expect(driver.started).toEqual([]);
   });
+
+  it('joins only after a pending start and its active completion both settle', async () => {
+    const scheduler = new FakeScheduler(claim(1));
+    const driver = new ControlledDriver();
+    const coordinator = track(
+      new ExecutionCoordinator({
+        scheduler,
+        executionDriver: driver,
+        terminalizer: { fail: () => undefined },
+        authenticatedControlConnectionCount: () => 1,
+      }),
+    );
+
+    coordinator.notify();
+    await waitFor(() => driver.started.length === 1, 'deferred driver start');
+    coordinator.quiesce();
+    const joining = coordinator.join();
+    let joined = false;
+    void joining.then(() => {
+      joined = true;
+    });
+
+    await settleScheduledWork();
+    expect(joined).toBe(false);
+    const started = driver.started[0] as StartedExecution;
+    started.start.resolve({ completion: started.completion.promise });
+    await settleScheduledWork();
+    expect(joined).toBe(false);
+
+    started.completion.resolve(undefined);
+    await joining;
+    expect(joined).toBe(true);
+  });
+
+  it('reports a synchronous drain gate error once and retries only after a future notify', async () => {
+    const scheduler = new FakeScheduler(claim(1));
+    const driver = new ControlledDriver();
+    const gateError = new Error('injected authenticated connection gate failure');
+    const errors: unknown[] = [];
+    const unhandled: unknown[] = [];
+    let gateCalls = 0;
+    const handleUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', handleUnhandled);
+    const coordinator = track(
+      new ExecutionCoordinator({
+        scheduler,
+        executionDriver: driver,
+        terminalizer: { fail: () => undefined },
+        authenticatedControlConnectionCount: () => {
+          gateCalls += 1;
+          if (gateCalls === 1) {
+            throw gateError;
+          }
+          return 1;
+        },
+        onError: (error) => {
+          errors.push(error);
+        },
+      }),
+    );
+
+    try {
+      coordinator.notify();
+      await settleScheduledWork();
+      expect(errors).toEqual([gateError]);
+      expect(unhandled).toEqual([]);
+      expect(gateCalls).toBe(1);
+      expect(scheduler.claimCalls).toBe(0);
+      expect(driver.started).toEqual([]);
+
+      await settleScheduledWork();
+      expect(errors).toEqual([gateError]);
+      expect(gateCalls).toBe(1);
+
+      coordinator.notify();
+      await waitFor(() => driver.started.length === 1, 'retry after gate recovery');
+      expect(gateCalls).toBe(2);
+      expect(scheduler.claimCalls).toBe(1);
+      const started = driver.started[0] as StartedExecution;
+      started.start.resolve({ completion: started.completion.promise });
+      started.completion.resolve(undefined);
+      await settleScheduledWork();
+    } finally {
+      process.off('unhandledRejection', handleUnhandled);
+    }
+  });
 });

@@ -27,6 +27,7 @@ import {
   connectRpcClient,
   type RpcClient,
 } from '../../packages/testkit/src/rpc-client.js';
+import type { ExecutionDriver } from '../../services/daemon/src/runtime/execution-coordinator.js';
 import { DaemonServer } from '../../services/daemon/src/server.js';
 
 const requireFromDaemon = createRequire(
@@ -696,6 +697,57 @@ describe('craft session persistence', () => {
     await runtimeLock?.release();
     const replacement = runtime.spawnDaemon();
     await replacement.waitForReady();
+  }, 12_000);
+
+  it('retains the database and runtime ownership when driver shutdown fails', async () => {
+    runtime = createTempRuntime();
+    const ownerPath = join(runtime.dataDir, '.daemon-owner.json');
+    const shutdownError = new Error('injected driver shutdown failure');
+    const driver: ExecutionDriver = {
+      start: async () => {
+        throw new Error('No execution start expected');
+      },
+      shutdown: async () => {
+        throw shutdownError;
+      },
+    };
+    const server = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: Buffer.alloc(32, 0x66),
+      executionDriver: driver,
+    });
+    const internals = server as unknown as {
+      readonly database?: InstanceType<typeof Database>;
+      readonly runtimeLock?: { release(): Promise<void> };
+    };
+    let replacement: DaemonServer | undefined;
+
+    try {
+      await server.start();
+      await expect(server.stop()).rejects.toThrow(shutdownError);
+      expect(existsSync(ownerPath)).toBe(true);
+      expect(internals.database?.open).toBe(true);
+      expect(
+        internals.database?.prepare('SELECT state FROM scheduler_slots').get(),
+      ).toEqual({ state: 'free' });
+
+      replacement = new DaemonServer({
+        socketPath: runtime.alternateSocketPath,
+        dataDir: runtime.dataDir,
+        bootstrapSecret: Buffer.alloc(32, 0x67),
+      });
+      await expect(replacement.start()).rejects.toThrow();
+      expect(existsSync(runtime.alternateSocketPath)).toBe(false);
+    } finally {
+      await replacement?.stop().catch(() => undefined);
+      try {
+        internals.database?.close();
+      } catch {
+        // The current buggy implementation may already have closed SQLite.
+      }
+      await internals.runtimeLock?.release();
+    }
   }, 12_000);
 
   it('retains ownership when database initialization and cleanup close both fail', async () => {

@@ -122,6 +122,24 @@ class RecordingDriver implements ExecutionDriver {
   }
 }
 
+class DeferredStartDriver implements ExecutionDriver {
+  readonly startEntered = deferred<void>();
+  readonly startResult = deferred<ExecutionRun>();
+  readonly completion = deferred<void>();
+  readonly claims: Claim[] = [];
+  shutdownCalls = 0;
+
+  start(claim: Claim): Promise<ExecutionRun> {
+    this.claims.push(claim);
+    this.startEntered.resolve(undefined);
+    return this.startResult.promise;
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownCalls += 1;
+  }
+}
+
 describe('Daemon execution wakeups', () => {
   let runtime: TempRuntime | undefined;
   let server: DaemonServer | undefined;
@@ -322,6 +340,127 @@ describe('Daemon execution wakeups', () => {
     } finally {
       inspection.close();
     }
+  });
+
+  it('quiesces synchronously before an already scheduled authenticated wake can claim', async () => {
+    runtime = createTempRuntime();
+    const driver = new RecordingDriver();
+    server = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: BOOTSTRAP_SECRET,
+      executionDriver: driver,
+    });
+    await server.start();
+    const client = await authenticate(runtime);
+    clients.push(client);
+    await settleScheduledWork();
+
+    const workspacePath = join(runtime.rootDir, 'stop-before-wake-workspace');
+    mkdirSync(workspacePath);
+    const writer = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const sessions = new SessionService(writer);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'stop-before-wake-workspace',
+    );
+    const created = sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Stop before wake',
+        prompt: 'Must remain queued',
+      },
+      'stop-before-wake-session',
+    );
+    writer.close();
+
+    const coordinator = (
+      server as unknown as {
+        readonly executionCoordinator?: { notify(): void };
+      }
+    ).executionCoordinator;
+    if (!coordinator) {
+      throw new Error('Execution coordinator was not initialized');
+    }
+    coordinator.notify();
+    await server.stop();
+    server = undefined;
+
+    expect(driver.starts).toEqual([]);
+    const inspection = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    try {
+      expect(
+        inspection
+          .prepare('SELECT status, execution_fence FROM turns WHERE id = ?')
+          .get(created.turnId),
+      ).toEqual({ status: 'queued', execution_fence: 0 });
+      expect(
+        inspection.prepare('SELECT state, owner_turn_id FROM scheduler_slots').get(),
+      ).toEqual({ state: 'free', owner_turn_id: null });
+    } finally {
+      inspection.close();
+    }
+  });
+
+  it('keeps stop pending until an in-flight start and its completion both settle', async () => {
+    runtime = createTempRuntime();
+    const workspacePath = join(runtime.rootDir, 'joined-stop-workspace');
+    mkdirSync(workspacePath);
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const sessions = new SessionService(database);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'joined-stop-workspace',
+    );
+    sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Join pending start',
+        prompt: 'Start before stop',
+      },
+      'joined-stop-session',
+    );
+    database.close();
+
+    const driver = new DeferredStartDriver();
+    let acquiredDatabase: ReturnType<typeof acquireRuntimeDatabase> | undefined;
+    server = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: BOOTSTRAP_SECRET,
+      executionDriver: driver,
+      acquireDatabase: (options) => {
+        acquiredDatabase = acquireRuntimeDatabase(options);
+        return acquiredDatabase;
+      },
+    });
+    await server.start();
+    const client = await authenticate(runtime);
+    clients.push(client);
+    await driver.startEntered.promise;
+
+    let stopped = false;
+    const stopping = server.stop().then(() => {
+      stopped = true;
+    });
+    await client.waitForClose();
+    await settleScheduledWork();
+    expect(driver.shutdownCalls).toBe(1);
+    expect(stopped).toBe(false);
+    expect(acquiredDatabase?.open).toBe(true);
+    expect(existsSync(join(runtime.dataDir, '.daemon-owner.json'))).toBe(true);
+
+    driver.startResult.resolve({ completion: driver.completion.promise });
+    await settleScheduledWork();
+    expect(stopped).toBe(false);
+    expect(acquiredDatabase?.open).toBe(true);
+
+    driver.completion.resolve(undefined);
+    await stopping;
+    server = undefined;
+    expect(acquiredDatabase?.open).toBe(false);
+    expect(existsSync(runtime.socketPath)).toBe(false);
+    expect(existsSync(join(runtime.dataDir, '.daemon-owner.json'))).toBe(false);
   });
 
   it('orders cleanup as connections, driver, socket, database, then owner lock', async () => {
