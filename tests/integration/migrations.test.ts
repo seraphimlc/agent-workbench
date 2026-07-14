@@ -31,6 +31,7 @@ import {
   discoverMigrations,
   migrateDatabase,
 } from '../../services/daemon/src/db/migrations.js';
+import { SessionRepository } from '../../services/daemon/src/db/session-repository.js';
 import {
   createTempRuntime,
   type TempRuntime,
@@ -51,6 +52,18 @@ const sourceMigrationPath = fileURLToPath(
 const sourceSchedulerMigrationPath = fileURLToPath(
   new URL(
     '../../services/daemon/src/db/migrations/002_scheduler_invariants.sql',
+    import.meta.url,
+  ),
+);
+const sourceExecutionMigrationPath = fileURLToPath(
+  new URL(
+    '../../services/daemon/src/db/migrations/003_execution_ledger.sql',
+    import.meta.url,
+  ),
+);
+const sourceArtifactMigrationPath = fileURLToPath(
+  new URL(
+    '../../services/daemon/src/db/migrations/004_artifact_store.sql',
     import.meta.url,
   ),
 );
@@ -91,6 +104,194 @@ const openConfiguredDatabase = (
   return database;
 };
 
+type TestDatabase = import('better-sqlite3').Database;
+
+const seedTurn = (
+  database: TestDatabase,
+  suffix: string,
+  status: 'queued' | 'running' | 'succeeded' = 'running',
+): { readonly sessionId: string; readonly turnId: string } => {
+  const workspaceId = `workspace-${suffix}`;
+  const sessionId = `session-${suffix}`;
+  const messageId = `message-${suffix}`;
+  const turnId = `turn-${suffix}`;
+  const insert = database.transaction(() => {
+    database
+      .prepare(
+        `INSERT INTO workspaces (id, path, canonical_path, created_at)
+         VALUES (?, ?, ?, 'now')`,
+      )
+      .run(workspaceId, `/workspace/${suffix}`, `/canonical/${suffix}`);
+    database
+      .prepare(
+        `INSERT INTO sessions (
+          id, title, workspace_id, lifecycle_status, runtime_status,
+          queue_block_reason, recovery_episode, recovery_source_turn_id,
+          current_turn_id, mode, access_mode, next_turn_ordinal, next_event_seq,
+          revision, created_at, updated_at
+        ) VALUES (?, 'title', ?, 'active', ?, NULL, 0, NULL, NULL, 'craft',
+          'full_access', 2, 1, 0, 'now', 'now')`,
+      )
+      .run(sessionId, workspaceId, status === 'running' ? 'running' : 'queued');
+    database
+      .prepare(
+        `INSERT INTO messages (
+          id, session_id, turn_id, role, status, content, created_at, completed_at
+        ) VALUES (?, ?, ?, 'user', 'completed', 'prompt', 'now', 'now')`,
+      )
+      .run(messageId, sessionId, turnId);
+    database
+      .prepare(
+        `INSERT INTO turns (
+          id, session_id, ordinal, client_request_id, queue_kind, status,
+          input_message_id, mode_snapshot, access_mode_snapshot, queued_at,
+          started_at, finished_at, error_code, error_message, result_message_id,
+          execution_fence
+        ) VALUES (?, ?, 1, ?, 'normal', ?, ?, 'craft', 'full_access', 'now',
+          NULL, NULL, NULL, NULL, NULL, 0)`,
+      )
+      .run(turnId, sessionId, `request-${suffix}`, status, messageId);
+  });
+  insert.immediate();
+  return { sessionId, turnId };
+};
+
+const insertModelCall = (
+  database: TestDatabase,
+  values: {
+    readonly id: string;
+    readonly sessionId: string;
+    readonly turnId: string;
+    readonly ordinal?: number;
+    readonly status?: 'running' | 'succeeded' | 'failed' | 'interrupted';
+    readonly successfulAttemptId?: string | null;
+  },
+): void => {
+  database
+    .prepare(
+      `INSERT INTO model_calls (
+        id, session_id, turn_id, ordinal, kind, status, profile_snapshot_json,
+        input_json, result_json, successful_attempt_id, error_code,
+        error_message, created_at, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, 'craft', ?, '{}', '{}', NULL, ?, NULL, NULL,
+        'now', 'now', NULL)`,
+    )
+    .run(
+      values.id,
+      values.sessionId,
+      values.turnId,
+      values.ordinal ?? 1,
+      values.status ?? 'running',
+      values.successfulAttemptId ?? null,
+    );
+};
+
+const insertModelAttempt = (
+  database: TestDatabase,
+  values: {
+    readonly id: string;
+    readonly modelCallId: string;
+    readonly attempt?: number;
+    readonly status?: 'running' | 'succeeded' | 'failed' | 'interrupted';
+  },
+): void => {
+  database
+    .prepare(
+      `INSERT INTO model_attempts (
+        id, model_call_id, attempt, status, provider_request_id,
+        partial_output_json, result_json, finish_reason, input_tokens,
+        output_tokens, cached_tokens, latency_ms, error_code, error_message,
+        retryable, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, 'now', NULL)`,
+    )
+    .run(
+      values.id,
+      values.modelCallId,
+      values.attempt ?? 1,
+      values.status ?? 'running',
+    );
+};
+
+type ToolRunValues = {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly ordinal: number;
+  readonly logicalCallId: string;
+  readonly sourceModelCallId: string;
+  readonly sourceModelAttemptId: string;
+  readonly attempt: number;
+  readonly operationId: string | null;
+  readonly idempotencyKey: string | null;
+  readonly sourceHandle: string | null;
+  readonly toolId: string;
+  readonly toolVersion: string;
+  readonly executionMode: string;
+  readonly sideEffectClass: string;
+  readonly status: string;
+  readonly dispatchState: string | null;
+  readonly dispatchNonce: string | null;
+  readonly normalizedInputHash: string;
+  readonly effectState: string;
+};
+
+const toolRunValues = (
+  suffix: string,
+  ownership: {
+    readonly sessionId: string;
+    readonly turnId: string;
+    readonly sourceModelCallId: string;
+    readonly sourceModelAttemptId: string;
+  },
+  overrides: Partial<ToolRunValues> = {},
+): ToolRunValues => ({
+  id: `tool-run-${suffix}`,
+  sessionId: ownership.sessionId,
+  turnId: ownership.turnId,
+  ordinal: 1,
+  logicalCallId: `logical-call-${suffix}`,
+  sourceModelCallId: ownership.sourceModelCallId,
+  sourceModelAttemptId: ownership.sourceModelAttemptId,
+  attempt: 1,
+  operationId: `operation-${suffix}`,
+  idempotencyKey: null,
+  sourceHandle: null,
+  toolId: 'fs.read_text',
+  toolVersion: '1',
+  executionMode: 'read_inline',
+  sideEffectClass: 'read',
+  status: 'failed',
+  dispatchState: null,
+  dispatchNonce: null,
+  normalizedInputHash: 'a'.repeat(64),
+  effectState: 'not_applied',
+  ...overrides,
+});
+
+const insertToolRun = (database: TestDatabase, values: ToolRunValues): void => {
+  database
+    .prepare(
+      `INSERT INTO tool_runs (
+        id, session_id, turn_id, ordinal, logical_call_id,
+        source_model_call_id, source_model_attempt_id, attempt, operation_id,
+        idempotency_key, source_handle, tool_id, tool_version, execution_mode,
+        side_effect_class, status, dispatch_state, dispatch_nonce,
+        normalized_input_hash, input_json, result_json, effect_state, pid,
+        process_start_identity, error_code, error_message, queued_at,
+        started_at, finished_at
+      ) VALUES (
+        @id, @sessionId, @turnId, @ordinal, @logicalCallId,
+        @sourceModelCallId, @sourceModelAttemptId, @attempt, @operationId,
+        @idempotencyKey, @sourceHandle, @toolId, @toolVersion, @executionMode,
+        @sideEffectClass, @status, @dispatchState, @dispatchNonce,
+        @normalizedInputHash, '{}', NULL, @effectState, NULL, NULL, NULL, NULL,
+        'now', NULL, NULL
+      )`,
+    )
+    .run(values);
+};
+
 describe('daemon SQLite migrations', () => {
   let runtime: TempRuntime | undefined;
 
@@ -119,7 +320,12 @@ describe('daemon SQLite migrations', () => {
         database
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all(),
-      ).toEqual([{ version: 1 }, { version: 2 }]);
+      ).toEqual([
+        { version: 1 },
+        { version: 2 },
+        { version: 3 },
+        { version: 4 },
+      ]);
       expect(database.pragma('foreign_key_check')).toEqual([]);
     } finally {
       database.close();
@@ -386,7 +592,7 @@ describe('daemon SQLite migrations', () => {
     }
   });
 
-  it('installs the exact foundation tables, scheduler row, and four deferred circular references', async () => {
+  it('installs the exact foundation and execution tables with six deferred references', async () => {
     runtime = createTempRuntime();
     const daemon = runtime.spawnDaemon();
     await daemon.waitForReady();
@@ -402,13 +608,25 @@ describe('daemon SQLite migrations', () => {
         )
         .all() as Array<{ readonly name: string; readonly sql: string }>;
       expect(tableRows.map((row) => row.name)).toEqual([
+        'artifact_versions',
+        'artifacts',
+        'audit_events',
+        'blobs',
+        'effect_resolutions',
+        'fs_write_effects',
         'messages',
+        'model_attempts',
+        'model_calls',
+        'model_tool_calls',
         'rpc_idempotency',
         'runner_leases',
         'scheduler_slots',
         'schema_migrations',
         'session_events',
         'sessions',
+        'sqlite_sequence',
+        'tool_runs',
+        'tracked_files',
         'turns',
         'workspaces',
       ]);
@@ -419,7 +637,7 @@ describe('daemon SQLite migrations', () => {
         Object.values(createSql)
           .join('\n')
           .match(/DEFERRABLE\s+INITIALLY\s+DEFERRED/gi),
-      ).toHaveLength(4);
+      ).toHaveLength(6);
       expect(createSql.messages).toMatch(
         /turn_id\s+TEXT\s+NOT\s+NULL\s+REFERENCES\s+turns\s*\(id\)\s+DEFERRABLE\s+INITIALLY\s+DEFERRED/i,
       );
@@ -432,6 +650,29 @@ describe('daemon SQLite migrations', () => {
       expect(createSql.sessions).toMatch(
         /current_turn_id\s+TEXT\s+REFERENCES\s+turns\s*\(id\)\s+DEFERRABLE\s+INITIALLY\s+DEFERRED/i,
       );
+      expect(createSql.model_calls).toMatch(
+        /successful_attempt_id\s+TEXT\s+REFERENCES\s+model_attempts\s*\(id\)\s+DEFERRABLE\s+INITIALLY\s+DEFERRED/i,
+      );
+      expect(createSql.artifacts).toMatch(
+        /FOREIGN\s+KEY\s*\(\s*id\s*,\s*current_version_id\s*\)\s+REFERENCES\s+artifact_versions\s*\(\s*artifact_id\s*,\s*id\s*\)\s+DEFERRABLE\s+INITIALLY\s+DEFERRED/i,
+      );
+      expect(
+        database
+          .pragma('table_info(turns)')
+          .find((column: { readonly name: string }) =>
+            column.name === 'execution_fence'),
+      ).toMatchObject({
+        name: 'execution_fence',
+        type: 'INTEGER',
+        notnull: 1,
+        dflt_value: '0',
+      });
+      expect(
+        database
+          .pragma('table_info(runner_leases)')
+          .slice(-3)
+          .map((column: { readonly name: string }) => column.name),
+      ).toEqual(['runner_instance_id', 'pid', 'process_start_identity']);
       expect(createSql.turns).not.toMatch(
         /UNIQUE\s*\(\s*session_id\s*,\s*client_request_id\s*\)/i,
       );
@@ -498,7 +739,7 @@ describe('daemon SQLite migrations', () => {
             `INSERT INTO turns VALUES (
               'turn-1', 'session-1', 1, 'key', 'normal', 'succeeded',
               'message-input', 'craft', 'full_access', 'now', 'now', 'now',
-              NULL, NULL, 'message-result'
+              NULL, NULL, 'message-result', 0
             )`,
           )
           .run();
@@ -531,6 +772,953 @@ describe('daemon SQLite migrations', () => {
       database.close();
     }
   });
+
+  it('rejects every execution-ledger partial and declared unique owner conflict', async () => {
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    try {
+      const turns = Array.from({ length: 12 }, (_value, index) =>
+        seedTurn(database, `unique-${index + 1}`),
+      );
+      const first = turns[0]!;
+      insertModelCall(database, {
+        id: 'model-call-active',
+        ...first,
+      });
+      expect(() =>
+        insertModelCall(database, {
+          id: 'model-call-active-conflict',
+          ...first,
+          ordinal: 2,
+        }),
+      ).toThrow();
+      expect(() =>
+        insertModelCall(database, {
+          id: 'model-call-ordinal-conflict',
+          ...first,
+          status: 'failed',
+        }),
+      ).toThrow();
+
+      const second = turns[1]!;
+      insertModelCall(database, { id: 'model-call-attempts', ...second });
+      insertModelAttempt(database, {
+        id: 'model-attempt-active',
+        modelCallId: 'model-call-attempts',
+      });
+      expect(() =>
+        insertModelAttempt(database, {
+          id: 'model-attempt-number-conflict',
+          modelCallId: 'model-call-attempts',
+          status: 'failed',
+        }),
+      ).toThrow();
+      expect(() =>
+        insertModelAttempt(database, {
+          id: 'model-attempt-active-conflict',
+          modelCallId: 'model-call-attempts',
+          attempt: 2,
+        }),
+      ).toThrow();
+      database
+        .prepare(
+          "UPDATE model_attempts SET status = 'succeeded' WHERE id = 'model-attempt-active'",
+        )
+        .run();
+      expect(() =>
+        insertModelAttempt(database, {
+          id: 'model-attempt-succeeded-conflict',
+          modelCallId: 'model-call-attempts',
+          attempt: 2,
+          status: 'succeeded',
+        }),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO model_tool_calls (
+            model_attempt_id, logical_call_id, call_index, tool_id,
+            arguments_json, normalized_input_hash
+          ) VALUES ('model-attempt-active', 'logical-1', 0, 'fs.read_text',
+            '{}', ?)` ,
+        )
+        .run('a'.repeat(64));
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO model_tool_calls VALUES (
+              'model-attempt-active', 'logical-1', 1, 'fs.read_text', '{}', ?
+            )`,
+          )
+          .run('b'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO model_tool_calls VALUES (
+              'model-attempt-active', 'logical-2', 0, 'fs.read_text', '{}', ?
+            )`,
+          )
+          .run('c'.repeat(64)),
+      ).toThrow();
+
+      const sourceOwnership = {
+        sourceModelCallId: 'model-call-attempts',
+        sourceModelAttemptId: 'model-attempt-active',
+      };
+      const third = turns[2]!;
+      const activeTool = toolRunValues('active', {
+        ...third,
+        ...sourceOwnership,
+      }, { status: 'queued' });
+      insertToolRun(database, activeTool);
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'active-conflict',
+            { ...third, ...sourceOwnership },
+            { ordinal: 2, status: 'running' },
+          ),
+        ),
+      ).toThrow();
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'turn-ordinal-conflict',
+            { ...third, ...sourceOwnership },
+            { ordinal: 1, status: 'failed' },
+          ),
+        ),
+      ).toThrow();
+
+      const fourth = turns[3]!;
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'source-owner-conflict',
+            { ...fourth, ...sourceOwnership },
+            {
+              logicalCallId: activeTool.logicalCallId,
+              attempt: activeTool.attempt,
+            },
+          ),
+        ),
+      ).toThrow();
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'operation-conflict',
+            { ...fourth, ...sourceOwnership },
+            { operationId: activeTool.operationId },
+          ),
+        ),
+      ).toThrow();
+
+      const fifth = turns[4]!;
+      const effectOwner = toolRunValues(
+        'effect-owner',
+        { ...fifth, ...sourceOwnership },
+        {
+          toolId: 'fs.write_text',
+          executionMode: 'worker',
+          sideEffectClass: 'local_write',
+          idempotencyKey: 'shared-effect-key',
+          dispatchState: 'acknowledged',
+          dispatchNonce: 'dispatch-owner',
+          effectState: 'unknown',
+        },
+      );
+      insertToolRun(database, effectOwner);
+      const sixth = turns[5]!;
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'effect-owner-conflict',
+            { ...sixth, ...sourceOwnership },
+            {
+              toolId: 'fs.write_text',
+              executionMode: 'worker',
+              sideEffectClass: 'local_write',
+              idempotencyKey: 'shared-effect-key',
+              dispatchState: 'acknowledged',
+              dispatchNonce: 'dispatch-other',
+              effectState: 'unknown',
+            },
+          ),
+        ),
+      ).toThrow();
+      const seventh = turns[6]!;
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'dispatch-conflict',
+            { ...seventh, ...sourceOwnership },
+            {
+              toolId: 'fs.write_text',
+              executionMode: 'worker',
+              sideEffectClass: 'local_write',
+              idempotencyKey: 'dispatch-conflict-key',
+              dispatchState: 'acknowledged',
+              dispatchNonce: effectOwner.dispatchNonce,
+              effectState: 'unknown',
+            },
+          ),
+        ),
+      ).toThrow();
+
+      const eighth = turns[7]!;
+      const handleOwner = toolRunValues(
+        'handle-owner',
+        { ...eighth, ...sourceOwnership },
+        {
+          toolId: 'fs.write_text',
+          executionMode: 'worker',
+          sideEffectClass: 'local_write',
+          status: 'succeeded',
+          idempotencyKey: 'handle-owner-key',
+          sourceHandle: 'source-handle-shared',
+          dispatchState: 'acknowledged',
+          dispatchNonce: 'dispatch-handle-owner',
+          effectState: 'applied',
+        },
+      );
+      insertToolRun(database, handleOwner);
+      const ninth = turns[8]!;
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues(
+            'handle-conflict',
+            { ...ninth, ...sourceOwnership },
+            {
+              toolId: 'fs.write_text',
+              executionMode: 'worker',
+              sideEffectClass: 'local_write',
+              status: 'succeeded',
+              idempotencyKey: 'handle-conflict-key',
+              sourceHandle: handleOwner.sourceHandle,
+              dispatchState: 'acknowledged',
+              dispatchNonce: 'dispatch-handle-other',
+              effectState: 'applied',
+            },
+          ),
+        ),
+      ).toThrow();
+
+      const tenth = turns[9]!;
+      database
+        .prepare(
+          `INSERT INTO runner_leases (
+            id, daemon_epoch, lease_epoch, session_id, current_turn_id, status,
+            heartbeat_at, lease_expires_at, runner_instance_id, pid,
+            process_start_identity
+          ) VALUES ('lease-active', 'daemon-1', 1, ?, ?, 'active', 'now',
+            'later', NULL, NULL, NULL)`,
+        )
+        .run(tenth.sessionId, tenth.turnId);
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO runner_leases (
+              id, daemon_epoch, lease_epoch, session_id, current_turn_id,
+              status, heartbeat_at, lease_expires_at, runner_instance_id, pid,
+              process_start_identity
+            ) VALUES ('lease-active-conflict', 'daemon-2', 1, ?, ?, 'active',
+              'now', 'later', NULL, NULL, NULL)`,
+          )
+          .run(tenth.sessionId, tenth.turnId),
+      ).toThrow();
+      const eleventh = turns[10]!;
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO runner_leases (
+              id, daemon_epoch, lease_epoch, session_id, current_turn_id,
+              status, heartbeat_at, lease_expires_at, runner_instance_id, pid,
+              process_start_identity
+            ) VALUES ('lease-epoch-conflict', 'daemon-1', 1, ?, ?, 'expired',
+              'now', 'later', NULL, NULL, NULL)`,
+          )
+          .run(eleventh.sessionId, eleventh.turnId),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO tracked_files (
+            session_id, canonical_path, requested_path, content_sha256, size,
+            mtime_ms, device, inode, baseline_source, last_source_tool_run_id,
+            updated_at
+          ) VALUES (?, '/canonical/file', 'file', ?, 1, 1, 'dev', 'inode',
+            'read', ?, 'now')`,
+        )
+        .run(first.sessionId, 'a'.repeat(64), activeTool.id);
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO tracked_files VALUES (
+              ?, '/canonical/file', 'other', ?, 2, 2, 'dev', 'inode-2',
+              'write', ?, 'later'
+            )`,
+          )
+          .run(first.sessionId, 'b'.repeat(64), handleOwner.id),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO fs_write_effects VALUES (
+            ?, 'summary.md', '/canonical/summary.md', 1, ?, ?, 12
+          )`,
+        )
+        .run(handleOwner.id, 'a'.repeat(64), 'b'.repeat(64));
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO fs_write_effects VALUES (
+              ?, 'other.md', '/canonical/other.md', 0, NULL, ?, 1
+            )`,
+          )
+          .run(handleOwner.id, 'c'.repeat(64)),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO audit_events (
+            id, session_id, turn_id, operation_key, phase, action,
+            payload_json, created_at
+          ) VALUES ('audit-1', ?, ?, 'operation-audit', 'intent', 'tool.write',
+            '{}', 'now')`,
+        )
+        .run(first.sessionId, first.turnId);
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO audit_events (
+              id, session_id, turn_id, operation_key, phase, action,
+              payload_json, created_at
+            ) VALUES ('audit-2', ?, ?, 'operation-audit', 'intent',
+              'tool.write', '{}', 'now')`,
+          )
+          .run(first.sessionId, first.turnId),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO audit_events (
+              id, session_id, turn_id, operation_key, phase, action,
+              payload_json, created_at
+            ) VALUES ('audit-1', ?, ?, 'operation-other', 'outcome',
+              'tool.write', '{}', 'now')`,
+          )
+          .run(first.sessionId, first.turnId),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO effect_resolutions (
+            id, resolution_key, tool_run_id, resolution, evidence_json, actor,
+            created_at
+          ) VALUES ('resolution-1', 'resolution-key', ?,
+            'confirmed_applied', '{}', 'daemon', 'now')`,
+        )
+        .run(effectOwner.id);
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO effect_resolutions VALUES (
+              'resolution-2', 'resolution-key', ?, 'confirmed_not_applied',
+              '{}', 'daemon', 'now'
+            )`,
+          )
+          .run(handleOwner.id),
+      ).toThrow();
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rejects missing execution parents, invalid scalar checks, and every cross-mode ToolRun combination', async () => {
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    try {
+      const owner = seedTurn(database, 'checks');
+      insertModelCall(database, { id: 'model-call-checks', ...owner });
+      insertModelAttempt(database, {
+        id: 'model-attempt-checks',
+        modelCallId: 'model-call-checks',
+      });
+      const ownership = {
+        ...owner,
+        sourceModelCallId: 'model-call-checks',
+        sourceModelAttemptId: 'model-attempt-checks',
+      };
+
+      expect(() =>
+        insertModelCall(database, {
+          id: 'model-call-missing-session',
+          sessionId: 'missing-session',
+          turnId: owner.turnId,
+        }),
+      ).toThrow();
+      expect(() =>
+        insertModelAttempt(database, {
+          id: 'model-attempt-missing-call',
+          modelCallId: 'missing-model-call',
+        }),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO model_tool_calls VALUES (
+              'missing-attempt', 'logical', 0, 'fs.read_text', '{}', ?
+            )`,
+          )
+          .run('a'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        insertToolRun(
+          database,
+          toolRunValues('missing-source', {
+            ...owner,
+            sourceModelCallId: 'missing-model-call',
+            sourceModelAttemptId: 'missing-model-attempt',
+          }),
+        ),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO tracked_files VALUES (
+              'missing-session', '/missing', 'missing', ?, 0, 0, 'dev',
+              'inode', 'read', NULL, 'now'
+            )`,
+          )
+          .run('a'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO fs_write_effects VALUES (
+              'missing-tool-run', 'file', '/file', 0, NULL, ?, 0
+            )`,
+          )
+          .run('a'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO audit_events (
+              id, session_id, turn_id, operation_key, phase, action,
+              payload_json, created_at
+            ) VALUES ('audit-missing', 'missing-session', 'missing-turn',
+              'operation', 'intent', 'action', '{}', 'now')`,
+          )
+          .run(),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO effect_resolutions VALUES (
+              'resolution-missing', 'resolution-missing', 'missing-tool-run',
+              'confirmed_applied', '{}', 'daemon', 'now'
+            )`,
+          )
+          .run(),
+      ).toThrow();
+
+      expect(() =>
+        database
+          .prepare('UPDATE turns SET execution_fence = -1 WHERE id = ?')
+          .run(owner.turnId),
+      ).toThrow();
+      for (const statement of [
+        "UPDATE model_calls SET ordinal = 0 WHERE id = 'model-call-checks'",
+        "UPDATE model_calls SET kind = 'summary' WHERE id = 'model-call-checks'",
+        "UPDATE model_calls SET status = 'queued' WHERE id = 'model-call-checks'",
+        "UPDATE model_attempts SET attempt = 0 WHERE id = 'model-attempt-checks'",
+        "UPDATE model_attempts SET input_tokens = -1 WHERE id = 'model-attempt-checks'",
+        "UPDATE model_attempts SET output_tokens = -1 WHERE id = 'model-attempt-checks'",
+        "UPDATE model_attempts SET cached_tokens = -1 WHERE id = 'model-attempt-checks'",
+        "UPDATE model_attempts SET latency_ms = -1 WHERE id = 'model-attempt-checks'",
+        "UPDATE model_attempts SET retryable = 2 WHERE id = 'model-attempt-checks'",
+      ]) {
+        expect(() => database.exec(statement)).toThrow();
+      }
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO model_tool_calls VALUES (
+              'model-attempt-checks', 'negative-index', -1, 'fs.read_text',
+              '{}', ?
+            )`,
+          )
+          .run('a'.repeat(64)),
+      ).toThrow();
+
+      const invalidModes: Array<{
+        readonly name: string;
+        readonly overrides: Partial<ToolRunValues>;
+      }> = [
+        {
+          name: 'read_inline local_write',
+          overrides: { sideEffectClass: 'local_write' },
+        },
+        {
+          name: 'read_inline dispatch state',
+          overrides: {
+            dispatchState: 'prepared',
+            dispatchNonce: 'read-dispatch',
+          },
+        },
+        {
+          name: 'read_inline applied effect',
+          overrides: { effectState: 'applied' },
+        },
+        {
+          name: 'worker read side effect',
+          overrides: {
+            executionMode: 'worker',
+            sideEffectClass: 'read',
+            idempotencyKey: 'worker-read',
+            dispatchState: 'prepared',
+            dispatchNonce: 'worker-read',
+          },
+        },
+        {
+          name: 'worker missing operation',
+          overrides: {
+            executionMode: 'worker',
+            sideEffectClass: 'local_write',
+            operationId: null,
+            idempotencyKey: 'worker-operation',
+            dispatchState: 'prepared',
+            dispatchNonce: 'worker-operation',
+          },
+        },
+        {
+          name: 'worker missing idempotency',
+          overrides: {
+            executionMode: 'worker',
+            sideEffectClass: 'local_write',
+            dispatchState: 'prepared',
+            dispatchNonce: 'worker-idempotency',
+          },
+        },
+        {
+          name: 'worker missing dispatch state',
+          overrides: {
+            executionMode: 'worker',
+            sideEffectClass: 'local_write',
+            idempotencyKey: 'worker-state',
+            dispatchNonce: 'worker-state',
+          },
+        },
+        {
+          name: 'worker missing dispatch nonce',
+          overrides: {
+            executionMode: 'worker',
+            sideEffectClass: 'local_write',
+            idempotencyKey: 'worker-nonce',
+            dispatchState: 'prepared',
+          },
+        },
+        {
+          name: 'transactional intrinsic dispatch state',
+          overrides: {
+            executionMode: 'transactional_intrinsic',
+            sideEffectClass: 'local_write',
+            dispatchState: 'prepared',
+            dispatchNonce: 'intrinsic-state',
+          },
+        },
+        {
+          name: 'transactional intrinsic dispatch nonce',
+          overrides: {
+            executionMode: 'transactional_intrinsic',
+            sideEffectClass: 'local_write',
+            dispatchNonce: 'intrinsic-nonce',
+          },
+        },
+        {
+          name: 'transactional intrinsic applied effect',
+          overrides: {
+            executionMode: 'transactional_intrinsic',
+            sideEffectClass: 'local_write',
+            effectState: 'applied',
+          },
+        },
+        {
+          name: 'source handle on another Tool',
+          overrides: {
+            status: 'succeeded',
+            sourceHandle: 'source-handle-wrong-tool',
+          },
+        },
+        {
+          name: 'source handle on failed fs.write_text',
+          overrides: {
+            toolId: 'fs.write_text',
+            executionMode: 'worker',
+            sideEffectClass: 'local_write',
+            idempotencyKey: 'failed-handle',
+            sourceHandle: 'source-handle-failed',
+            dispatchState: 'acknowledged',
+            dispatchNonce: 'failed-handle',
+            effectState: 'unknown',
+          },
+        },
+        { name: 'unknown execution mode', overrides: { executionMode: 'fork' } },
+        { name: 'unknown status', overrides: { status: 'waiting' } },
+        { name: 'unknown effect state', overrides: { effectState: 'maybe' } },
+      ];
+      for (const { name, overrides } of invalidModes) {
+        expect(
+          () =>
+            insertToolRun(
+              database,
+              toolRunValues(`invalid-${name.replaceAll(' ', '-')}`, ownership, overrides),
+            ),
+          name,
+        ).toThrow();
+      }
+
+      const validTool = toolRunValues('check-valid', ownership);
+      insertToolRun(database, validTool);
+      database
+        .prepare(
+          `INSERT INTO tracked_files VALUES (
+            ?, '/canonical/check', 'check', ?, 1, 1, 'dev', 'inode', 'read',
+            ?, 'now'
+          )`,
+        )
+        .run(owner.sessionId, 'a'.repeat(64), validTool.id);
+      for (const statement of [
+        "UPDATE tracked_files SET size = -1 WHERE canonical_path = '/canonical/check'",
+        "UPDATE tracked_files SET mtime_ms = -1 WHERE canonical_path = '/canonical/check'",
+        "UPDATE tracked_files SET baseline_source = 'scan' WHERE canonical_path = '/canonical/check'",
+      ]) {
+        expect(() => database.exec(statement)).toThrow();
+      }
+      database
+        .prepare(
+          `INSERT INTO fs_write_effects VALUES (
+            ?, 'check', '/canonical/check', 1, ?, ?, 1
+          )`,
+        )
+        .run(validTool.id, 'a'.repeat(64), 'b'.repeat(64));
+      expect(() =>
+        database
+          .prepare('UPDATE fs_write_effects SET target_existed_before = 2')
+          .run(),
+      ).toThrow();
+      expect(() =>
+        database.prepare('UPDATE fs_write_effects SET expected_size = -1').run(),
+      ).toThrow();
+
+      database
+        .prepare(
+          `INSERT INTO audit_events (
+            id, session_id, turn_id, operation_key, phase, action,
+            payload_json, created_at
+          ) VALUES ('audit-check', ?, ?, 'audit-check', 'intent', 'check',
+            '{}', 'now')`,
+        )
+        .run(owner.sessionId, owner.turnId);
+      expect(() =>
+        database.prepare("UPDATE audit_events SET phase = 'middle'").run(),
+      ).toThrow();
+      database
+        .prepare(
+          `INSERT INTO effect_resolutions VALUES (
+            'resolution-check', 'resolution-check', ?, 'confirmed_applied',
+            '{}', 'daemon', 'now'
+          )`,
+        )
+        .run(validTool.id);
+      expect(() =>
+        database
+          .prepare("UPDATE effect_resolutions SET resolution = 'accepted_unknown'")
+          .run(),
+      ).toThrow();
+      expect(() =>
+        database.prepare("UPDATE effect_resolutions SET actor = 'user'").run(),
+      ).toThrow();
+    } finally {
+      database.close();
+    }
+  });
+
+  it('enforces Blob and Artifact checks, uniqueness, and the deferred current-Version relation', async () => {
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    try {
+      const owner = seedTurn(database, 'artifact', 'succeeded');
+      insertModelCall(database, {
+        id: 'model-call-artifact',
+        ...owner,
+        status: 'succeeded',
+      });
+      insertModelAttempt(database, {
+        id: 'model-attempt-artifact',
+        modelCallId: 'model-call-artifact',
+        status: 'succeeded',
+      });
+      const sourceTool = toolRunValues('artifact-source', {
+        ...owner,
+        sourceModelCallId: 'model-call-artifact',
+        sourceModelAttemptId: 'model-attempt-artifact',
+      }, { status: 'succeeded' });
+      insertToolRun(database, sourceTool);
+      const blobSha256 = 'a'.repeat(64);
+      database
+        .prepare(
+          `INSERT INTO blobs (sha256, size, storage_relpath, created_at)
+           VALUES (?, 12, 'sha256/aa/blob-a', 'now')`,
+        )
+        .run(blobSha256);
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO blobs VALUES (?, 1, 'sha256/aa/blob-a', 'now')`,
+          )
+          .run('b'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare("INSERT INTO blobs VALUES ('short', 1, 'short', 'now')")
+          .run(),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare('INSERT INTO blobs VALUES (?, -1, ?, ?)')
+          .run('c'.repeat(64), 'negative', 'now'),
+      ).toThrow();
+
+      const incompleteArtifact = database.transaction(() => {
+        database
+          .prepare(
+            `INSERT INTO artifacts (
+              id, session_id, logical_name, current_version_id, created_at,
+              updated_at
+            ) VALUES ('artifact-incomplete', ?, 'incomplete',
+              'missing-version', 'now', 'now')`,
+          )
+          .run(owner.sessionId);
+      });
+      expect(() => incompleteArtifact.immediate()).toThrow();
+      expect(
+        database
+          .prepare("SELECT id FROM artifacts WHERE id = 'artifact-incomplete'")
+          .get(),
+      ).toBeUndefined();
+
+      const insertArtifact = (
+        artifactId: string,
+        versionId: string,
+        logicalName: string,
+        version: number,
+        registrationKey: string,
+      ): void => {
+        const transaction = database.transaction(() => {
+          database
+            .prepare(
+              `INSERT INTO artifacts (
+                id, session_id, logical_name, current_version_id, created_at,
+                updated_at
+              ) VALUES (?, ?, ?, ?, 'now', 'now')`,
+            )
+            .run(artifactId, owner.sessionId, logicalName, versionId);
+          database
+            .prepare(
+              `INSERT INTO artifact_versions (
+                id, artifact_id, version, source_turn_id, source_tool_run_id,
+                blob_sha256, visibility, artifact_type, mime_type, filename,
+                size, validation_status, registration_key,
+                registration_input_hash, provenance_json, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, 'final', 'markdown',
+                'text/markdown', 'summary.md', 12, 'unchecked', ?, ?, '{}',
+                'now')`,
+            )
+            .run(
+              versionId,
+              artifactId,
+              version,
+              owner.turnId,
+              sourceTool.id,
+              blobSha256,
+              registrationKey,
+              'd'.repeat(64),
+            );
+        });
+        transaction.immediate();
+      };
+
+      insertArtifact('artifact-1', 'artifact-version-1', 'summary', 1, 'register-1');
+      insertArtifact('artifact-2', 'artifact-version-2', 'notes', 1, 'register-2');
+
+      const pointAcrossArtifacts = database.transaction(() => {
+        database
+          .prepare(
+            `UPDATE artifacts SET current_version_id = 'artifact-version-2'
+             WHERE id = 'artifact-1'`,
+          )
+          .run();
+      });
+      expect(() => pointAcrossArtifacts.immediate()).toThrow();
+      expect(
+        database
+          .prepare("SELECT current_version_id FROM artifacts WHERE id = 'artifact-1'")
+          .get(),
+      ).toEqual({ current_version_id: 'artifact-version-1' });
+
+      expect(() =>
+        insertArtifact(
+          'artifact-logical-conflict',
+          'artifact-version-logical-conflict',
+          'summary',
+          1,
+          'register-logical-conflict',
+        ),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO artifact_versions (
+              id, artifact_id, version, source_turn_id, source_tool_run_id,
+              blob_sha256, visibility, artifact_type, mime_type, filename,
+              size, validation_status, registration_key,
+              registration_input_hash, provenance_json, created_at
+            ) VALUES ('artifact-version-number-conflict', 'artifact-1', 1, ?,
+              ?, ?, 'working', 'markdown', 'text/markdown', 'summary-v2.md', 12,
+              'valid', 'register-number-conflict', ?, '{}', 'now')`,
+          )
+          .run(owner.turnId, sourceTool.id, blobSha256, 'e'.repeat(64)),
+      ).toThrow();
+      expect(() =>
+        database
+          .prepare(
+            `INSERT INTO artifact_versions (
+              id, artifact_id, version, source_turn_id, source_tool_run_id,
+              blob_sha256, visibility, artifact_type, mime_type, filename,
+              size, validation_status, registration_key,
+              registration_input_hash, provenance_json, created_at
+            ) VALUES ('artifact-version-registration-conflict', 'artifact-1',
+              2, ?, ?, ?, 'evidence', 'markdown', 'text/markdown', 'evidence.md',
+              12, 'warning', 'register-1', ?, '{}', 'now')`,
+          )
+          .run(owner.turnId, sourceTool.id, blobSha256, 'f'.repeat(64)),
+      ).toThrow();
+
+      const invalidVersionStatements = [
+        ['version', 0],
+        ['visibility', 'private'],
+        ['artifact_type', 'binary'],
+        ['mime_type', 'text/plain'],
+        ['size', -1],
+        ['validation_status', 'pending'],
+      ] as const;
+      for (const [column, value] of invalidVersionStatements) {
+        expect(() =>
+          database
+            .prepare(
+              `UPDATE artifact_versions SET ${column} = ?
+               WHERE id = 'artifact-version-1'`,
+            )
+            .run(value),
+        ).toThrow();
+      }
+      expect(database.pragma('foreign_key_check')).toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each(['artifact', 'turn', 'tool', 'blob'] as const)(
+    'rejects an ArtifactVersion whose %s parent alone is missing',
+    async (missingParent) => {
+      runtime = createTempRuntime();
+      const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+      try {
+        const owner = seedTurn(database, `artifact-fk-${missingParent}`, 'succeeded');
+        const modelCallId = `model-call-artifact-fk-${missingParent}`;
+        const modelAttemptId = `model-attempt-artifact-fk-${missingParent}`;
+        insertModelCall(database, {
+          id: modelCallId,
+          ...owner,
+          status: 'succeeded',
+        });
+        insertModelAttempt(database, {
+          id: modelAttemptId,
+          modelCallId,
+          status: 'succeeded',
+        });
+        const sourceTool = toolRunValues(
+          `artifact-fk-${missingParent}`,
+          {
+            ...owner,
+            sourceModelCallId: modelCallId,
+            sourceModelAttemptId: modelAttemptId,
+          },
+          { status: 'succeeded' },
+        );
+        insertToolRun(database, sourceTool);
+        const blobSha256 = 'a'.repeat(64);
+        database
+          .prepare('INSERT INTO blobs VALUES (?, 1, ?, \'now\')')
+          .run(blobSha256, `blob-${missingParent}`);
+
+        const artifactId =
+          missingParent === 'artifact'
+            ? 'missing-artifact'
+            : `artifact-fk-${missingParent}`;
+        const versionId = `artifact-version-fk-${missingParent}`;
+        const insertInvalidVersion = database.transaction(() => {
+          if (missingParent !== 'artifact') {
+            database
+              .prepare(
+                `INSERT INTO artifacts VALUES (?, ?, ?, ?, 'now', 'now')`,
+              )
+              .run(
+                artifactId,
+                owner.sessionId,
+                `logical-${missingParent}`,
+                versionId,
+              );
+          }
+          database
+            .prepare(
+              `INSERT INTO artifact_versions (
+                id, artifact_id, version, source_turn_id, source_tool_run_id,
+                blob_sha256, visibility, artifact_type, mime_type, filename,
+                size, validation_status, registration_key,
+                registration_input_hash, provenance_json, created_at
+              ) VALUES (?, ?, 1, ?, ?, ?, 'final', 'markdown',
+                'text/markdown', 'missing.md', 1, 'unchecked', ?, ?, '{}',
+                'now')`,
+            )
+            .run(
+              versionId,
+              artifactId,
+              missingParent === 'turn' ? 'missing-turn' : owner.turnId,
+              missingParent === 'tool' ? 'missing-tool' : sourceTool.id,
+              missingParent === 'blob' ? 'b'.repeat(64) : blobSha256,
+              `register-${missingParent}`,
+              'c'.repeat(64),
+            );
+        });
+
+        expect(() => insertInvalidVersion.immediate()).toThrow();
+        expect(database.pragma('foreign_key_check')).toEqual([]);
+      } finally {
+        database.close();
+      }
+    },
+  );
 
   it('is idempotent when every installed migration is already applied', async () => {
     runtime = createTempRuntime();
@@ -1099,6 +2287,280 @@ describe('daemon SQLite migrations', () => {
     }
   });
 
+  it('upgrades the shipped 002 schema with one awaited pre-003 backup before applying 003 and 004', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    copyFileSync(
+      sourceMigrationPath,
+      join(migrationsDirectory, '001_runtime_foundation.sql'),
+    );
+    copyFileSync(
+      sourceSchedulerMigrationPath,
+      join(migrationsDirectory, '002_scheduler_invariants.sql'),
+    );
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'runtime.sqlite3'),
+    );
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      expect(
+        database.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      const seedQueuedFacts = database.transaction(() => {
+        database.exec(`
+          INSERT INTO workspaces (
+            id, path, canonical_path, created_at
+          ) VALUES (
+            'upgrade-workspace', '/upgrade', '/canonical/upgrade', 'before'
+          );
+          INSERT INTO sessions (
+            id, title, workspace_id, lifecycle_status, runtime_status,
+            queue_block_reason, recovery_episode, recovery_source_turn_id,
+            current_turn_id, mode, access_mode, next_turn_ordinal,
+            next_event_seq, revision, created_at, updated_at
+          ) VALUES (
+            'upgrade-session', 'Upgrade', 'upgrade-workspace', 'active',
+            'queued', NULL, 0, NULL, NULL, 'craft', 'full_access', 2, 1, 0,
+            'before', 'before'
+          );
+          INSERT INTO messages (
+            id, session_id, turn_id, role, status, content, created_at,
+            completed_at
+          ) VALUES (
+            'upgrade-message', 'upgrade-session', 'upgrade-turn', 'user',
+            'completed', 'Persist through 003 and 004', 'before', 'before'
+          );
+          INSERT INTO turns (
+            id, session_id, ordinal, client_request_id, queue_kind, status,
+            input_message_id, mode_snapshot, access_mode_snapshot, queued_at,
+            started_at, finished_at, error_code, error_message,
+            result_message_id
+          ) VALUES (
+            'upgrade-turn', 'upgrade-session', 1, 'upgrade-request', 'normal',
+            'queued', 'upgrade-message', 'craft', 'full_access', 'before',
+            NULL, NULL, NULL, NULL, NULL
+          );
+        `);
+      });
+      seedQueuedFacts.immediate();
+
+      copyFileSync(
+        sourceExecutionMigrationPath,
+        join(migrationsDirectory, '003_execution_ledger.sql'),
+      );
+      copyFileSync(
+        sourceArtifactMigrationPath,
+        join(migrationsDirectory, '004_artifact_store.sql'),
+      );
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+
+      expect(
+        database.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      ).toEqual([
+        { version: 1 },
+        { version: 2 },
+        { version: 3 },
+        { version: 4 },
+      ]);
+      expect(
+        database
+          .prepare(
+            `SELECT id, session_id, status, input_message_id, execution_fence
+             FROM turns WHERE id = 'upgrade-turn'`,
+          )
+          .get(),
+      ).toEqual({
+        id: 'upgrade-turn',
+        session_id: 'upgrade-session',
+        status: 'queued',
+        input_message_id: 'upgrade-message',
+        execution_fence: 0,
+      });
+      expect(new SessionRepository(database).getSnapshot('upgrade-session')).toMatchObject({
+        session: {
+          id: 'upgrade-session',
+          runtimeStatus: 'queued',
+        },
+        messages: [
+          {
+            id: 'upgrade-message',
+            turnId: 'upgrade-turn',
+            content: 'Persist through 003 and 004',
+          },
+        ],
+        turns: [
+          {
+            id: 'upgrade-turn',
+            status: 'queued',
+            executionFence: 0,
+          },
+        ],
+      });
+      const backups = readdirSync(join(runtime.dataDir, 'backups'));
+      expect(backups).toHaveLength(1);
+      expect(backups[0]).toMatch(/^runtime-before-v003-.+\.sqlite3$/);
+      const backup = new Database(
+        join(runtime.dataDir, 'backups', backups[0] as string),
+        { readonly: true },
+      );
+      try {
+        expect(
+          backup.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+        ).toEqual([{ version: 1 }, { version: 2 }]);
+        expect(
+          backup
+            .pragma('table_info(turns)')
+            .some((column: { readonly name: string }) =>
+              column.name === 'execution_fence'),
+        ).toBe(false);
+        expect(tableExists(backup, 'model_calls')).toBe(false);
+        expect(tableExists(backup, 'artifacts')).toBe(false);
+        expect(
+          backup
+            .prepare(
+              `SELECT id, status, input_message_id
+               FROM turns WHERE id = 'upgrade-turn'`,
+            )
+            .get(),
+        ).toEqual({
+          id: 'upgrade-turn',
+          status: 'queued',
+          input_message_id: 'upgrade-message',
+        });
+      } finally {
+        backup.close();
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rolls back every shipped 003 schema effect and its history row on failure', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    copyFileSync(
+      sourceMigrationPath,
+      join(migrationsDirectory, '001_runtime_foundation.sql'),
+    );
+    copyFileSync(
+      sourceSchedulerMigrationPath,
+      join(migrationsDirectory, '002_scheduler_invariants.sql'),
+    );
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'broken-003.sqlite3'),
+    );
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      writeFileSync(
+        join(migrationsDirectory, '003_execution_ledger.sql'),
+        `${readFileSync(sourceExecutionMigrationPath, 'utf8')}
+         INSERT INTO table_that_does_not_exist VALUES ('boom');`,
+        { mode: 0o600 },
+      );
+
+      await expect(
+        migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        }),
+      ).rejects.toThrow();
+      expect(
+        database.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(
+        database
+          .pragma('table_info(turns)')
+          .some((column: { readonly name: string }) =>
+            column.name === 'execution_fence'),
+      ).toBe(false);
+      expect(tableExists(database, 'model_calls')).toBe(false);
+      expect(tableExists(database, 'tool_runs')).toBe(false);
+      expect(
+        database
+          .pragma('table_info(runner_leases)')
+          .map((column: { readonly name: string }) => column.name)
+          .filter((name: string) =>
+            ['runner_instance_id', 'pid', 'process_start_identity'].includes(name),
+          ),
+      ).toEqual([]);
+      expect(
+        database
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'index'
+               AND name IN (
+                 'model_calls_one_running_per_turn',
+                 'model_attempts_one_running_per_call',
+                 'model_attempts_one_succeeded_per_call',
+                 'tool_runs_one_active_per_turn',
+                 'tool_runs_effectful_idempotency_owner',
+                 'runner_leases_one_active_per_turn'
+               )`,
+          )
+          .all(),
+      ).toEqual([]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rolls back every shipped 004 schema effect and its history row on failure', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    copyFileSync(
+      sourceMigrationPath,
+      join(migrationsDirectory, '001_runtime_foundation.sql'),
+    );
+    copyFileSync(
+      sourceSchedulerMigrationPath,
+      join(migrationsDirectory, '002_scheduler_invariants.sql'),
+    );
+    copyFileSync(
+      sourceExecutionMigrationPath,
+      join(migrationsDirectory, '003_execution_ledger.sql'),
+    );
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'broken-004.sqlite3'),
+    );
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      writeFileSync(
+        join(migrationsDirectory, '004_artifact_store.sql'),
+        `${readFileSync(sourceArtifactMigrationPath, 'utf8')}
+         INSERT INTO table_that_does_not_exist VALUES ('boom');`,
+        { mode: 0o600 },
+      );
+
+      await expect(
+        migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        }),
+      ).rejects.toThrow();
+      expect(
+        database.prepare('SELECT version FROM schema_migrations ORDER BY version').all(),
+      ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+      expect(tableExists(database, 'model_calls')).toBe(true);
+      expect(tableExists(database, 'blobs')).toBe(false);
+      expect(tableExists(database, 'artifacts')).toBe(false);
+      expect(tableExists(database, 'artifact_versions')).toBe(false);
+    } finally {
+      database.close();
+    }
+  });
+
   it('rolls back shipped migration 002 and its version when old rows violate the active-Turn invariant', async () => {
     runtime = createTempRuntime();
     const migrationsDirectory = createMigrationDirectory(runtime, {});
@@ -1436,6 +2898,12 @@ describe('daemon SQLite migrations', () => {
     expect(
       readFileSync(join(distMigrations, '002_scheduler_invariants.sql'), 'utf8'),
     ).toBe(readFileSync(sourceSchedulerMigrationPath, 'utf8'));
+    expect(
+      readFileSync(join(distMigrations, '003_execution_ledger.sql'), 'utf8'),
+    ).toBe(readFileSync(sourceExecutionMigrationPath, 'utf8'));
+    expect(
+      readFileSync(join(distMigrations, '004_artifact_store.sql'), 'utf8'),
+    ).toBe(readFileSync(sourceArtifactMigrationPath, 'utf8'));
 
     const builtModulePath = join(
       repositoryRoot,
@@ -1445,12 +2913,18 @@ describe('daemon SQLite migrations', () => {
       `${pathToFileURL(builtModulePath).href}?test=${randomUUID()}`
     )) as { readonly discoverMigrations: () => Array<{ readonly path: string }> };
     const discovered = builtModule.discoverMigrations();
-    expect(discovered).toHaveLength(2);
+    expect(discovered).toHaveLength(4);
     expect(discovered[0]?.path).toBe(
       join(distMigrations, '001_runtime_foundation.sql'),
     );
     expect(discovered[1]?.path).toBe(
       join(distMigrations, '002_scheduler_invariants.sql'),
+    );
+    expect(discovered[2]?.path).toBe(
+      join(distMigrations, '003_execution_ledger.sql'),
+    );
+    expect(discovered[3]?.path).toBe(
+      join(distMigrations, '004_artifact_store.sql'),
     );
 
     runtime = createTempRuntime();
@@ -1487,7 +2961,12 @@ describe('daemon SQLite migrations', () => {
         builtDatabase
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all(),
-      ).toEqual([{ version: 1 }, { version: 2 }]);
+      ).toEqual([
+        { version: 1 },
+        { version: 2 },
+        { version: 3 },
+        { version: 4 },
+      ]);
     } finally {
       builtDatabase.close();
     }

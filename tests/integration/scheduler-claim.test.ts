@@ -273,6 +273,9 @@ describe('single-slot Scheduler claim', () => {
         status: 'active',
         heartbeat_at: NOW,
         lease_expires_at: LEASE_EXPIRES_AT,
+        runner_instance_id: null,
+        pid: null,
+        process_start_identity: null,
       },
     ]);
     expect(

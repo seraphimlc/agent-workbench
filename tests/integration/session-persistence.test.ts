@@ -203,6 +203,7 @@ describe('craft session persistence', () => {
         clientRequestId: 'session-create-1',
         queueKind: 'normal',
         status: 'queued',
+        executionFence: 0,
         startedAt: null,
         finishedAt: null,
         errorCode: null,

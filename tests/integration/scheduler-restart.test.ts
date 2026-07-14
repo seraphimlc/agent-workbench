@@ -342,6 +342,9 @@ describe('startup scheduler recovery', () => {
           status: 'expired',
           heartbeat_at: CLAIM_TIME,
           lease_expires_at: RECOVERY_TIME,
+          runner_instance_id: null,
+          pid: null,
+          process_start_identity: null,
         });
         expect(
           database
@@ -564,9 +567,10 @@ describe('startup scheduler recovery', () => {
       corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
         database
           .prepare(
-            `INSERT INTO runner_leases VALUES (
-              ?, ?, 2, ?, ?, 'expired', ?, ?
-            )`,
+            `INSERT INTO runner_leases (
+              id, daemon_epoch, lease_epoch, session_id, current_turn_id,
+              status, heartbeat_at, lease_expires_at
+            ) VALUES (?, ?, 2, ?, ?, 'expired', ?, ?)`,
           )
           .run(
             '018f0000-0000-7000-8000-000000000499',
@@ -911,11 +915,13 @@ describe('startup scheduler recovery', () => {
     {
       name: 'multiple active Leases',
       corrupt: (database: RuntimeDatabase, fixture: ActiveFixture) => {
+        database.exec('DROP INDEX runner_leases_one_active_per_turn');
         database
           .prepare(
-            `INSERT INTO runner_leases VALUES (
-              ?, ?, 2, ?, ?, 'active', ?, ?
-            )`,
+            `INSERT INTO runner_leases (
+              id, daemon_epoch, lease_epoch, session_id, current_turn_id,
+              status, heartbeat_at, lease_expires_at
+            ) VALUES (?, ?, 2, ?, ?, 'active', ?, ?)`,
           )
           .run(
             '018f0000-0000-7000-8000-000000000399',
@@ -1021,9 +1027,10 @@ describe('startup scheduler recovery', () => {
           .run(second.turnId, second.sessionId);
         database
           .prepare(
-            `INSERT INTO runner_leases VALUES (
-              ?, ?, 2, ?, ?, 'active', ?, ?
-            )`,
+            `INSERT INTO runner_leases (
+              id, daemon_epoch, lease_epoch, session_id, current_turn_id,
+              status, heartbeat_at, lease_expires_at
+            ) VALUES (?, ?, 2, ?, ?, 'active', ?, ?)`,
           )
           .run(
             '018f0000-0000-7000-8000-000000000398',

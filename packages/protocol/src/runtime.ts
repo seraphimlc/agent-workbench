@@ -79,6 +79,7 @@ export const TurnRowSchema = z
     inputMessageId: NonEmptyStringSchema,
     modeSnapshot: CraftModeSchema,
     accessModeSnapshot: AccessModeSchema,
+    executionFence: z.number().int().nonnegative(),
     queuedAt: NonEmptyStringSchema,
     startedAt: NullableTimestampSchema,
     finishedAt: NullableTimestampSchema,

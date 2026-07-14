@@ -257,6 +257,7 @@ describe('runtime smoke command', () => {
           ordinal: 1,
           queueKind: 'normal',
           status: 'queued',
+          executionFence: 0,
           startedAt: null,
           finishedAt: null,
           resultMessageId: null,
@@ -298,7 +299,12 @@ describe('runtime smoke command', () => {
           database
             .prepare('SELECT version FROM schema_migrations ORDER BY version')
             .all(),
-        ).toEqual([{ version: 1 }, { version: 2 }]);
+        ).toEqual([
+          { version: 1 },
+          { version: 2 },
+          { version: 3 },
+          { version: 4 },
+        ]);
         expect(database.pragma('foreign_key_check')).toEqual([]);
         expect(database.pragma('integrity_check', { simple: true })).toBe('ok');
         expect(database.prepare('SELECT id FROM sessions').all()).toEqual([
@@ -307,9 +313,30 @@ describe('runtime smoke command', () => {
         expect(database.prepare('SELECT id FROM messages').all()).toHaveLength(
           output.restoredMessageCount,
         );
-        const turns = database.prepare('SELECT id, status FROM turns').all();
+        const turns = database
+          .prepare('SELECT id, status, execution_fence FROM turns')
+          .all();
         expect(turns).toHaveLength(output.restoredTurnCount);
-        expect(turns).toEqual([{ id: output.turnId, status: 'queued' }]);
+        expect(turns).toEqual([
+          { id: output.turnId, status: 'queued', execution_fence: 0 },
+        ]);
+        for (const table of [
+          'model_calls',
+          'model_attempts',
+          'model_tool_calls',
+          'tool_runs',
+          'tracked_files',
+          'fs_write_effects',
+          'audit_events',
+          'effect_resolutions',
+          'blobs',
+          'artifacts',
+          'artifact_versions',
+        ]) {
+          expect(
+            database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get(),
+          ).toEqual({ count: 0 });
+        }
         const events = database
           .prepare('SELECT seq FROM session_events ORDER BY seq')
           .all();

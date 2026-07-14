@@ -33,15 +33,15 @@ The script itself writes exactly one JSON object to stdout after cleanup. Daemon
 
 ## Current boundary
 
-This check covers the source Daemon, fd 3 challenge-response authentication, migrations `001` and `002`, workspace registration, creation of the first queued craft turn, graceful restart, and durable snapshot recovery.
+This check covers the source Daemon, fd 3 challenge-response authentication, migrations `001` through `004`, workspace registration, creation of the first queued craft turn with execution fence `0`, graceful restart, and durable snapshot recovery.
 
-It intentionally does not call `Scheduler.claimNext`. It does not execute turns or validate Electron, Runner, model, tool, or artifact paths. A successful result is evidence for the runtime foundation only, not an end-to-end product run.
+Migrations `003` and `004` install the durable execution ledger and immutable Markdown Artifact store. The ordinary Daemon still has no execution dependencies in this slice: it does not call `Scheduler.claimNext`, the Turn remains queued across restart, and all execution and Artifact tables remain empty. The smoke check does not execute turns or validate Electron, Runner, model, tool, Blob content, or Artifact preview paths. A successful result is evidence for the runtime foundation only, not an end-to-end product run.
 
 ## Failure checks
 
 - fd 3 secret: the Daemon requires exactly 32 bytes followed by EOF on fd 3. The launcher must not move the secret into argv or environment variables. Authentication/startup errors must be investigated without printing the secret.
 - Socket/data permissions: the temporary root, data directory, and runtime directory must remain owned by the current user with mode `0700`; the socket and SQLite file must remain `0600`. Ownership, symlink, permission, or overlong Unix-socket paths fail closed.
-- Migration or recovery failure: the Daemon does not emit ready and the smoke command does not emit an `ok` object. Inspect stderr; use `--keep-data` when retained files are needed for SQLite inspection. Do not edit historical migrations `001` or `002` to repair an existing database.
+- Migration or recovery failure: the Daemon does not emit ready and the smoke command does not emit an `ok` object. Inspect stderr; use `--keep-data` when retained files are needed for SQLite inspection. Do not edit historical migrations `001` through `004` to repair an existing database.
 - Non-clean shutdown: both Daemon generations must stop with exit code `0` and no signal. A non-zero exit or forced-signal fallback makes the smoke command fail without an `ok` JSON object.
 
 ## Verification

@@ -392,6 +392,7 @@ export class SessionRepository {
           input_message_id AS inputMessageId,
           mode_snapshot AS modeSnapshot,
           access_mode_snapshot AS accessModeSnapshot,
+          execution_fence AS executionFence,
           queued_at AS queuedAt,
           started_at AS startedAt,
           finished_at AS finishedAt,

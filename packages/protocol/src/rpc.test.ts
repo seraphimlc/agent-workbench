@@ -125,6 +125,7 @@ const sessionSnapshot = {
       inputMessageId: 'message-1',
       modeSnapshot: 'craft',
       accessModeSnapshot: 'full_access',
+      executionFence: 0,
       queuedAt: '2026-07-14T00:00:00.000Z',
       startedAt: null,
       finishedAt: null,
@@ -521,6 +522,25 @@ describe('session snapshots', () => {
       }).success,
     ).toBe(false);
     expect(schema.safeParse({ ...sessionSnapshot, highWaterSeq: 0 }).success).toBe(false);
+    expect(
+      schema.safeParse({ ...sessionSnapshot, modelCalls: [] }).success,
+    ).toBe(false);
+  });
+
+  it('requires a nonnegative integer execution fence on every Turn row', () => {
+    const turnRowSchema = getSchema('TurnRowSchema');
+    const turn = sessionSnapshot.turns[0];
+    const missingFence: Record<string, unknown> = { ...turn };
+    delete missingFence.executionFence;
+
+    expect(turnRowSchema.safeParse(turn).success).toBe(true);
+    expect(turnRowSchema.safeParse(missingFence).success).toBe(false);
+    expect(
+      turnRowSchema.safeParse({ ...turn, executionFence: -1 }).success,
+    ).toBe(false);
+    expect(
+      turnRowSchema.safeParse({ ...turn, executionFence: 0.5 }).success,
+    ).toBe(false);
   });
 
   it('keeps model-only event content behind the list Renderer boundary', () => {
