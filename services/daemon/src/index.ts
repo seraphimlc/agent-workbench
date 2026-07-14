@@ -2,7 +2,11 @@ import { closeSync, readSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DaemonServer, DaemonStartCancelledError } from './server.js';
+import {
+  DaemonServer,
+  DaemonStartCancelledError,
+  type DaemonServerOptions,
+} from './server.js';
 import type { SessionServiceHooks } from './runtime/session-service.js';
 
 type CliOptions = {
@@ -136,6 +140,7 @@ const readStartupInputs = (): { options: CliOptions; bootstrapSecret: Buffer } =
 
 export interface RunDaemonOptions {
   readonly sessionServiceHooks?: SessionServiceHooks;
+  readonly initializeDatabase?: DaemonServerOptions['initializeDatabase'];
 }
 
 export const runDaemon = async (
@@ -150,6 +155,9 @@ export const runDaemon = async (
     bootstrapSecret,
     ...(dependencies.sessionServiceHooks
       ? { sessionServiceHooks: dependencies.sessionServiceHooks }
+      : {}),
+    ...(dependencies.initializeDatabase
+      ? { initializeDatabase: dependencies.initializeDatabase }
       : {}),
     onFatal: () => {
       void shutdown(1).catch(() => {

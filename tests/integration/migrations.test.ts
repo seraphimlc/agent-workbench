@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -8,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -22,6 +24,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   acquireRuntimeDatabase,
   configureDatabase,
+  initializeRuntimeDatabase,
   openRuntimeDatabase,
 } from '../../services/daemon/src/db/database.js';
 import {
@@ -44,6 +47,12 @@ const sourceMigrationPath = fileURLToPath(
     '../../services/daemon/src/db/migrations/001_runtime_foundation.sql',
     import.meta.url,
   ),
+);
+const committedWalProducerEntryPoint = fileURLToPath(
+  new URL('../fixtures/committed-wal-producer-daemon.ts', import.meta.url),
+);
+const testMigrationsDaemonEntryPoint = fileURLToPath(
+  new URL('../fixtures/test-migrations-daemon.ts', import.meta.url),
 );
 
 const createMigrationDirectory = (
@@ -137,6 +146,217 @@ describe('daemon SQLite migrations', () => {
     } finally {
       acquired?.close();
     }
+  });
+
+  it.each([
+    {
+      name: 'a preflight-to-native-open symlink replacement',
+      replaceAfterPreflight: true,
+      replaceAfterNativeOpen: false,
+      replacementKind: 'symlink' as const,
+      expectsNativeHandle: true,
+    },
+    {
+      name: 'a native-open-to-post-check symlink replacement',
+      replaceAfterPreflight: false,
+      replaceAfterNativeOpen: true,
+      replacementKind: 'symlink' as const,
+      expectsNativeHandle: true,
+    },
+    {
+      name: 'a preflight-to-native-open regular-file replacement',
+      replaceAfterPreflight: true,
+      replaceAfterNativeOpen: false,
+      replacementKind: 'regular' as const,
+      expectsNativeHandle: true,
+    },
+    {
+      name: 'a native-open-to-post-check regular-file replacement',
+      replaceAfterPreflight: false,
+      replaceAfterNativeOpen: true,
+      replacementKind: 'regular' as const,
+      expectsNativeHandle: true,
+    },
+    {
+      name: 'an unlink after preflight',
+      replaceAfterPreflight: true,
+      replaceAfterNativeOpen: false,
+      replacementKind: 'unlink' as const,
+      expectsNativeHandle: false,
+    },
+  ])(
+    'rejects $name, closes SQLite, and never initializes',
+    async ({
+      replaceAfterPreflight,
+      replaceAfterNativeOpen,
+      replacementKind,
+      expectsNativeHandle,
+    }) => {
+      runtime = createTempRuntime();
+      const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+      const externalTarget = join(runtime.rootDir, 'external-target.sqlite3');
+      const regularReplacement = join(
+        runtime.rootDir,
+        'regular-replacement.sqlite3',
+      );
+      writeFileSync(externalTarget, 'external-must-stay-unchanged', {
+        mode: 0o640,
+      });
+      chmodSync(externalTarget, 0o640);
+      const replacementDatabase = new Database(regularReplacement);
+      try {
+        replacementDatabase.exec(
+          'CREATE TABLE replacement_fact (value TEXT NOT NULL)',
+        );
+        replacementDatabase
+          .prepare('INSERT INTO replacement_fact (value) VALUES (?)')
+          .run('regular-replacement-unchanged');
+      } finally {
+        replacementDatabase.close();
+      }
+      chmodSync(regularReplacement, 0o600);
+      let capturedDatabase: import('better-sqlite3').Database | undefined;
+      let initializeCalled = false;
+      const replaceCurrentPath = (): void => {
+        rmSync(databasePath, { force: true });
+        if (replacementKind === 'symlink') {
+          symlinkSync(externalTarget, databasePath);
+        } else if (replacementKind === 'regular') {
+          renameSync(regularReplacement, databasePath);
+        }
+      };
+
+      const acquireAndInitialize = async (): Promise<void> => {
+        const database = acquireRuntimeDatabase(
+          { dataDir: runtime?.dataDir ?? '' },
+          {
+            afterPreflight: () => {
+              if (replaceAfterPreflight) {
+                replaceCurrentPath();
+              }
+            },
+            afterNativeOpen: ({ database: openedDatabase }) => {
+              capturedDatabase = openedDatabase;
+              if (replaceAfterNativeOpen) {
+                replaceCurrentPath();
+              }
+            },
+          },
+        );
+        try {
+          initializeCalled = true;
+          await initializeRuntimeDatabase(database, {
+            dataDir: runtime?.dataDir ?? '',
+          });
+        } finally {
+          database.close();
+        }
+      };
+
+      await expect(acquireAndInitialize()).rejects.toThrow();
+      expect(initializeCalled).toBe(false);
+      expect(capturedDatabase !== undefined).toBe(expectsNativeHandle);
+      if (capturedDatabase) {
+        expect(capturedDatabase.open).toBe(false);
+      }
+      expect(existsSync(databasePath)).toBe(replacementKind !== 'unlink');
+      if (replacementKind === 'symlink') {
+        expect(lstatSync(databasePath).isSymbolicLink()).toBe(true);
+      } else if (replacementKind === 'regular') {
+        expect(lstatSync(databasePath).isFile()).toBe(true);
+        expect(lstatSync(databasePath).mode & 0o777).toBe(0o600);
+        const replacementReader = new Database(databasePath, { readonly: true });
+        try {
+          expect(
+            replacementReader.prepare('SELECT * FROM replacement_fact').all(),
+          ).toEqual([{ value: 'regular-replacement-unchanged' }]);
+        } finally {
+          replacementReader.close();
+        }
+      }
+      expect(readFileSync(externalTarget, 'utf8')).toBe(
+        'external-must-stay-unchanged',
+      );
+      expect(lstatSync(externalTarget).mode & 0o777).toBe(0o640);
+      expect(existsSync(`${databasePath}-wal`)).toBe(false);
+      expect(existsSync(`${databasePath}-shm`)).toBe(false);
+      expect(existsSync(`${externalTarget}-wal`)).toBe(false);
+      expect(existsSync(`${externalTarget}-shm`)).toBe(false);
+      expect(existsSync(join(runtime.dataDir, 'backups'))).toBe(false);
+    },
+  );
+
+  it('preserves path validation when SQLite and descriptor cleanup both fail', () => {
+    runtime = createTempRuntime();
+    const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+    const externalTarget = join(runtime.rootDir, 'cleanup-target.sqlite3');
+    writeFileSync(externalTarget, 'cleanup-target-must-stay-unchanged', {
+      mode: 0o640,
+    });
+    const sqliteCloseFailure = new Error('injected SQLite close failure');
+    const descriptorCloseFailure = new Error(
+      'injected descriptor close failure',
+    );
+    let capturedDatabase: import('better-sqlite3').Database | undefined;
+    let descriptorCloseCalls = 0;
+    let failure: unknown;
+
+    try {
+      acquireRuntimeDatabase(
+        { dataDir: runtime.dataDir },
+        {
+          afterNativeOpen: ({ database }) => {
+            capturedDatabase = database;
+            const closeDatabase = database.close.bind(database);
+            Object.defineProperty(database, 'close', {
+              configurable: true,
+              value: () => {
+                closeDatabase();
+                throw sqliteCloseFailure;
+              },
+            });
+            rmSync(databasePath, { force: true });
+            symlinkSync(externalTarget, databasePath);
+          },
+          closeDescriptor: (descriptor) => {
+            descriptorCloseCalls += 1;
+            closeSync(descriptor);
+            throw descriptorCloseFailure;
+          },
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) {
+      throw new Error('Expected aggregated acquisition cleanup failure');
+    }
+    expect(failure.errors).toHaveLength(3);
+    expect(failure.errors).toContain(sqliteCloseFailure);
+    expect(failure.errors).toContain(descriptorCloseFailure);
+    expect(descriptorCloseCalls).toBe(1);
+    expect(capturedDatabase?.open).toBe(false);
+    expect(readFileSync(externalTarget, 'utf8')).toBe(
+      'cleanup-target-must-stay-unchanged',
+    );
+  });
+
+  it('does not create a missing data directory without the runtime lock boundary', () => {
+    runtime = createTempRuntime();
+    const missingDataDir = runtime.dataDir;
+    rmSync(missingDataDir, { recursive: true });
+    let acquired: import('better-sqlite3').Database | undefined;
+
+    try {
+      expect(() => {
+        acquired = acquireRuntimeDatabase({ dataDir: missingDataDir });
+      }).toThrow();
+    } finally {
+      acquired?.close();
+    }
+    expect(existsSync(missingDataDir)).toBe(false);
   });
 
   it('does not create a database artifact when the kernel lock is already held', async () => {
@@ -547,6 +767,45 @@ describe('daemon SQLite migrations', () => {
     }
   });
 
+  it('preserves initialization failure when closing the acquired database also fails', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {
+      '001_broken.sql': 'THIS IS NOT VALID SQL;',
+    });
+    const closeFailure = new Error('injected initialization close failure');
+    let capturedDatabase: import('better-sqlite3').Database | undefined;
+    let failure: unknown;
+
+    try {
+      await openRuntimeDatabase(
+        { dataDir: runtime.dataDir, migrationsDirectory },
+        {
+          afterNativeOpen: ({ database }) => {
+            capturedDatabase = database;
+            const closeDatabase = database.close.bind(database);
+            Object.defineProperty(database, 'close', {
+              configurable: true,
+              value: () => {
+                closeDatabase();
+                throw closeFailure;
+              },
+            });
+          },
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError)) {
+      throw new Error('Expected aggregated initialization cleanup failure');
+    }
+    expect(failure.errors).toHaveLength(2);
+    expect(failure.errors).toContain(closeFailure);
+    expect(capturedDatabase?.open).toBe(false);
+  });
+
   it('creates one awaited Online Backup with committed WAL data before the first pending migration', async () => {
     runtime = createTempRuntime();
     const migrationsDirectory = createMigrationDirectory(runtime, {
@@ -610,6 +869,90 @@ describe('daemon SQLite migrations', () => {
       ).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       database.close();
+    }
+  });
+
+  it('backs up committed WAL data recovered from a killed daemon before applying the next migration', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = join(runtime.dataDir, 'test-migrations');
+    mkdirSync(migrationsDirectory, { mode: 0o700 });
+    writeFileSync(
+      join(migrationsDirectory, '001_base.sql'),
+      `
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE wal_fact (value TEXT NOT NULL);
+      `,
+      { mode: 0o600 },
+    );
+
+    const producer = runtime.spawnDaemon({
+      entryPoint: committedWalProducerEntryPoint,
+    });
+    await producer.waitForReady();
+
+    const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
+    const mainOnlyPath = join(runtime.rootDir, 'main-file-only.sqlite3');
+    copyFileSync(databasePath, mainOnlyPath);
+    const mainOnly = new Database(mainOnlyPath, { readonly: true });
+    try {
+      expect(
+        mainOnly.prepare('SELECT version FROM schema_migrations').all(),
+      ).toEqual([{ version: 1 }]);
+      expect(mainOnly.prepare('SELECT * FROM wal_fact').all()).toEqual([]);
+    } finally {
+      mainOnly.close();
+    }
+
+    expect(await producer.stop('SIGKILL')).toEqual({
+      code: null,
+      signal: 'SIGKILL',
+    });
+    writeFileSync(
+      join(migrationsDirectory, '002_pending.sql'),
+      'CREATE TABLE pending_schema (value TEXT NOT NULL);',
+      { mode: 0o600 },
+    );
+
+    const migrator = runtime.spawnDaemon({
+      entryPoint: testMigrationsDaemonEntryPoint,
+    });
+    await migrator.waitForReady();
+    await migrator.stop();
+
+    const backupDirectory = join(runtime.dataDir, 'backups');
+    const backups = readdirSync(backupDirectory);
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toMatch(
+      /^runtime-before-v002-.+-[0-9a-f-]+\.sqlite3$/,
+    );
+    const backup = new Database(join(backupDirectory, backups[0] as string), {
+      readonly: true,
+    });
+    try {
+      expect(backup.prepare('SELECT * FROM wal_fact').all()).toEqual([
+        { value: 'committed-in-child-wal' },
+      ]);
+      expect(
+        backup.prepare('SELECT version FROM schema_migrations').all(),
+      ).toEqual([{ version: 1 }]);
+      expect(tableExists(backup, 'pending_schema')).toBe(false);
+    } finally {
+      backup.close();
+    }
+
+    const live = new Database(databasePath, { readonly: true });
+    try {
+      expect(live.prepare('SELECT * FROM wal_fact').all()).toEqual([
+        { value: 'committed-in-child-wal' },
+      ]);
+      expect(
+        live
+          .prepare('SELECT version FROM schema_migrations ORDER BY version')
+          .all(),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(tableExists(live, 'pending_schema')).toBe(true);
+    } finally {
+      live.close();
     }
   });
 
