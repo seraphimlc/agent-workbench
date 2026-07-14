@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
+import { findForbiddenTransactionStatement } from './migration-sql.js';
+
 const MIGRATION_FILE_PATTERN = /^(\d{3})_([A-Za-z0-9][A-Za-z0-9_-]*)\.sql$/;
 const DEFAULT_MIGRATIONS_DIRECTORY = fileURLToPath(
   new URL('./migrations', import.meta.url),
@@ -26,6 +28,11 @@ export interface MigrationOptions {
   readonly migrationsDirectory?: string;
   readonly now?: () => Date;
   readonly createId?: () => string;
+}
+
+interface PendingMigration {
+  readonly migration: InstalledMigration;
+  readonly sql: string;
 }
 
 const migrationError = (message: string, options?: ErrorOptions): Error =>
@@ -158,6 +165,25 @@ const assertAppliedPrefix = (
   }
 };
 
+const loadPendingMigrations = (
+  pendingMigrations: readonly InstalledMigration[],
+): PendingMigration[] =>
+  pendingMigrations.map((migration) => {
+    let sql: string;
+    try {
+      sql = readFileSync(migration.path, 'utf8');
+    } catch {
+      throw migrationError(`could not read ${migration.filename}`);
+    }
+    const forbiddenStatement = findForbiddenTransactionStatement(sql);
+    if (forbiddenStatement) {
+      throw migrationError(
+        `${migration.filename} contains forbidden top-level ${forbiddenStatement.keyword} statement`,
+      );
+    }
+    return { migration, sql };
+  });
+
 const timestampForFilename = (date: Date): string =>
   date.toISOString().replace(/[:.]/g, '-');
 
@@ -188,15 +214,29 @@ export const migrateDatabase = async (
   const appliedVersions = readAppliedVersions(database);
   assertAppliedPrefix(appliedVersions, installedMigrations);
   const pendingMigrations = installedMigrations.slice(appliedVersions.length);
+  const loadedPendingMigrations = loadPendingMigrations(pendingMigrations);
 
-  if (appliedVersions.length > 0 && pendingMigrations.length > 0) {
-    await createBackup(database, pendingMigrations[0]!.version, options);
+  if (appliedVersions.length > 0 && loadedPendingMigrations.length > 0) {
+    await createBackup(
+      database,
+      loadedPendingMigrations[0]!.migration.version,
+      options,
+    );
   }
 
-  for (const migration of pendingMigrations) {
-    const sql = readFileSync(migration.path, 'utf8');
+  for (const { migration, sql } of loadedPendingMigrations) {
     const apply = database.transaction(() => {
+      if (!database.inTransaction) {
+        throw migrationError(
+          `runner transaction was not active before ${migration.filename}`,
+        );
+      }
       database.exec(sql);
+      if (!database.inTransaction) {
+        throw migrationError(
+          `runner transaction ended while applying ${migration.filename}`,
+        );
+      }
       database
         .prepare(
           'INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)',

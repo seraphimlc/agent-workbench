@@ -703,6 +703,271 @@ describe('daemon SQLite migrations', () => {
     }
   });
 
+  it('rejects transaction control before a fresh migration can partially commit', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {
+      '001_transaction_escape.sql': `
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE escaped_fact (value TEXT NOT NULL);
+        INSERT INTO escaped_fact VALUES ('must-never-commit');
+        COMMIT;
+        INSERT INTO table_that_does_not_exist VALUES ('boom');
+      `,
+    });
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'transaction-escape-001.sqlite3'),
+    );
+    try {
+      let failure: unknown;
+      try {
+        await migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      const schemaExists = tableExists(database, 'schema_migrations');
+      const factExists = tableExists(database, 'escaped_fact');
+      expect({
+        failureMessage:
+          failure instanceof Error ? failure.message : String(failure),
+        schemaExists,
+        factExists,
+        facts: factExists
+          ? database.prepare('SELECT * FROM escaped_fact').all()
+          : [],
+        history: schemaExists
+          ? database.prepare('SELECT version FROM schema_migrations').all()
+          : [],
+      }).toEqual({
+        failureMessage: expect.stringMatching(
+          /^Invalid migration installation:/,
+        ),
+        schemaExists: false,
+        factExists: false,
+        facts: [],
+        history: [],
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each([
+    { keyword: 'BEGIN', statement: 'BEGIN;' },
+    { keyword: 'COMMIT', statement: 'COMMIT;' },
+    { keyword: 'END', statement: 'END TRANSACTION;' },
+    { keyword: 'ROLLBACK', statement: 'ROLLBACK;' },
+    { keyword: 'SAVEPOINT', statement: 'SAVEPOINT migration_owned;' },
+    { keyword: 'RELEASE', statement: 'RELEASE migration_owned;' },
+    { keyword: 'COMMIT after a vertical tab', statement: '\u000bCOMMIT;' },
+    { keyword: 'COMMIT after a BOM', statement: '\ufeffCOMMIT;' },
+  ])(
+    'rejects a top-level $keyword transaction-control statement before execution',
+    async ({ statement }) => {
+      runtime = createTempRuntime();
+      const migrationsDirectory = createMigrationDirectory(runtime, {
+        '001_forbidden_transaction.sql': `
+          CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+          ${statement}
+        `,
+      });
+      const database = openConfiguredDatabase(
+        join(runtime.dataDir, 'forbidden-transaction.sqlite3'),
+      );
+      try {
+        let failure: unknown;
+        try {
+          await migrateDatabase(database, {
+            dataDir: runtime.dataDir,
+            migrationsDirectory,
+          });
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toMatch(
+          /^Invalid migration installation:/,
+        );
+        expect(tableExists(database, 'schema_migrations')).toBe(false);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it.each([
+    { keyword: 'ROLLBACK', statement: 'ROLLBACK;' },
+    { keyword: 'END', statement: 'END TRANSACTION;' },
+  ])(
+    'validates all pending SQL before backup or an earlier migration when 003 starts with $keyword',
+    async ({ statement }) => {
+      runtime = createTempRuntime();
+      const migrationsDirectory = createMigrationDirectory(runtime, {
+        '001_base.sql': `
+          CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+          CREATE TABLE stable_fact (value TEXT NOT NULL);
+        `,
+      });
+      const database = openConfiguredDatabase(
+        join(runtime.dataDir, 'pending-transaction-control.sqlite3'),
+      );
+      try {
+        await migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        });
+        writeFileSync(
+          join(migrationsDirectory, '002_must_not_apply.sql'),
+          `
+            CREATE TABLE pending_fact (value TEXT NOT NULL);
+            INSERT INTO pending_fact VALUES ('must-not-apply');
+          `,
+          { mode: 0o600 },
+        );
+        writeFileSync(
+          join(migrationsDirectory, '003_forbidden.sql'),
+          `
+            -- sql-text-must-not-leak
+            CREATE TABLE pending_003_fact (value TEXT NOT NULL);
+            INSERT INTO pending_003_fact VALUES ('must-not-apply');
+            ${statement}
+          `,
+          { mode: 0o600 },
+        );
+
+        let failure: unknown;
+        try {
+          await migrateDatabase(database, {
+            dataDir: runtime.dataDir,
+            migrationsDirectory,
+          });
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(Error);
+        const failureMessage = (failure as Error).message;
+        const pendingExists = tableExists(database, 'pending_fact');
+        const pending003Exists = tableExists(database, 'pending_003_fact');
+        expect({
+          failureMessage,
+          leaksPath: failureMessage.includes(migrationsDirectory),
+          leaksSql: failureMessage.includes('sql-text-must-not-leak'),
+          history: database
+            .prepare('SELECT version FROM schema_migrations ORDER BY version')
+            .all(),
+          pendingExists,
+          pendingFacts: pendingExists
+            ? database.prepare('SELECT * FROM pending_fact').all()
+            : [],
+          pending003Exists,
+          pending003Facts: pending003Exists
+            ? database.prepare('SELECT * FROM pending_003_fact').all()
+            : [],
+          backupExists: existsSync(join(runtime.dataDir, 'backups')),
+        }).toEqual({
+          failureMessage: expect.stringMatching(
+            /^Invalid migration installation:/,
+          ),
+          leaksPath: false,
+          leaksSql: false,
+          history: [{ version: 1 }],
+          pendingExists: false,
+          pendingFacts: [],
+          pending003Exists: false,
+          pending003Facts: [],
+          backupExists: false,
+        });
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it('allows transaction keywords in quotes, comments, and trigger expressions', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {
+      '001_lexer_boundaries.sql': `
+        -- COMMIT; ROLLBACK; BEGIN; END; SAVEPOINT; RELEASE;
+        /* BEGIN TRANSACTION; COMMIT; */
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE source_fact (value TEXT NOT NULL);
+        CREATE TABLE audit_fact (value TEXT NOT NULL);
+        CREATE TABLE "COMMIT" ("ROLLBACK" TEXT);
+        CREATE TABLE \`END\` (\`BEGIN\` TEXT);
+        CREATE TABLE [SAVEPOINT] ([RELEASE] TEXT);
+        INSERT INTO "COMMIT" VALUES ('COMMIT; ROLLBACK; -- not SQL');
+        CREATE TRIGGER audit_source_fact
+        AFTER INSERT ON source_fact
+        BEGIN
+          INSERT OR ROLLBACK INTO audit_fact (value)
+          VALUES (
+            CASE
+              WHEN NEW.value = 'raise' THEN RAISE(ROLLBACK, 'blocked')
+              ELSE CASE
+                WHEN NEW.value = 'nested' THEN 'nested-case'
+                ELSE NEW.value
+              END
+            END
+          );
+        END;
+        INSERT INTO source_fact VALUES ('migrated');
+      `,
+    });
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'lexer-boundaries.sqlite3'),
+    );
+    try {
+      await migrateDatabase(database, {
+        dataDir: runtime.dataDir,
+        migrationsDirectory,
+      });
+      expect(
+        database.prepare('SELECT * FROM audit_fact').all(),
+      ).toEqual([{ value: 'migrated' }]);
+      expect(
+        database.prepare('SELECT version FROM schema_migrations').all(),
+      ).toEqual([{ version: 1 }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('detects a genuine top-level COMMIT after a valid trigger body', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {
+      '001_commit_after_trigger.sql': `
+        CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE source_fact (value TEXT NOT NULL);
+        CREATE TRIGGER inspect_source_fact
+        AFTER INSERT ON source_fact
+        BEGIN
+          SELECT CASE WHEN NEW.value = 'x' THEN 1 ELSE 0 END;
+        END;
+        COMMIT;
+      `,
+    });
+    const database = openConfiguredDatabase(
+      join(runtime.dataDir, 'commit-after-trigger.sqlite3'),
+    );
+    try {
+      await expect(
+        migrateDatabase(database, {
+          dataDir: runtime.dataDir,
+          migrationsDirectory,
+        }),
+      ).rejects.toThrow(/^Invalid migration installation:/);
+      expect(tableExists(database, 'schema_migrations')).toBe(false);
+      expect(tableExists(database, 'source_fact')).toBe(false);
+    } finally {
+      database.close();
+    }
+  });
+
   it('keeps 001 but rolls back every 002 effect when migration 002 fails', async () => {
     runtime = createTempRuntime();
     const migrationsDirectory = createMigrationDirectory(runtime, {
