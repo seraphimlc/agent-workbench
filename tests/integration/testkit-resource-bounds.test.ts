@@ -5,7 +5,10 @@ import { createConnection, createServer, type Socket } from 'node:net';
 
 import { describe, expect, it } from 'vitest';
 
-import { encodeFrame } from '../../packages/protocol/src/index.js';
+import {
+  encodeFrame,
+  MAX_FRAME_BYTES,
+} from '../../packages/protocol/src/index.js';
 import {
   createTempRuntime,
   DaemonProcess,
@@ -162,6 +165,51 @@ describe('testkit resource bounds', () => {
     }
   });
 
+  it(
+    'fails before retaining envelopes whose combined serialized bytes exceed the capture budget',
+    async () => {
+      let acceptedSocket: Socket | undefined;
+      const largePayload = 'z'.repeat(Math.floor(MAX_FRAME_BYTES * 0.7));
+      const server = createServer((socket) => {
+        acceptedSocket = socket;
+        const frames = Array.from({ length: 3 }, (_, index) =>
+          encodeFrame({
+            kind: 'response',
+            protocolVersion: 1,
+            requestId: randomUUID(),
+            traceId: randomUUID(),
+            ok: true,
+            result: { index, largePayload },
+          }),
+        );
+        socket.write(Buffer.concat(frames));
+      });
+      await new Promise<void>((resolvePromise) => {
+        server.listen(0, '127.0.0.1', resolvePromise);
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('Test RPC server did not publish a TCP address');
+      }
+      const socket = createConnection(address.port, '127.0.0.1');
+      const client = new RpcClient(socket);
+
+      try {
+        await once(socket, 'connect');
+        await client.waitForClose(5_000);
+
+        expect(client.receivedEnvelopes).toHaveLength(2);
+      } finally {
+        socket.destroy();
+        acceptedSocket?.destroy();
+        await new Promise<void>((resolvePromise) =>
+          server.close(() => resolvePromise()),
+        );
+      }
+    },
+    10_000,
+  );
+
   it('waits for a captured lock-helper identity after forced daemon termination', async () => {
     const runtime = createTempRuntime();
     const daemon = runtime.spawnDaemon();
@@ -185,6 +233,36 @@ describe('testkit resource bounds', () => {
         await waitForCondition(
           () => !processIdentityIsLive(helperIdentity),
           'stopped lock helper cleanup',
+        );
+      }
+      await runtime.cleanup();
+    }
+  });
+
+  it('reaps a cached lock helper when cleanup follows an external daemon SIGKILL', async () => {
+    const runtime = createTempRuntime();
+    const daemon = runtime.spawnDaemon();
+    await daemon.waitForReady();
+    const helperPids = findDirectChildPids(daemon.child.pid as number);
+    expect(helperPids).toHaveLength(1);
+    const helperIdentity = {
+      pid: helperPids[0] as number,
+      processStartIdentity: getProcessStartIdentity(helperPids[0] as number),
+    };
+    process.kill(helperIdentity.pid, 'SIGSTOP');
+
+    try {
+      process.kill(daemon.child.pid as number, 'SIGKILL');
+      await daemon.waitForExit();
+      await runtime.cleanup();
+
+      expect(processIdentityIsLive(helperIdentity)).toBe(false);
+    } finally {
+      if (processIdentityIsLive(helperIdentity)) {
+        process.kill(helperIdentity.pid, 'SIGKILL');
+        await waitForCondition(
+          () => !processIdentityIsLive(helperIdentity),
+          'externally orphaned lock helper cleanup',
         );
       }
       await runtime.cleanup();

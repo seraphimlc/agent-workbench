@@ -301,20 +301,39 @@ export class DaemonProcess {
           continue;
         }
 
+        let event: unknown;
         try {
-          const event: unknown = JSON.parse(line);
-          if (
-            typeof event === 'object' &&
-            event !== null &&
-            'event' in event &&
-            event.event === 'ready' &&
-            !ready
-          ) {
-            ready = true;
-            resolveReady();
-          }
+          event = JSON.parse(line);
         } catch {
           // Non-JSON output is retained for diagnostics but is not a ready signal.
+          continue;
+        }
+
+        if (
+          typeof event === 'object' &&
+          event !== null &&
+          'event' in event &&
+          event.event === 'ready' &&
+          !ready
+        ) {
+          try {
+            if (child.pid === undefined) {
+              throw new Error('Daemon child has no process id at readiness');
+            }
+            const descendants = captureDescendantIdentities(child.pid);
+            if (descendants.length === 0) {
+              throw new Error('Daemon ready event had no lock-helper identity');
+            }
+            this.mergeCapturedDescendantIdentities(descendants);
+            ready = true;
+            resolveReady();
+          } catch (error) {
+            rejectReady(
+              error instanceof Error
+                ? error
+                : new Error('Unable to cache daemon lock-helper identity'),
+            );
+          }
         }
       }
     });
@@ -376,8 +395,8 @@ export class DaemonProcess {
       if (this.child.pid === undefined) {
         throw new Error('Daemon child has no process id');
       }
-      this.capturedDescendantIdentities = captureDescendantIdentities(
-        this.child.pid,
+      this.mergeCapturedDescendantIdentities(
+        captureDescendantIdentities(this.child.pid),
       );
       this.child.kill(signal);
     }
@@ -427,6 +446,22 @@ export class DaemonProcess {
     if (unresolved.length > 0) {
       throw new Error('Daemon lock helper did not exit after forced cleanup');
     }
+  }
+
+  private mergeCapturedDescendantIdentities(
+    identities: readonly ProcessIdentity[],
+  ): void {
+    const merged = new Map<string, ProcessIdentity>();
+    for (const identity of [
+      ...this.capturedDescendantIdentities,
+      ...identities,
+    ]) {
+      merged.set(
+        `${identity.pid}\u0000${identity.processStartIdentity}`,
+        identity,
+      );
+    }
+    this.capturedDescendantIdentities = [...merged.values()];
   }
 
   private appendOutputTail(
