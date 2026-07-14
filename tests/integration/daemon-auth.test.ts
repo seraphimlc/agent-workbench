@@ -1,5 +1,7 @@
 import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createConnection, type Socket } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { join, relative, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
@@ -15,13 +17,15 @@ import {
 import {
   createAuthMac,
   connectRpcClient,
-  type RpcClient,
+  RpcClient,
 } from '../../packages/testkit/src/rpc-client.js';
 import type {
+  RpcRequest,
   RpcRequestEnvelope,
   RpcResponse,
 } from '@agent-workbench/protocol';
 import { computeAuthMac } from '../../services/daemon/src/rpc/authenticator.js';
+import { DaemonServer } from '../../services/daemon/src/server.js';
 
 const permissionBits = (path: string): number => lstatSync(path).mode & 0o777;
 const daemonEntryPoint = fileURLToPath(
@@ -56,6 +60,33 @@ const spawnDaemonWithRawOptions = (
   secretPipe.end(bootstrapSecret);
   return daemon;
 };
+const connectAllowHalfOpenRpcClient = async (
+  socketPath: string,
+): Promise<{ readonly client: RpcClient; readonly socket: Socket }> => {
+  const socket = createConnection({ path: socketPath, allowHalfOpen: true });
+  const rpcClient = new RpcClient(socket);
+  await once(socket, 'connect');
+  return { client: rpcClient, socket };
+};
+const waitForCondition = async (
+  condition: () => boolean,
+  description: string,
+  timeoutMs = 2_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${description}`);
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+};
+const serverConnectionCount = (server: DaemonServer): number =>
+  (
+    server as unknown as {
+      readonly connections: ReadonlySet<Socket>;
+    }
+  ).connections.size;
 const expectNoDaemonRuntimeState = (runtime: TempRuntime): void => {
   expect(readdirSync(runtime.dataDir)).toEqual([]);
   expect(existsSync(runtime.socketPath)).toBe(false);
@@ -86,10 +117,16 @@ const expectAuthFailure = (
 describe('daemon authentication', () => {
   let runtime: TempRuntime | undefined;
   let client: RpcClient | undefined;
+  let allowHalfOpenSocket: Socket | undefined;
+  let directServer: DaemonServer | undefined;
 
   afterEach(async () => {
+    allowHalfOpenSocket?.destroy();
+    allowHalfOpenSocket = undefined;
     await client?.close();
     client = undefined;
+    await directServer?.stop();
+    directServer = undefined;
     await runtime?.cleanup();
     runtime = undefined;
   });
@@ -186,6 +223,30 @@ describe('daemon authentication', () => {
 
     expectAuthFailure(response, request);
     await client.waitForClose();
+  });
+
+  it('full-closes an allow-half-open peer after flushing a canonical authentication failure', async () => {
+    runtime = createTempRuntime();
+    directServer = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: Buffer.alloc(32, 0x41),
+    });
+    await directServer.start();
+    const connection = await connectAllowHalfOpenRpcClient(runtime.socketPath);
+    client = connection.client;
+    allowHalfOpenSocket = connection.socket;
+    await client.waitForChallenge();
+
+    const request = client.createRequest('app.health', {});
+    const response = await client.sendRequest(request);
+
+    expectAuthFailure(response, request);
+    expect(allowHalfOpenSocket.writableEnded).toBe(false);
+    await waitForCondition(
+      () => serverConnectionCount(directServer as DaemonServer) === 0,
+      'server authentication-failure connection cleanup',
+    );
   });
 
   it('consumes the nonce on a wrong MAC and returns no retryable authentication detail', async () => {
@@ -502,5 +563,96 @@ describe('daemon authentication', () => {
       expect(response.error.traceId).toBe(response.traceId);
     }
     await client.waitForClose();
+  });
+
+  it('full-closes an allow-half-open peer after flushing the overflow response', async () => {
+    runtime = createTempRuntime();
+    const bootstrapSecret = Buffer.alloc(32, 0x42);
+    const pendingHealthHandlers: Array<() => void> = [];
+    directServer = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret,
+    });
+    const router = (
+      directServer as unknown as {
+        readonly router: {
+          handle(request: RpcRequest): Promise<unknown>;
+        };
+      }
+    ).router;
+    router.handle = async (request: RpcRequest): Promise<unknown> => {
+      if (request.method !== 'app.health') {
+        throw new Error('Unexpected routed method in overflow test');
+      }
+      await new Promise<void>((resolvePromise) => {
+        pendingHealthHandlers.push(resolvePromise);
+      });
+      return {
+        status: 'ready',
+        protocolVersion: 1,
+        pid: process.pid,
+      };
+    };
+    await directServer.start();
+    const connection = await connectAllowHalfOpenRpcClient(runtime.socketPath);
+    client = connection.client;
+    allowHalfOpenSocket = connection.socket;
+    await client.waitForChallenge();
+    await client.authenticate(bootstrapSecret);
+    const requests = Array.from({ length: 129 }, () =>
+      client?.createRequest('app.health', {}),
+    ).filter((request): request is RpcRequestEnvelope => request !== undefined);
+
+    const batchResponses = client.sendBatch(requests);
+    try {
+      await waitForCondition(
+        () =>
+          client?.receivedEnvelopes.some(
+            (envelope) =>
+              envelope.kind === 'response' &&
+              !envelope.ok &&
+              envelope.error.code === 'RPC_BACKPRESSURE',
+          ) === true,
+        'overflow response while accepted requests remain in flight',
+      );
+      await waitForCondition(
+        () => pendingHealthHandlers.length === 128,
+        'all accepted health handlers to be deferred',
+      );
+      let expectedSuccessfulResponses = client.receivedEnvelopes.filter(
+        (envelope) => envelope.kind === 'response' && envelope.ok,
+      ).length;
+      while (pendingHealthHandlers.length > 0) {
+        const releaseBatch = pendingHealthHandlers.splice(0, 4);
+        expectedSuccessfulResponses += releaseBatch.length;
+        for (const releaseHandler of releaseBatch) {
+          releaseHandler();
+        }
+        await waitForCondition(
+          () =>
+            client?.receivedEnvelopes.filter(
+              (envelope) => envelope.kind === 'response' && envelope.ok,
+            ).length === expectedSuccessfulResponses,
+          'released health responses to flush',
+        );
+      }
+    } finally {
+      for (const releaseHandler of pendingHealthHandlers.splice(0)) {
+        releaseHandler();
+      }
+    }
+    const responses = await batchResponses;
+
+    expect(
+      responses.filter(
+        (response) => !response.ok && response.error.code === 'RPC_BACKPRESSURE',
+      ),
+    ).toHaveLength(1);
+    expect(allowHalfOpenSocket.writableEnded).toBe(false);
+    await waitForCondition(
+      () => serverConnectionCount(directServer as DaemonServer) === 0,
+      'server overflow connection cleanup',
+    );
   });
 });

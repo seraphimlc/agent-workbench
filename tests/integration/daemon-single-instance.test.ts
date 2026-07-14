@@ -73,6 +73,33 @@ describe('daemon single-instance lifecycle', () => {
     runtime = undefined;
   });
 
+  it('constructs util-linux flock arguments with no-fork ownership semantics', async () => {
+    const runtimeLockModule = (await import(
+      '../../services/daemon/src/runtime/runtime-lock.js'
+    )) as unknown as {
+      readonly buildLinuxFlockArguments?: (
+        lockPath: string,
+        nodeExecutable: string,
+        nodeArguments: readonly string[],
+      ) => string[];
+    };
+
+    expect(
+      runtimeLockModule.buildLinuxFlockArguments?.(
+        '/tmp/runtime.lock',
+        '/usr/bin/node',
+        ['helper.js', '--lock-helper'],
+      ),
+    ).toEqual([
+      '-n',
+      '-F',
+      '/tmp/runtime.lock',
+      '/usr/bin/node',
+      'helper.js',
+      '--lock-helper',
+    ]);
+  });
+
   it('rejects a live second daemon before creating its different socket and preserves the first socket', async () => {
     runtime = createTempRuntime();
     const first = runtime.spawnDaemon();

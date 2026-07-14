@@ -458,6 +458,12 @@ const findExecutable = (candidates: readonly string[]): string | undefined => {
   return undefined;
 };
 
+export const buildLinuxFlockArguments = (
+  lockPath: string,
+  nodeExecutable: string,
+  nodeArguments: readonly string[],
+): string[] => ['-n', '-F', lockPath, nodeExecutable, ...nodeArguments];
+
 const spawnLockHelper = (
   lockPath: string,
   dataDir: string,
@@ -479,7 +485,7 @@ const spawnLockHelper = (
   if (flock) {
     return spawn(
       flock,
-      ['-n', lockPath, process.execPath, ...nodeArguments],
+      buildLinuxFlockArguments(lockPath, process.execPath, nodeArguments),
       { shell: false, stdio: ['pipe', 'pipe', 'pipe'] },
     );
   }

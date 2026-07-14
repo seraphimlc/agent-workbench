@@ -30,6 +30,7 @@ import {
 } from './runtime/runtime-lock.js';
 
 const MAX_IN_FLIGHT_REQUESTS = 128;
+const FULL_CLOSE_FALLBACK_MS = 500;
 
 export interface DaemonServerOptions {
   readonly socketPath: string;
@@ -167,6 +168,7 @@ export class DaemonServer {
   private readonly onFatal: (error: Error) => void;
   private readonly router = new Router();
   private readonly connections = new Set<Socket>();
+  private readonly closingSockets = new WeakSet<Socket>();
   private server: Server | undefined;
   private runtimeLock: RuntimeLock | undefined;
   private activeSocketPath: string | undefined;
@@ -697,7 +699,10 @@ export class DaemonServer {
 
   private failAuthentication(socket: Socket, request: RpcRequestEnvelope): void {
     if (!socket.destroyed && !socket.writableEnded) {
-      socket.end(encodeFrame(createAuthFailureResponse(request)));
+      this.closeAfterFlush(
+        socket,
+        encodeFrame(createAuthFailureResponse(request)),
+      );
     }
   }
 
@@ -712,7 +717,33 @@ export class DaemonServer {
       !socket.destroyed &&
       !socket.writableEnded
     ) {
-      socket.end();
+      this.closeAfterFlush(socket);
+    }
+  }
+
+  private closeAfterFlush(socket: Socket, finalBytes?: Uint8Array): void {
+    if (socket.destroyed || this.closingSockets.has(socket)) {
+      return;
+    }
+    this.closingSockets.add(socket);
+
+    const destroy = (): void => {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    };
+    const fallback = setTimeout(destroy, FULL_CLOSE_FALLBACK_MS);
+    fallback.unref();
+    socket.once('close', () => clearTimeout(fallback));
+
+    try {
+      if (finalBytes) {
+        socket.end(finalBytes, destroy);
+      } else {
+        socket.end(destroy);
+      }
+    } catch {
+      destroy();
     }
   }
 
