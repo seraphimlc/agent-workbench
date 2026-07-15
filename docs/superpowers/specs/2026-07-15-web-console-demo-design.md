@@ -96,12 +96,13 @@ Web Console Server
 根命令 `pnpm demo:web` 启动 Web Console。启动器：
 
 1. 校验 Provider 配置和 workspace。
-2. 解析模型。
+2. 解析并探测模型能力。
 3. 生成 32 字节 Daemon bootstrap secret。
-4. 通过 fd 3 把 secret 传给配置后的 Daemon 子进程。
-5. 连接并认证 Daemon RPC。
-6. 仅在 `127.0.0.1` 启动 HTTP 服务。
-7. 输出可打开的本机 URL。
+4. 启动 `apps/web-console/src/server/configured-daemon-entry.ts`；该专用子入口读取已校验的 Provider/workspace 配置，构造 `OpenAiCompatibleAdapter`、Session Runner 和 Tool handler，再调用 `runDaemon({ runner })`。
+5. 通过 fd 3 把 secret 传给配置后的 Daemon 子进程；Provider 配置通过受控子进程环境传入，bootstrap secret 仍禁止进入环境。
+6. 连接并认证 Daemon RPC。
+7. 仅在 `127.0.0.1` 启动 HTTP 服务。
+8. 输出可打开的本机 URL。
 
 Web Console 收到 `SIGINT` / `SIGTERM` 时先停止 HTTP ingress，再关闭 RPC，最后等待 Daemon、Runner 和子进程退出，避免现场演示留下孤儿进程。
 
@@ -118,11 +119,12 @@ Key 只存在于 Web Console 和 Daemon 的进程内存/环境中，不写入仓
 
 模型解析规则：
 
-1. 若设置 `AGENT_WORKBENCH_PROVIDER_MODEL`，使用该值。
-2. 否则请求 Provider `/models`。
-3. 过滤明显的 embedding、rerank、image、audio 模型。
-4. 对候选模型执行最小 chat/tool capability probe，选择第一个通过者。
-5. 无兼容模型时启动失败并显示可操作错误，不静默回退到假模型。
+1. 若设置 `AGENT_WORKBENCH_PROVIDER_MODEL`，把该模型作为唯一候选，但仍必须通过能力探测。
+2. 否则请求 Provider `/models`，过滤明显的 embedding、rerank、image、audio 模型，并最多探测前三个候选。
+3. 每个候选先执行普通 chat probe，再使用与生产一致的 `fs.read_text` Tool Schema 执行 tool-call probe。
+4. 单次请求和整个探测流程都有明确超时；失败后尝试下一个候选。
+5. 选择第一个同时通过 chat 和 tool-call probe 的模型。
+6. 无兼容模型时启动失败并显示可操作错误，不静默回退到假模型。
 
 Provider chat endpoint 由 base URL 拼接 `/chat/completions`。UI 只显示 base host、选中模型和健康状态，不显示 Key。
 
@@ -141,22 +143,23 @@ Provider chat endpoint 由 base URL 拼接 `/chat/completions`。UI 只显示 ba
 
 - 只接受 workspace 相对路径。
 - 拒绝绝对路径、空路径和 `..` 越界。
-- 对真实路径做 canonical 检查，拒绝通过符号链接逃离 workspace。
-- 只读取普通文件和 UTF-8 文本。
-- 默认限制单次读取 256 KiB。
+- 启动时拒绝 workspace 与 Daemon data/runtime/control-plane 目录重叠。
+- 打开文件时使用 no-follow 标志；打开后用 `fstat` 验证普通文件，并复核 canonical 路径与设备/inode 身份仍属于 workspace，拒绝通过符号链接或检查/使用竞态逃离 workspace。
+- 最多读取 `256 KiB + 1` 字节；超过 256 KiB 立即失败，不先把完整文件载入内存。
+- 使用严格 UTF-8 解码，拒绝替换字符式容错。
 - 错误以稳定错误码返回，不泄露 workspace 外路径。
 
 ## 9. HTTP Bridge
 
-HTTP API 只监听 loopback，并设置 `Cache-Control: no-store`。第一版接口：
+HTTP API 只监听 loopback，并设置 `Cache-Control: no-store`。Server 只接受启动时确定的 `127.0.0.1:<port>` / `localhost:<port>` Host；拒绝其他 Host、所有 CORS 请求和跨源 Origin。写请求必须使用 `application/json`、携带精确同源 `Origin`，并提交每次启动随机生成的 CSRF token。token 只通过同源 HTML bootstrap 数据交给页面，不写入 URL、日志或持久化存储。页面同时使用限制脚本来源的 CSP。第一版接口：
 
 - `GET /api/runtime`：Daemon、Provider、模型和 workspace 的脱敏状态。
-- `POST /api/sessions`：注册 workspace 并调用 `session.create`。
-- `POST /api/sessions/:sessionId/turns`：调用 `turn.enqueue`。
+- `POST /api/sessions`：注册 workspace 并调用 `session.create`；请求包含浏览器为本次逻辑提交生成的 UUID `submissionId`。
+- `POST /api/sessions/:sessionId/turns`：调用 `turn.enqueue`；请求包含浏览器为本次逻辑提交生成的 UUID `submissionId`。
 - `GET /api/sessions/:sessionId/snapshot`：调用 `session.getSnapshot`。
 - `GET /api/sessions/:sessionId/events?afterSeq=<n>&limit=<n>`：调用 `event.listAfter`。
 
-所有请求和响应使用 Zod 校验。Bridge 生成 `clientRequestId`，浏览器不能控制 Daemon RPC envelope、trace、认证状态或 socket 路径。
+所有请求和响应使用 Zod 校验。Bridge 只接受规范 UUID `submissionId`，并稳定映射为方法域隔离的 `clientRequestId`；同一逻辑提交的 HTTP 重试必须复用同一 `submissionId`，从而命中 Daemon 幂等语义。浏览器不能控制其余 Daemon RPC envelope、trace、认证状态或 socket 路径。
 
 Browser 将当前 Session ID 保存在 `localStorage`。页面刷新后先请求 Snapshot；Session 不存在或数据目录已重置时回到新建任务页。
 
@@ -173,13 +176,15 @@ Browser 将当前 Session ID 保存在 `localStorage`。页面刷新后先请求
 
 ## 11. Tool 可观察性
 
-当前 ToolRun 已持久化，但 Renderer Event 中没有正常执行的 Tool 事件。为了真实展示既有能力，Tool Gateway 在同一权威状态变化附近追加：
+当前 ToolRun 已持久化，但 Renderer Event 中没有正常执行的 Tool 事件。为了真实展示既有能力，Tool Gateway 将 ToolRun 状态变化与对应 Event 放在同一个 SQLite 事务中提交：
 
 - `tool.started`：`toolRunId`、`toolId`、脱敏输入摘要。
 - `tool.succeeded`：`toolRunId`、输出字节数、截断后的输出摘要。
 - `tool.failed`：`toolRunId`、稳定错误码。
 
-事件 payload 不保存 Provider Key、Daemon secret 或 workspace 外路径。输出摘要有严格长度上限；完整 Tool 结果继续以数据库执行记录为权威，不复制到浏览器事件中。
+`tool.started` 与 ToolRun `running` 插入原子提交；`tool.succeeded` / `tool.failed` 与对应终态更新原子提交。崩溃后不得出现没有 ToolRun 的幽灵事件，也不得出现已经提交终态但缺少对应 Renderer Event 的状态。
+
+Provider Key、Daemon secret 和其他启动时登记的 secret 在 Tool 结果持久化、Event 构造和 HTTP 响应之前做精确值脱敏。事件 payload 不保存 workspace 外路径。输出摘要有严格长度上限；脱敏后的完整 Tool 结果继续以数据库执行记录为权威，不复制到浏览器事件中。
 
 ## 12. 错误处理
 
@@ -197,7 +202,7 @@ Browser 将当前 Session ID 保存在 `localStorage`。页面刷新后先请求
 浏览器错误：
 
 - HTTP 非 2xx、Schema 不匹配和事件缺口进入明确错误态。
-- 用户输入在请求期间锁定对应按钮，防止重复提交；Daemon 幂等键仍是最终防线。
+- 用户输入在请求期间锁定对应按钮，防止重复提交；网络层重试复用原 `submissionId`，Daemon 幂等键是最终防线。
 
 ## 13. 技术选择
 
@@ -212,15 +217,19 @@ Browser 将当前 Session ID 保存在 `localStorage`。页面刷新后先请求
 单元测试：
 
 - Provider URL、模型选择和配置脱敏。
-- workspace canonical 路径边界和读取大小限制。
+- workspace/control-plane 重叠拒绝、no-follow/canonical/文件身份边界、严格 UTF-8 和读取大小限制。
 - HTTP 请求/响应 Schema。
+- Host、Origin、Content-Type、CORS 和 CSRF 拒绝矩阵。
+- `submissionId` 到 `clientRequestId` 的稳定幂等映射。
 - Event 到 Timeline view model 的确定性映射。
 
 集成测试：
 
 - Fake OpenAI Server → configured Daemon → Runner → model → `fs.read_text` → final reply。
 - Tool started/succeeded/failed 事件顺序和重连 Snapshot。
+- ToolRun 状态与 Tool Event 的事务原子性和崩溃恢复。
 - HTTP Bridge 不返回 Key、bootstrap secret 或未脱敏路径。
+- Tool 读取内容中包含已登记 secret 时，数据库、Event、模型上下文和 HTTP 均只出现脱敏值。
 - SIGINT 关闭后 Daemon 和 Runner 全部退出。
 
 浏览器测试：
