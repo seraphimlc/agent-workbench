@@ -7,6 +7,11 @@ import {
   TurnTerminalizationInvariantError,
   expectTerminalizationChange,
 } from '../db/execution-repository.js';
+import {
+  ToolRunStatusMatrixError,
+  type ToolRunStatusTuple,
+  validateToolRunStatusTuple,
+} from './tool-run-status-validator.js';
 
 type ActiveAttemptRow = {
   readonly id: string;
@@ -19,13 +24,13 @@ type ActiveModelCallRow = {
   readonly ordinal: number;
 };
 
-type ActiveToolRunRow = {
+type ToolRunRow = ToolRunStatusTuple & {
   readonly id: string;
   readonly ordinal: number;
+};
+
+type ActiveToolRunRow = ToolRunRow & {
   readonly status: 'queued' | 'running' | 'cancel_requested';
-  readonly executionMode: 'read_inline' | 'worker' | 'transactional_intrinsic';
-  readonly dispatchState: 'prepared' | 'worker_ready' | 'go_sent' | 'acknowledged' | null;
-  readonly effectState: 'not_applied' | 'applied' | 'unknown';
 };
 
 type ToolTerminalDecision = ActiveToolRunRow & {
@@ -74,10 +79,10 @@ export class ExecutionRecovery {
     readonly now: string;
   }): SessionEventDraft[] {
     this.assertCallerTransaction();
-    this.assertFailSafeEffects(input.sessionId, input.turnId);
-    const tools = this.readActiveToolRuns(input.sessionId, input.turnId).map(
+    const tools = this.readValidatedToolRuns(input.sessionId, input.turnId).map(
       (tool) => this.decideFailedTool(tool),
     );
+    this.assertFailSafeEffects(input.sessionId, input.turnId);
     return this.closeSubexecutions({
       ...input,
       outcome: 'failed',
@@ -95,7 +100,7 @@ export class ExecutionRecovery {
     readonly resolutions?: readonly EffectResolutionInput[];
   }): SessionEventDraft[] {
     this.assertCallerTransaction();
-    const tools = this.readActiveToolRuns(input.sessionId, input.turnId).map(
+    const tools = this.readValidatedToolRuns(input.sessionId, input.turnId).map(
       (tool) => this.decideInterruptedTool(tool),
     );
     const resolutions = input.resolutions ?? [];
@@ -118,6 +123,11 @@ export class ExecutionRecovery {
       payload: { reason: input.reason },
       tools,
     });
+  }
+
+  assertToolRunsValid(sessionId: string, turnId: string): void {
+    this.assertCallerTransaction();
+    this.readValidatedToolRuns(sessionId, turnId);
   }
 
   private assertCallerTransaction(): void {
@@ -285,11 +295,11 @@ export class ExecutionRecovery {
     }
   }
 
-  private readActiveToolRuns(
+  private readValidatedToolRuns(
     sessionId: string,
     turnId: string,
   ): ActiveToolRunRow[] {
-    return this.database
+    const tools = this.database
       .prepare(
         `SELECT id, ordinal, status,
                 execution_mode AS executionMode,
@@ -297,13 +307,28 @@ export class ExecutionRecovery {
                 effect_state AS effectState
          FROM tool_runs
          WHERE session_id = ? AND turn_id = ?
-           AND status IN ('queued', 'running', 'cancel_requested')
          ORDER BY ordinal, id`,
       )
-      .all(sessionId, turnId) as ActiveToolRunRow[];
+      .all(sessionId, turnId) as ToolRunRow[];
+    const active: ActiveToolRunRow[] = [];
+    for (const tool of tools) {
+      try {
+        const validation = validateToolRunStatusTuple(tool);
+        if (validation.kind === 'active') {
+          active.push(tool as ActiveToolRunRow);
+        }
+      } catch (error) {
+        if (error instanceof ToolRunStatusMatrixError) {
+          throw new TurnTerminalizationInvariantError(error.message);
+        }
+        throw error;
+      }
+    }
+    return active;
   }
 
   private decideFailedTool(tool: ActiveToolRunRow): ToolTerminalDecision {
+    this.validateActiveTool(tool);
     const deterministicallyNotApplied =
       tool.executionMode === 'read_inline' ||
       tool.executionMode === 'transactional_intrinsic' ||
@@ -321,66 +346,28 @@ export class ExecutionRecovery {
   }
 
   private decideInterruptedTool(tool: ActiveToolRunRow): ToolTerminalDecision {
-    if (tool.executionMode === 'worker') {
-      if (tool.dispatchState === 'prepared' || tool.dispatchState === 'worker_ready') {
-        if (tool.effectState === 'applied') {
-          throw new TurnTerminalizationInvariantError(
-            'pre-GO worker ToolRun cannot have an applied effect',
-          );
-        }
-        return {
-          ...tool,
-          outcome: 'canceled',
-          terminalEffectState: 'not_applied',
-          eventSuffix: 'canceled',
-        };
-      }
-      if (tool.dispatchState === 'go_sent' || tool.dispatchState === 'acknowledged') {
-        if (tool.effectState === 'not_applied') {
-          throw new TurnTerminalizationInvariantError(
-            'dispatched worker ToolRun cannot claim a not-applied effect',
-          );
-        }
-        return {
-          ...tool,
-          outcome: 'interrupted',
-          terminalEffectState: tool.effectState,
-          eventSuffix: 'interrupted',
-        };
-      }
-      throw new TurnTerminalizationInvariantError(
-        'worker ToolRun dispatch state is invalid',
-      );
-    }
-
-    if (tool.dispatchState !== null) {
-      throw new TurnTerminalizationInvariantError(
-        'inline ToolRun cannot have a dispatch state',
-      );
-    }
-    if (
-      tool.executionMode === 'read_inline' &&
-      tool.effectState !== 'not_applied'
-    ) {
-      throw new TurnTerminalizationInvariantError(
-        'read-inline ToolRun effect state is invalid',
-      );
-    }
-    if (
-      tool.executionMode === 'transactional_intrinsic' &&
-      tool.effectState === 'applied'
-    ) {
-      throw new TurnTerminalizationInvariantError(
-        'active transactional ToolRun cannot have an applied effect',
-      );
-    }
-    const canceled = tool.status === 'queued';
+    const decision = this.validateActiveTool(tool);
     return {
       ...tool,
-      outcome: canceled ? 'canceled' : 'interrupted',
-      terminalEffectState: 'not_applied',
-      eventSuffix: canceled ? 'canceled' : 'interrupted',
+      outcome: decision.outcome,
+      terminalEffectState: decision.terminalEffectState,
+      eventSuffix: decision.eventSuffix,
     };
+  }
+
+  private validateActiveTool(tool: ActiveToolRunRow) {
+    try {
+      const decision = validateToolRunStatusTuple(tool);
+      if (decision.kind !== 'active') {
+        throw new ToolRunStatusMatrixError(tool);
+      }
+      return decision;
+    } catch (error) {
+      if (error instanceof ToolRunStatusMatrixError) {
+        throw new TurnTerminalizationInvariantError(error.message);
+      }
+      throw error;
+    }
   }
 
   private closeSubexecutions(input: {

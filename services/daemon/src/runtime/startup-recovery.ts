@@ -6,6 +6,11 @@ import {
 } from '../db/execution-repository.js';
 import type { Claim } from './scheduler.js';
 import { TurnTerminalizer } from './turn-terminalizer.js';
+import {
+  ToolRunStatusMatrixError,
+  type ToolRunStatusTuple,
+  validateToolRunStatusTuple,
+} from './tool-run-status-validator.js';
 
 const SLOT_NO = 1 as const;
 
@@ -81,6 +86,10 @@ type RecoveryEventRow = {
   readonly toolRunId: string | null;
   readonly blobId: string | null;
   readonly createdAt: string;
+};
+
+type PersistedToolRunStatusRow = ToolRunStatusTuple & {
+  readonly finishedAt: string | null;
 };
 
 export interface StartupRecoveryHooks {
@@ -195,40 +204,6 @@ const assertRecoveredSubexecutionsAreComplete = (
                tool_runs.status IN ('queued', 'running', 'cancel_requested')
                OR tool_runs.finished_at IS NULL
                OR tool_runs.finished_at > ?
-               OR (
-                 tool_runs.status = 'canceled'
-                 AND (
-                   tool_runs.effect_state <> 'not_applied'
-                   OR (
-                     tool_runs.execution_mode = 'worker'
-                     AND tool_runs.dispatch_state NOT IN ('prepared', 'worker_ready')
-                   )
-                 )
-               )
-               OR (
-                 tool_runs.status = 'interrupted'
-                 AND tool_runs.execution_mode = 'worker'
-                 AND (
-                   tool_runs.dispatch_state NOT IN ('go_sent', 'acknowledged')
-                   OR tool_runs.effect_state NOT IN ('unknown', 'applied')
-                 )
-               )
-               OR (
-                 tool_runs.status = 'succeeded'
-                 AND (
-                   (
-                     tool_runs.execution_mode = 'worker'
-                     AND (
-                       tool_runs.dispatch_state <> 'acknowledged'
-                       OR tool_runs.effect_state <> 'applied'
-                     )
-                   )
-                   OR (
-                     tool_runs.execution_mode IN ('read_inline', 'transactional_intrinsic')
-                     AND tool_runs.effect_state <> 'not_applied'
-                   )
-                 )
-               )
              )
          ) AS toolRuns`,
     )
@@ -251,6 +226,57 @@ const assertRecoveredSubexecutionsAreComplete = (
     throw new StartupRecoveryInvariantError(
       'already-recovered subexecution projection is incomplete',
     );
+  }
+
+  const tools = database
+    .prepare(
+      `SELECT status, execution_mode AS executionMode,
+              dispatch_state AS dispatchState, effect_state AS effectState,
+              finished_at AS finishedAt
+       FROM tool_runs
+       WHERE session_id = ? AND turn_id = ?
+       ORDER BY ordinal, id`,
+    )
+    .all(input.sessionId, input.turnId) as PersistedToolRunStatusRow[];
+  try {
+    for (const tool of tools) {
+      validateToolRunStatusTuple(tool);
+    }
+  } catch (error) {
+    if (error instanceof ToolRunStatusMatrixError) {
+      throw new StartupRecoveryInvariantError(
+        'already-recovered ToolRun status tuple is inconsistent',
+      );
+    }
+    throw error;
+  }
+};
+
+const assertToolRunsAreRecoverable = (
+  database: Database.Database,
+  sessionId: string,
+  turnId: string,
+): void => {
+  const tools = database
+    .prepare(
+      `SELECT status, execution_mode AS executionMode,
+              dispatch_state AS dispatchState, effect_state AS effectState
+       FROM tool_runs
+       WHERE session_id = ? AND turn_id = ?
+       ORDER BY ordinal, id`,
+    )
+    .all(sessionId, turnId) as ToolRunStatusTuple[];
+  try {
+    for (const tool of tools) {
+      validateToolRunStatusTuple(tool);
+    }
+  } catch (error) {
+    if (error instanceof ToolRunStatusMatrixError) {
+      throw new StartupRecoveryInvariantError(
+        'ToolRun status tuple is inconsistent',
+      );
+    }
+    throw error;
   }
 };
 
@@ -512,6 +538,7 @@ const inspectStartupState = (
       'persistent ownership tuple is inconsistent',
     );
   }
+  assertToolRunsAreRecoverable(database, turn.sessionId, turn.turnId);
   return {
     slotNo: SLOT_NO,
     sessionId: turn.sessionId,
