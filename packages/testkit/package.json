@@ -13,6 +13,11 @@
       "types": "./src/rpc-client.ts",
       "development": "./src/rpc-client.ts",
       "default": "./dist/rpc-client.js"
+    },
+    "./fake-openai-server": {
+      "types": "./src/fake-openai-server.ts",
+      "development": "./src/fake-openai-server.ts",
+      "default": "./dist/fake-openai-server.js"
     }
   },
   "scripts": {

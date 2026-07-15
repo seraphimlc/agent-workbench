@@ -11,6 +11,11 @@ export interface ExecutionDriver {
    * completions before this promise resolves.
    */
   shutdown(): Promise<void>;
+  inspectPersistedExecutor?(identity: {
+    readonly pid: number;
+    readonly processStartIdentity: string;
+  }): 'live' | 'exited' | 'ambiguous';
+  onDaemonPhase?(phase: 'coordinator.quiesced' | 'runtime_lock.released'): void;
 }
 
 export interface CoordinatorScheduler {
@@ -153,7 +158,8 @@ export class ExecutionCoordinator {
     void execution.completion.then(
       () => {
         this.activeRunner = false;
-        if (this.running && this.dirty) {
+        if (this.running) {
+          this.dirty = true;
           this.scheduleDrain();
         }
         this.settleJoinWaiters();
@@ -161,7 +167,8 @@ export class ExecutionCoordinator {
       (error: unknown) => {
         this.activeRunner = false;
         this.reportError(error);
-        if (this.running && this.dirty) {
+        if (this.running) {
+          this.dirty = true;
           this.scheduleDrain();
         }
         this.settleJoinWaiters();
