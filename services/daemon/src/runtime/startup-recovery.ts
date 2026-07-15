@@ -47,6 +47,19 @@ type ActiveLeaseRow = {
   readonly leaseEpoch: number;
   readonly sessionId: string;
   readonly turnId: string;
+  readonly runnerInstanceId: string | null;
+  readonly pid: number | null;
+  readonly processStartIdentity: string | null;
+};
+
+type PersistedExecutorIdentity = {
+  readonly pid: number;
+  readonly processStartIdentity: string;
+};
+
+type StartupInspection = {
+  readonly binding: Claim;
+  readonly executorIdentity: PersistedExecutorIdentity | null;
 };
 
 type RecoveryMarkerSessionRow = {
@@ -104,6 +117,9 @@ export interface StartupRecoveryOptions {
   readonly now?: () => Date;
   readonly createId?: () => string;
   readonly hooks?: StartupRecoveryHooks;
+  readonly inspectExecutor?: (
+    identity: PersistedExecutorIdentity,
+  ) => 'live' | 'exited' | 'ambiguous';
 }
 
 export type StartupRecovery = (
@@ -115,6 +131,15 @@ export class StartupRecoveryInvariantError extends Error {
   constructor(message: string) {
     super(`Startup recovery invariant violation: ${message}`);
     this.name = 'StartupRecoveryInvariantError';
+  }
+}
+
+export class StartupRecoveryExecutorError extends Error {
+  readonly code = 'ORPHAN_EXECUTOR_SUSPECTED';
+
+  constructor() {
+    super('Persisted Runner executor may still be active');
+    this.name = 'StartupRecoveryExecutorError';
   }
 }
 
@@ -439,7 +464,7 @@ const assertRecoveredStatesAreComplete = (
 const inspectStartupState = (
   database: Database.Database,
   daemonEpoch: string,
-): Claim | null => {
+): StartupInspection | null => {
   assertRecoveredStatesAreComplete(database, daemonEpoch);
 
   const slots = database
@@ -480,7 +505,9 @@ const inspectStartupState = (
     .prepare(
       `SELECT id AS leaseId, daemon_epoch AS daemonEpoch,
               lease_epoch AS leaseEpoch, session_id AS sessionId,
-              current_turn_id AS turnId
+              current_turn_id AS turnId,
+              runner_instance_id AS runnerInstanceId, pid,
+              process_start_identity AS processStartIdentity
        FROM runner_leases
        WHERE status = 'active'
        ORDER BY id`,
@@ -539,14 +566,27 @@ const inspectStartupState = (
     );
   }
   assertToolRunsAreRecoverable(database, turn.sessionId, turn.turnId);
+  const identityValues = [lease.runnerInstanceId, lease.pid, lease.processStartIdentity];
+  const hasIdentity = identityValues.every((value) => value !== null);
+  if (!hasIdentity && identityValues.some((value) => value !== null)) {
+    throw new StartupRecoveryExecutorError();
+  }
   return {
-    slotNo: SLOT_NO,
-    sessionId: turn.sessionId,
-    turnId: turn.turnId,
-    leaseId: lease.leaseId,
-    daemonEpoch: lease.daemonEpoch,
-    leaseEpoch: lease.leaseEpoch,
-    executionFence: turn.executionFence,
+    binding: {
+      slotNo: SLOT_NO,
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      leaseId: lease.leaseId,
+      daemonEpoch: lease.daemonEpoch,
+      leaseEpoch: lease.leaseEpoch,
+      executionFence: turn.executionFence,
+    },
+    executorIdentity: hasIdentity
+      ? {
+          pid: lease.pid as number,
+          processStartIdentity: lease.processStartIdentity as string,
+        }
+      : null,
   };
 };
 
@@ -554,9 +594,14 @@ export const recoverStartupState: StartupRecovery = (database, options) => {
   const inspect = database.transaction(() =>
     inspectStartupState(database, options.daemonEpoch),
   );
-  const binding = inspect.immediate();
-  if (!binding) {
+  const inspection = inspect.immediate();
+  if (!inspection) {
     return;
+  }
+  const { binding } = inspection;
+  if (inspection.executorIdentity) {
+    const state = options.inspectExecutor?.(inspection.executorIdentity) ?? 'ambiguous';
+    if (state !== 'exited') throw new StartupRecoveryExecutorError();
   }
 
   const terminalizer = new TurnTerminalizer(database, {

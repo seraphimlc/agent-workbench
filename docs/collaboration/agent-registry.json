@@ -45,7 +45,7 @@
       "default_lifecycle": "warm_persistent_startup_engineering_workline",
       "output_contracts": ["RESULT", "REQUEST", "BLOCKED"],
       "capability_skills": ["software-technical-design", "software-engineering-execution"],
-      "required_init_files": ["AGENTS.md", "docs/collaboration.md", "docs/collaboration/roles/tingyun.md"],
+      "required_init_files": ["AGENTS.md", "docs/collaboration/roles/tingyun.md"],
       "primary_responsibility": "Technical lead and architect-implementer: technical design, implementation, engineering self-check"
     },
     {
@@ -65,7 +65,7 @@
       "default_lifecycle": "warm_persistent_startup_qa_gate",
       "output_contracts": ["RESULT", "REQUEST", "BLOCKED"],
       "capability_skills": ["software-quality-assurance"],
-      "required_init_files": ["AGENTS.md", "docs/collaboration.md", "docs/collaboration/roles/guanzhi.md"],
+      "required_init_files": ["AGENTS.md", "docs/collaboration/roles/guanzhi.md"],
       "primary_responsibility": "Test design and independent QA: execution evidence, false-pass audit, acceptance risk"
     },
     {
@@ -85,7 +85,7 @@
       "default_lifecycle": "warm_persistent_startup_review_gate",
       "output_contracts": ["RESULT", "REQUEST", "BLOCKED"],
       "capability_skills": ["software-engineering-review"],
-      "required_init_files": ["AGENTS.md", "docs/collaboration.md", "docs/collaboration/roles/jinghua.md"],
+      "required_init_files": ["AGENTS.md", "docs/collaboration/roles/jinghua.md"],
       "primary_responsibility": "Independent technical, architecture, design, and code review"
     },
     {
@@ -105,7 +105,7 @@
       "default_lifecycle": "warm_persistent_startup_ux_workline",
       "output_contracts": ["RESULT", "REQUEST", "BLOCKED"],
       "capability_skills": ["software-ux-design"],
-      "required_init_files": ["AGENTS.md", "docs/collaboration.md", "docs/collaboration/roles/qingqiu.md"],
+      "required_init_files": ["AGENTS.md", "docs/collaboration/roles/qingqiu.md"],
       "primary_responsibility": "UX flow, information architecture, interaction design, and UX review"
     }
   ]

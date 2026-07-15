@@ -158,7 +158,10 @@ describe('daemon authentication', () => {
   it('spawns native Node with development exports and transports the bootstrap secret only on fd 3', async () => {
     runtime = createTempRuntime();
     const bootstrapSecret = Buffer.alloc(32, 0x73);
-    const daemon = runtime.spawnDaemon({ bootstrapSecret });
+    const daemon = runtime.spawnDaemon({
+      bootstrapSecret,
+      entryPoint: daemonEntryPoint,
+    });
     const secretText = bootstrapSecret.toString('utf8');
 
     expect(daemon.launchArguments).toEqual(

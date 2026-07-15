@@ -51,6 +51,9 @@ const RECOVERY_TIME = '2026-07-14T09:05:00.000Z';
 const crashBeforeRecoveryCommitEntryPoint = fileURLToPath(
   new URL('../fixtures/crash-before-recovery-commit-daemon.ts', import.meta.url),
 );
+const manualSchedulerDaemonEntryPoint = fileURLToPath(
+  new URL('../fixtures/manual-scheduler-daemon.ts', import.meta.url),
+);
 
 type RuntimeDatabase = import('better-sqlite3').Database;
 
@@ -466,7 +469,7 @@ const createClaimedDaemonFixture = async (
 ): Promise<ClaimedDaemonFixture> => {
   const workspacePath = join(runtime.rootDir, 'rpc-workspace');
   mkdirSync(workspacePath);
-  const daemon = runtime.spawnDaemon();
+  const daemon = runtime.spawnDaemon({ entryPoint: manualSchedulerDaemonEntryPoint });
   await daemon.waitForReady();
   const client = await authenticatedClient(runtime, daemon);
   try {
@@ -1466,7 +1469,9 @@ describe('startup scheduler recovery', () => {
       signal: 'SIGKILL',
     });
 
-    const replacement = runtime.spawnDaemon();
+    const replacement = runtime.spawnDaemon({
+      entryPoint: manualSchedulerDaemonEntryPoint,
+    });
     await replacement.waitForReady();
     const replacementClient = await authenticatedClient(runtime, replacement);
     try {

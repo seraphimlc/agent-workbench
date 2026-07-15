@@ -52,6 +52,12 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  runtimes/session-runner:
+    dependencies:
+      '@agent-workbench/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+
   services/daemon:
     dependencies:
       '@agent-workbench/protocol':

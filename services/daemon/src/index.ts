@@ -7,6 +7,8 @@ import {
   DaemonStartCancelledError,
   type DaemonServerOptions,
 } from './server.js';
+import type { ExecutionDriver } from './runtime/execution-coordinator.js';
+import { createRunnerExecutionDriver } from './runtime/runner-supervisor.js';
 import type { SessionServiceHooks } from './runtime/session-service.js';
 import type { StartupRecoveryHooks } from './runtime/startup-recovery.js';
 
@@ -144,7 +146,22 @@ export interface RunDaemonOptions {
   readonly startupRecoveryHooks?: StartupRecoveryHooks;
   readonly initializeDatabase?: DaemonServerOptions['initializeDatabase'];
   readonly recoverStartup?: DaemonServerOptions['recoverStartup'];
+  readonly executionDriver?: ExecutionDriver | null;
+  readonly runner?: Omit<
+    Parameters<typeof createRunnerExecutionDriver>[0],
+    'dataDir'
+  >;
 }
+
+const createUnavailableExecutionDriver = (): ExecutionDriver => ({
+  start: async () => {
+    throw Object.assign(new Error('Runner production configuration is unavailable'), {
+      code: 'RUNNER_CONFIGURATION_REQUIRED',
+    });
+  },
+  shutdown: async () => undefined,
+  inspectPersistedExecutor: () => 'ambiguous',
+});
 
 export const runDaemon = async (
   dependencies: RunDaemonOptions = {},
@@ -152,10 +169,24 @@ export const runDaemon = async (
   const { options, bootstrapSecret } = readStartupInputs();
   let shutdownPromise: Promise<void> | undefined;
   let requestedExitCode = 0;
+  if (dependencies.executionDriver !== undefined && dependencies.runner !== undefined) {
+    throw new Error('Daemon execution authority must be configured exactly once');
+  }
+  const executionDriver =
+    dependencies.executionDriver === null
+      ? undefined
+      : dependencies.executionDriver ??
+        (dependencies.runner
+          ? createRunnerExecutionDriver({
+              dataDir: options.dataDir,
+              ...dependencies.runner,
+            })
+          : createUnavailableExecutionDriver());
   const server = new DaemonServer({
     socketPath: options.socketPath,
     dataDir: options.dataDir,
     bootstrapSecret,
+    ...(executionDriver ? { executionDriver } : {}),
     ...(dependencies.sessionServiceHooks
       ? { sessionServiceHooks: dependencies.sessionServiceHooks }
       : {}),

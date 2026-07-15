@@ -25,7 +25,7 @@ const HELPER_SIGNAL_GRACE_MS = 750;
 const PROCESS_POLL_INTERVAL_MS = 25;
 const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const daemonEntryPoint = fileURLToPath(
-  new URL('../../../services/daemon/src/index.ts', import.meta.url),
+  new URL('../../../tests/fixtures/manual-scheduler-daemon.ts', import.meta.url),
 );
 
 const isBootstrapSecretEnvironmentKey = (key: string): boolean => {

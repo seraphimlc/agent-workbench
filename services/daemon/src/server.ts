@@ -299,6 +299,12 @@ export class DaemonServer {
       this.recoverStartup(this.database, {
         daemonEpoch: this.daemonEpoch,
         hooks: this.startupRecoveryHooks,
+        ...(this.executionDriver?.inspectPersistedExecutor
+          ? {
+              inspectExecutor: (identity) =>
+                this.executionDriver?.inspectPersistedExecutor?.(identity) ?? 'ambiguous',
+            }
+          : {}),
       });
       this.throwIfStopRequested();
       runtimeLock.assertHeld();
@@ -425,6 +431,7 @@ export class DaemonServer {
 
   async stop(): Promise<void> {
     this.executionCoordinator?.quiesce();
+    this.executionDriver?.onDaemonPhase?.('coordinator.quiesced');
     this.stopRequested = true;
     this.listenAbortController?.abort();
     this.stopPromise ??= this.performStop();
@@ -508,6 +515,7 @@ export class DaemonServer {
         if (databaseClosed) {
           try {
             await this.runtimeLock?.release();
+            this.executionDriver?.onDaemonPhase?.('runtime_lock.released');
           } catch (error) {
             cleanupErrors.push(error);
           }
