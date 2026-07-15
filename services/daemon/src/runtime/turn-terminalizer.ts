@@ -82,6 +82,10 @@ export class TurnTerminalizer {
     return this.commit(() => {
       const now = this.now().toISOString();
       const tuple = this.repository.readActiveTuple(input.binding, ['running']);
+      this.recovery.assertToolRunsValid(
+        input.binding.sessionId,
+        input.binding.turnId,
+      );
       const content = this.repository.readFinalAssistantContent(
         input.binding.sessionId,
         input.binding.turnId,
@@ -141,6 +145,10 @@ export class TurnTerminalizer {
     this.commit(() => {
       const now = this.now().toISOString();
       const tuple = this.repository.readActiveTuple(input.binding, ['running']);
+      this.recovery.assertToolRunsValid(
+        input.binding.sessionId,
+        input.binding.turnId,
+      );
       const errorMessage = stableErrorMessage(input.errorMessage);
       const subexecutionEvents = this.recovery.fail({
         sessionId: input.binding.sessionId,
@@ -225,6 +233,10 @@ export class TurnTerminalizer {
         'running',
         'cancel_requested',
       ]);
+      this.recovery.assertToolRunsValid(
+        input.binding.sessionId,
+        input.binding.turnId,
+      );
       const revokedFence = this.repository.revokeFence(input.binding);
       this.after('fence');
       const subexecutionEvents = this.recovery.interrupt({
