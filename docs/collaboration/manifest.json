@@ -1,0 +1,18 @@
+{
+  "schema": 2,
+  "skill": "multi-agent-collaboration",
+  "profile": "team",
+  "generated_date": "2026-07-15",
+  "runtime_entry": "docs/collaboration.md",
+  "core_files": [
+    "docs/collaboration.md",
+    "docs/collaboration/manifest.json",
+    "docs/collaboration/agent-registry.json",
+    "docs/collaboration/roles/*.md"
+  ],
+  "team_profile_additions": [
+    "docs/collaboration/inbox.md"
+  ],
+  "loading_policy": "read runtime contract, current role, current task/relevant inbox, and only task-relevant project files",
+  "legacy_framework_files_are_not_runtime_sources": true
+}

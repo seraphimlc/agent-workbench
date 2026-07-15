@@ -2858,6 +2858,8 @@ describe('daemon SQLite migrations', () => {
   });
 
   it('copies only current SQL assets into dist and discovers them from compiled code', async () => {
+    runtime = createTempRuntime();
+    const isolatedProtocolDist = join(runtime.rootDir, 'protocol-dist');
     const distMigrations = join(
       repositoryRoot,
       'services/daemon/dist/db/migrations',
@@ -2868,7 +2870,16 @@ describe('daemon SQLite migrations', () => {
 
     const protocolBuild = spawnSync(
       'pnpm',
-      ['--filter', '@agent-workbench/protocol', 'build'],
+      [
+        '--filter',
+        '@agent-workbench/protocol',
+        'exec',
+        'tsc',
+        '-p',
+        'tsconfig.json',
+        '--outDir',
+        isolatedProtocolDist,
+      ],
       {
         cwd: repositoryRoot,
         encoding: 'utf8',
@@ -2927,7 +2938,6 @@ describe('daemon SQLite migrations', () => {
       join(distMigrations, '004_artifact_store.sql'),
     );
 
-    runtime = createTempRuntime();
     const builtPackageRoot = join(runtime.rootDir, 'built-daemon-package');
     mkdirSync(builtPackageRoot, { mode: 0o700 });
     cpSync(
@@ -2939,12 +2949,38 @@ describe('daemon SQLite migrations', () => {
       join(repositoryRoot, 'services/daemon/package.json'),
       join(builtPackageRoot, 'package.json'),
     );
-    symlinkSync(
-      join(repositoryRoot, 'services/daemon/node_modules'),
-      join(builtPackageRoot, 'node_modules'),
-      'dir',
+    const sourceNodeModules = join(
+      repositoryRoot,
+      'services/daemon/node_modules',
+    );
+    const builtNodeModules = join(builtPackageRoot, 'node_modules');
+    mkdirSync(join(builtNodeModules, '@agent-workbench'), { recursive: true });
+    for (const dependency of readdirSync(sourceNodeModules)) {
+      if (dependency === '.bin' || dependency === '@agent-workbench') {
+        continue;
+      }
+      symlinkSync(
+        join(sourceNodeModules, dependency),
+        join(builtNodeModules, dependency),
+        'dir',
+      );
+    }
+    const builtProtocolRoot = join(
+      builtNodeModules,
+      '@agent-workbench/protocol',
+    );
+    mkdirSync(builtProtocolRoot, { recursive: true });
+    cpSync(
+      isolatedProtocolDist,
+      join(builtProtocolRoot, 'dist'),
+      { recursive: true },
+    );
+    copyFileSync(
+      join(repositoryRoot, 'packages/protocol/package.json'),
+      join(builtProtocolRoot, 'package.json'),
     );
     expect(existsSync(join(builtPackageRoot, 'src'))).toBe(false);
+    expect(existsSync(join(builtProtocolRoot, 'src'))).toBe(false);
     const builtDaemon = runtime.spawnDaemon({
       entryPoint: join(builtPackageRoot, 'dist/index.js'),
       useDevelopmentConditions: false,
