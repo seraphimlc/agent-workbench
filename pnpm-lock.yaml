@@ -41,6 +41,9 @@ importers:
       '@agent-workbench/daemon':
         specifier: workspace:*
         version: link:../../services/daemon
+      '@agent-workbench/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
       '@agent-workbench/session-runner':
         specifier: workspace:*
         version: link:../../runtimes/session-runner
@@ -48,6 +51,9 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
     devDependencies:
+      '@agent-workbench/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
       '@types/node':
         specifier: 26.1.1
         version: 26.1.1
