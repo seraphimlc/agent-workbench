@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -108,6 +109,27 @@ type ToolGatewayModule = {
   ) => ToolGateway;
 };
 
+type RunnerExecutionDriver = {
+  start(claim: Claim): Promise<{ readonly completion: Promise<void> }>;
+  shutdown(): Promise<void>;
+};
+
+type RunnerSupervisorModule = {
+  createRunnerExecutionDriver(options: {
+    readonly dataDir: string;
+    readonly runnerEntryPoint: string;
+    readonly modelAdapter: ModelAdapter;
+    readonly provider: {
+      readonly endpoint: string;
+      readonly modelId: string;
+      readonly apiKey: string;
+    };
+    readonly toolHandlers: Readonly<
+      Record<string, (input: ToolHandlerInput) => Promise<{ readonly content: string }>>
+    >;
+  }): RunnerExecutionDriver;
+};
+
 type Deferred<Value> = {
   readonly promise: Promise<Value>;
   resolve(value: Value): void;
@@ -126,6 +148,11 @@ type AuthorizationFixture = {
 
 const MODEL_GATEWAY_MODULE_PATH = '../../services/daemon/src/model/model-gateway.js';
 const TOOL_GATEWAY_MODULE_PATH = '../../services/daemon/src/tools/tool-gateway.js';
+const RUNNER_SUPERVISOR_MODULE_PATH =
+  '../../services/daemon/src/runtime/runner-supervisor.js';
+const runnerEntryPoint = fileURLToPath(
+  new URL('../../runtimes/session-runner/src/index.ts', import.meta.url),
+);
 const DAEMON_EPOCH = '018f0000-0000-7000-8000-000000003000';
 const START_TIME = '2026-07-15T03:00:00.000Z';
 const FINISH_TIME = '2026-07-15T03:00:01.000Z';
@@ -191,6 +218,9 @@ const loadModelGateway = async (): Promise<ModelGatewayModule> =>
 
 const loadToolGateway = async (): Promise<ToolGatewayModule> =>
   (await import(TOOL_GATEWAY_MODULE_PATH)) as unknown as ToolGatewayModule;
+
+const loadRunnerSupervisor = async (): Promise<RunnerSupervisorModule> =>
+  (await import(RUNNER_SUPERVISOR_MODULE_PATH)) as unknown as RunnerSupervisorModule;
 
 class ControlledAdapter implements ModelAdapter {
   readonly started = deferred<ModelAdapterRequest>();
@@ -395,6 +425,66 @@ describe('ModelAttempt and ToolCall authorization', () => {
   afterEach(async () => {
     await runtime?.cleanup();
     runtime = undefined;
+  });
+
+  it('advertises only Tool definitions backed by production Runner handlers', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const adapter = new ControlledAdapter();
+    const { createRunnerExecutionDriver } = await loadRunnerSupervisor();
+    const driver = createRunnerExecutionDriver({
+      dataDir: runtime.dataDir,
+      runnerEntryPoint,
+      modelAdapter: adapter,
+      provider: {
+        endpoint: PROVIDER_ENDPOINT,
+        modelId: PROVIDER_MODEL,
+        apiKey: PROVIDER_API_KEY,
+      },
+      toolHandlers: {
+        'fs.read_text': async () => ({ content: 'notes' }),
+      },
+    });
+
+    try {
+      const execution = await driver.start(fixture.claim);
+      const request = await adapter.started.promise;
+      adapter.result.resolve({
+        finishReason: 'stop',
+        content: 'Done',
+        toolCalls: [],
+        providerRequestId: 'provider-runner-tools',
+        usage: null,
+      });
+      await execution.completion;
+
+      expect(
+        request.tools.map((tool) => (tool as { readonly toolId: string }).toolId),
+      ).toEqual(['fs.read_text']);
+    } finally {
+      await driver.shutdown();
+      fixture.database.close();
+    }
+  });
+
+  it('fails closed when production Runner installs an unknown Tool handler', async () => {
+    const { createRunnerExecutionDriver } = await loadRunnerSupervisor();
+
+    expect(() =>
+      createRunnerExecutionDriver({
+        dataDir: '/unused',
+        runnerEntryPoint,
+        modelAdapter: new ControlledAdapter(),
+        provider: {
+          endpoint: PROVIDER_ENDPOINT,
+          modelId: PROVIDER_MODEL,
+          apiKey: PROVIDER_API_KEY,
+        },
+        toolHandlers: {
+          'shell.exec': async () => ({ content: 'not allowed' }),
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: 'MODEL_TOOL_UNAUTHORIZED' }));
   });
 
   it('commits running Model facts, start Events, and a redacted audit intent before adapter fetch', async () => {

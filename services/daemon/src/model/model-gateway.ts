@@ -56,8 +56,8 @@ type ValidatedToolCall = ProviderToolCall & {
   readonly normalizedInputHash: string;
 };
 
-const BUILTIN_TOOLS = [
-  {
+export const BUILTIN_TOOL_DEFINITIONS = Object.freeze({
+  'fs.read_text': {
     toolId: 'fs.read_text',
     type: 'function',
     function: {
@@ -70,7 +70,7 @@ const BUILTIN_TOOLS = [
       },
     },
   },
-  {
+  'fs.write_text': {
     toolId: 'fs.write_text',
     type: 'function',
     function: {
@@ -86,7 +86,23 @@ const BUILTIN_TOOLS = [
       },
     },
   },
-] as const;
+} as const);
+
+type BuiltinToolId = keyof typeof BUILTIN_TOOL_DEFINITIONS;
+
+export const selectBuiltinToolDefinitions = (
+  toolIds: readonly string[],
+): readonly unknown[] =>
+  toolIds.map((toolId) => {
+    if (!Object.hasOwn(BUILTIN_TOOL_DEFINITIONS, toolId)) {
+      throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id is not allowlisted');
+    }
+    return BUILTIN_TOOL_DEFINITIONS[toolId as BuiltinToolId];
+  });
+
+const DEFAULT_BUILTIN_TOOLS = Object.freeze(
+  selectBuiltinToolDefinitions(Object.keys(BUILTIN_TOOL_DEFINITIONS)),
+);
 
 const sha256 = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
@@ -180,6 +196,7 @@ export class ModelGateway {
     readonly modelId: string;
     readonly apiKey: string;
   };
+  private readonly tools: readonly unknown[];
   private readonly now: () => Date;
   private readonly createId: () => string;
 
@@ -192,12 +209,14 @@ export class ModelGateway {
         readonly modelId: string;
         readonly apiKey: string;
       };
+      readonly tools?: readonly unknown[];
       readonly now?: () => Date;
       readonly createId?: () => string;
     },
   ) {
     this.adapter = options.adapter;
     this.provider = { ...options.provider };
+    this.tools = Object.freeze([...(options.tools ?? DEFAULT_BUILTIN_TOOLS)]);
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? uuidv7;
     this.repository = new ExecutionRepository(database);
@@ -224,7 +243,7 @@ export class ModelGateway {
         endpoint: this.provider.endpoint,
         modelId: this.provider.modelId,
         messages: input.messages,
-        tools: BUILTIN_TOOLS,
+        tools: this.tools,
       }),
     );
 
@@ -315,7 +334,7 @@ export class ModelGateway {
         modelId: this.provider.modelId,
         apiKey: this.provider.apiKey,
         messages: input.messages,
-        tools: BUILTIN_TOOLS,
+        tools: this.tools,
         ...(input.signal ? { signal: input.signal } : {}),
       });
     } catch (error) {

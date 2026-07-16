@@ -13,7 +13,11 @@ import {
 import type Database from 'better-sqlite3';
 
 import { openRuntimeDatabase } from '../db/database.js';
-import { ModelGateway, type ModelAdapter } from '../model/model-gateway.js';
+import {
+  ModelGateway,
+  selectBuiltinToolDefinitions,
+  type ModelAdapter,
+} from '../model/model-gateway.js';
 import { redactAndLimit } from '../security/secret-redactor.js';
 import { ToolGateway } from '../tools/tool-gateway.js';
 import type { ExecutionDriver, ExecutionRun } from './execution-coordinator.js';
@@ -553,6 +557,7 @@ const errorCodeOf = (error: unknown): string =>
 class RunnerExecutionDriver implements ExecutionDriver {
   private readonly supervisor: RunnerSupervisor;
   private readonly hooks: DriverHooks;
+  private readonly modelTools: readonly unknown[];
   private databasePromise: Promise<Database.Database> | undefined;
   private database: Database.Database | undefined;
   private pendingStart: DriverPendingStart | undefined;
@@ -584,6 +589,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
     },
   ) {
     this.hooks = options.hooks;
+    this.modelTools = selectBuiltinToolDefinitions(Object.keys(options.toolHandlers));
     this.supervisor = new RunnerSupervisor({
       runnerEntryPoint: options.runnerEntryPoint,
       readyTimeoutMs: 5_000,
@@ -714,6 +720,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
             const gateway = new ModelGateway(database, {
               adapter: this.options.modelAdapter,
               provider: this.options.provider,
+              tools: this.modelTools,
             });
             const result = await gateway.call({
               binding: active.claim,
