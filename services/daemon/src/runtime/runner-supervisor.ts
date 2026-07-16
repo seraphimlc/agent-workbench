@@ -729,7 +729,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
             });
             const result = await gateway.call({
               binding: active.claim,
-              messages: request.payload.messages as unknown as never,
+              messages: request.payload.messages,
               signal: abort.signal,
               abortDisposition: 'external_interrupt',
             });

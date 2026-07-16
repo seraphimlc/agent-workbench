@@ -1,3 +1,4 @@
+import type { RunnerModelMessage } from '@agent-workbench/protocol';
 import { describe, expect, it } from 'vitest';
 
 import { OpenAiCompatibleAdapter } from './openai-compatible-adapter.js';
@@ -80,6 +81,7 @@ const toolCallResponse = (
 
 const startAdapterServer = async (input: {
   readonly messages: readonly unknown[];
+  readonly expectedMessages?: readonly unknown[];
   readonly expectedTools: readonly unknown[];
   readonly response: Uint8Array;
 }): Promise<FakeOpenAiServer> => {
@@ -97,7 +99,7 @@ const startAdapterServer = async (input: {
           jsonBody: {
             model: 'adapter-test-model',
             stream: true,
-            messages: input.messages,
+            messages: input.expectedMessages ?? input.messages,
             tools: input.expectedTools,
           },
         },
@@ -315,8 +317,106 @@ describe('OpenAiCompatibleAdapter', () => {
     }
   });
 
+  it('translates second-cycle Runner tool history to OpenAI wire messages', async () => {
+    const messages: readonly RunnerModelMessage[] = [
+      { role: 'user', content: 'Read README.md.' },
+      {
+        role: 'assistant',
+        content: null,
+        toolCalls: [
+          {
+            logicalCallId: 'call-readme',
+            toolId: 'fs.read_text',
+            argumentsJson: '{"path":"README.md"}',
+          },
+        ],
+      },
+      { role: 'tool', logicalCallId: 'call-readme', content: '# Agent Workbench' },
+    ];
+    const tools = [toolDefinition('fs.read_text')] as const;
+    const server = await startAdapterServer({
+      messages,
+      expectedMessages: [
+        { role: 'user', content: 'Read README.md.' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'call-readme',
+              type: 'function',
+              function: {
+                name: 'fs_read_text',
+                arguments: '{"path":"README.md"}',
+              },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call-readme', content: '# Agent Workbench' },
+      ],
+      expectedTools: [providerToolDefinition('fs_read_text')],
+      response: encoder.encode(
+        event({
+          id: 'response-adapter-second-cycle',
+          choices: [{ index: 0, delta: { content: 'README loaded.' } }],
+        }) +
+          event({
+            id: 'response-adapter-second-cycle',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          }) +
+          'data: [DONE]\n\n',
+      ),
+    });
+    const adapter = new OpenAiCompatibleAdapter({ timeoutMs: 5_000 });
+
+    try {
+      await expect(
+        adapter.call({
+          endpoint: new URL('/v1/chat/completions', server.baseUrl).toString(),
+          modelId: 'adapter-test-model',
+          apiKey: 'adapter-test-key',
+          messages,
+          tools,
+        }),
+      ).resolves.toMatchObject({
+        finishReason: 'stop',
+        content: 'README loaded.',
+        toolCalls: [],
+      });
+      await server.completed;
+    } finally {
+      await server.close();
+    }
+  });
+
   it('assigns deterministic aliases when sanitized function names collide', async () => {
-    const messages = [{ role: 'user', content: 'Call every tool.' }] as const;
+    const messages: readonly RunnerModelMessage[] = [
+      { role: 'user', content: 'Call every tool.' },
+      {
+        role: 'assistant',
+        content: null,
+        toolCalls: [
+          {
+            logicalCallId: 'history-slash',
+            toolId: 'fs/read_text',
+            argumentsJson: '{"source":"slash"}',
+          },
+          {
+            logicalCallId: 'history-safe',
+            toolId: 'fs_read_text',
+            argumentsJson: '{"source":"safe"}',
+          },
+          {
+            logicalCallId: 'history-dot',
+            toolId: 'fs.read_text',
+            argumentsJson: '{"source":"dot"}',
+          },
+        ],
+      },
+      { role: 'tool', logicalCallId: 'history-slash', content: 'slash result' },
+      { role: 'tool', logicalCallId: 'history-safe', content: 'safe result' },
+      { role: 'tool', logicalCallId: 'history-dot', content: 'dot result' },
+    ];
     const tools = [
       toolDefinition('fs/read_text'),
       toolDefinition('fs_read_text'),
@@ -324,6 +424,33 @@ describe('OpenAiCompatibleAdapter', () => {
     ] as const;
     const server = await startAdapterServer({
       messages,
+      expectedMessages: [
+        { role: 'user', content: 'Call every tool.' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'history-slash',
+              type: 'function',
+              function: { name: 'fs_read_text_3', arguments: '{"source":"slash"}' },
+            },
+            {
+              id: 'history-safe',
+              type: 'function',
+              function: { name: 'fs_read_text', arguments: '{"source":"safe"}' },
+            },
+            {
+              id: 'history-dot',
+              type: 'function',
+              function: { name: 'fs_read_text_2', arguments: '{"source":"dot"}' },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'history-slash', content: 'slash result' },
+        { role: 'tool', tool_call_id: 'history-safe', content: 'safe result' },
+        { role: 'tool', tool_call_id: 'history-dot', content: 'dot result' },
+      ],
       expectedTools: [
         providerToolDefinition('fs_read_text_3'),
         providerToolDefinition('fs_read_text'),

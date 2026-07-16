@@ -257,10 +257,23 @@ describe('Web Console real execution lifecycle', () => {
               stream: true,
               messages: [
                 { role: 'user', content: PROMPT },
-                { role: 'assistant', content: null, toolCalls: [TOOL_CALL] },
+                {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: TOOL_CALL.logicalCallId,
+                      type: 'function',
+                      function: {
+                        name: PROVIDER_READ_TOOL_NAME,
+                        arguments: TOOL_CALL.argumentsJson,
+                      },
+                    },
+                  ],
+                },
                 {
                   role: 'tool',
-                  logicalCallId: TOOL_CALL.logicalCallId,
+                  tool_call_id: TOOL_CALL.logicalCallId,
                   content: README_CONTENT,
                 },
               ],

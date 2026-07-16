@@ -1,5 +1,6 @@
 import { BUILTIN_TOOL_DEFINITIONS } from '@agent-workbench/daemon/model/model-gateway';
 import { OpenAiCompatibleAdapter } from '@agent-workbench/daemon/model/openai-compatible-adapter';
+import type { RunnerModelMessage } from '@agent-workbench/protocol';
 import { z } from 'zod';
 
 import type { ProviderPrivateConfig } from './config.js';
@@ -39,7 +40,7 @@ export type ProviderModelProbeAdapter = {
     readonly endpoint: string;
     readonly modelId: string;
     readonly apiKey: string;
-    readonly messages: readonly unknown[];
+    readonly messages: readonly RunnerModelMessage[];
     readonly tools: readonly unknown[];
     readonly signal?: AbortSignal;
   }): Promise<ProbeResult>;

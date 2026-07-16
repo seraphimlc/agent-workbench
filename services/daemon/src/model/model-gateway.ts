@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import type { RunnerModelMessage } from '@agent-workbench/protocol';
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
@@ -7,10 +8,7 @@ import { ExecutionRepository } from '../db/execution-repository.js';
 import { SessionEventWriter } from '../db/session-event-writer.js';
 import type { Claim } from '../runtime/scheduler.js';
 
-export type ModelMessage = {
-  readonly role: 'system' | 'user';
-  readonly content: string;
-};
+export type ModelMessage = RunnerModelMessage;
 
 export type ProviderToolCall = {
   readonly logicalCallId: string;

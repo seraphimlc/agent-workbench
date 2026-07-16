@@ -1,3 +1,5 @@
+import type { RunnerModelMessage } from '@agent-workbench/protocol';
+
 import {
   decodeOpenAiSseResponse,
   type DecodedOpenAiResponse,
@@ -34,6 +36,7 @@ const prepareProviderTools = (
 ): {
   readonly tools: readonly unknown[];
   readonly providerNameToToolId: ReadonlyMap<string, string>;
+  readonly toolIdToProviderName: ReadonlyMap<string, string>;
 } => {
   const bindings: ProviderFunctionBinding[] = [];
   for (const [index, tool] of tools.entries()) {
@@ -60,6 +63,7 @@ const prepareProviderTools = (
 
   const providerNameByIndex = new Map<number, string>();
   const providerNameToToolId = new Map<string, string>();
+  const toolIdToProviderName = new Map<string, string>();
   const usedProviderNames = new Set<string>();
   bindings.sort(
     (left, right) =>
@@ -79,6 +83,7 @@ const prepareProviderTools = (
     usedProviderNames.add(providerName);
     providerNameByIndex.set(binding.index, providerName);
     providerNameToToolId.set(providerName, binding.toolId);
+    toolIdToProviderName.set(binding.toolId, providerName);
   }
 
   const providerTools = tools.map((tool, index) => {
@@ -99,8 +104,70 @@ const prepareProviderTools = (
     }
     return providerTool;
   });
-  return { tools: providerTools, providerNameToToolId };
+  return { tools: providerTools, providerNameToToolId, toolIdToProviderName };
 };
+
+type ProviderMessage =
+  | {
+      readonly role: 'system' | 'user';
+      readonly content: string;
+    }
+  | {
+      readonly role: 'assistant';
+      readonly content: string | null;
+      readonly tool_calls?: readonly {
+        readonly id: string;
+        readonly type: 'function';
+        readonly function: {
+          readonly name: string;
+          readonly arguments: string;
+        };
+      }[];
+    }
+  | {
+      readonly role: 'tool';
+      readonly tool_call_id: string;
+      readonly content: string;
+    };
+
+const prepareProviderMessages = (
+  messages: readonly RunnerModelMessage[],
+  toolIdToProviderName: ReadonlyMap<string, string>,
+): readonly ProviderMessage[] =>
+  messages.map((message) => {
+    if (message.role === 'system' || message.role === 'user') return message;
+    if (message.role === 'tool') {
+      return {
+        role: message.role,
+        tool_call_id: message.logicalCallId,
+        content: message.content,
+      };
+    }
+    if (message.toolCalls.length === 0) {
+      return { role: message.role, content: message.content };
+    }
+    return {
+      role: message.role,
+      content: message.content,
+      tool_calls: message.toolCalls.map((toolCall) => {
+        const providerName = toolIdToProviderName.get(toolCall.toolId);
+        if (providerName === undefined) {
+          throw new OpenAiDecoderError(
+            'MODEL_RESPONSE_INVALID',
+            'Assistant Tool Call references an unadvertised tool',
+          );
+        }
+        return {
+          id: toolCall.logicalCallId,
+          type: 'function',
+          function: {
+            name: providerName,
+            arguments: toolCall.argumentsJson,
+          },
+        };
+      }),
+    };
+  });
 
 export class OpenAiCompatibleAdapter {
   private readonly timeoutMs: number;
@@ -113,7 +180,7 @@ export class OpenAiCompatibleAdapter {
     readonly endpoint: string;
     readonly modelId: string;
     readonly apiKey: string;
-    readonly messages: readonly unknown[];
+    readonly messages: readonly RunnerModelMessage[];
     readonly tools: readonly unknown[];
     readonly signal?: AbortSignal;
   }): Promise<DecodedOpenAiResponse> {
@@ -125,6 +192,10 @@ export class OpenAiCompatibleAdapter {
     input.signal?.addEventListener('abort', abort, { once: true });
     try {
       const preparedTools = prepareProviderTools(input.tools);
+      const preparedMessages = prepareProviderMessages(
+        input.messages,
+        preparedTools.toolIdToProviderName,
+      );
       const response = await fetch(input.endpoint, {
         method: 'POST',
         redirect: 'error',
@@ -135,7 +206,7 @@ export class OpenAiCompatibleAdapter {
         body: JSON.stringify({
           model: input.modelId,
           stream: true,
-          messages: input.messages,
+          messages: preparedMessages,
           tools: preparedTools.tools,
         }),
         signal: combined.signal,
