@@ -13,6 +13,7 @@ import { NavigationRail } from './components/NavigationRail.js';
 import { SessionHeader } from './components/SessionHeader.js';
 import {
   Timeline,
+  buildToolPresentationIndex,
   getToolPresentation,
 } from './components/Timeline.js';
 import {
@@ -163,9 +164,11 @@ export function App({
   const mutationInFlight = useRef(false);
   const snapshotRef = useRef<SessionSnapshot | null>(null);
   const eventStateRef = useRef<EventPageState | null>(null);
+  const stateGenerationRef = useRef(0);
 
   const adoptSnapshot = useCallback((nextSnapshot: SessionSnapshot): void => {
     const nextEventState = createEventPageState(nextSnapshot);
+    stateGenerationRef.current += 1;
     snapshotRef.current = nextSnapshot;
     eventStateRef.current = nextEventState;
     setSnapshot(nextSnapshot);
@@ -173,6 +176,7 @@ export function App({
   }, []);
 
   const clearSession = useCallback((): void => {
+    stateGenerationRef.current += 1;
     snapshotRef.current = null;
     eventStateRef.current = null;
     setSnapshot(null);
@@ -266,6 +270,17 @@ export function App({
         currentSnapshot.session.runtimeStatus,
         pollIntervals,
       );
+      const pollGeneration = stateGenerationRef.current;
+      const generationChanged = (): boolean =>
+        stateGenerationRef.current !== pollGeneration;
+      const scheduleFromCurrentState = (): void => {
+        const latestSnapshot = snapshotRef.current;
+        if (latestSnapshot !== null && latestSnapshot.session.id === sessionId) {
+          schedule(
+            pollDelay(latestSnapshot.session.runtimeStatus, pollIntervals),
+          );
+        }
+      };
 
       try {
         const request = {
@@ -278,11 +293,23 @@ export function App({
         try {
           page = await api.getEvents(request);
           if (canceled) return;
+          if (generationChanged()) {
+            scheduleFromCurrentState();
+            return;
+          }
           nextEvents = applyEventPage(currentEvents, request, page);
         } catch (error) {
+          if (generationChanged()) {
+            scheduleFromCurrentState();
+            return;
+          }
           if (!isIncrementalResponseInvalid(error)) throw error;
           const resyncedSnapshot = await api.getSnapshot(sessionId);
           if (canceled) return;
+          if (generationChanged()) {
+            scheduleFromCurrentState();
+            return;
+          }
           adoptSnapshot(resyncedSnapshot);
           setPollError(null);
           nextDelay = pollDelay(
@@ -300,6 +327,10 @@ export function App({
         if (page.events.length > 0) {
           const refreshedSnapshot = await api.getSnapshot(sessionId);
           if (canceled) return;
+          if (generationChanged()) {
+            scheduleFromCurrentState();
+            return;
+          }
           adoptSnapshot(refreshedSnapshot);
           nextDelay = pollDelay(
             refreshedSnapshot.session.runtimeStatus,
@@ -307,6 +338,10 @@ export function App({
           );
         }
       } catch (error) {
+        if (generationChanged()) {
+          scheduleFromCurrentState();
+          return;
+        }
         if (!canceled) setPollError(errorDetails(error).message);
         nextDelay = pollIntervals.idleMs;
       }
@@ -334,12 +369,16 @@ export function App({
     () => timeline.find(({ id }) => id === selectedItemId) ?? null,
     [selectedItemId, timeline],
   );
+  const toolPresentationIndex = useMemo(
+    () => buildToolPresentationIndex(timeline),
+    [timeline],
+  );
   const selectedTool = useMemo(
     () =>
       selectedItem === null
         ? null
-        : getToolPresentation(selectedItem, timeline),
-    [selectedItem, timeline],
+        : getToolPresentation(selectedItem, toolPresentationIndex),
+    [selectedItem, toolPresentationIndex],
   );
 
   const completeMutation = useCallback(
@@ -517,6 +556,7 @@ export function App({
           onSelect={selectTimelineItem}
           runtimeUnavailable={runtimeUnavailable}
           selectedItemId={selectedItemId}
+          toolPresentationIndex={toolPresentationIndex}
         />
 
         <Composer

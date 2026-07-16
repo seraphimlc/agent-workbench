@@ -32,6 +32,11 @@ import {
   CURRENT_SESSION_STORAGE_KEY,
   type PollIntervals,
 } from './App.js';
+import {
+  buildToolPresentationIndex,
+  getToolPresentation,
+} from './components/Timeline.js';
+import { projectTimeline } from './view-model.js';
 
 const timestamp = (second: number): string =>
   `2026-07-16T00:00:${String(second).padStart(2, '0')}.000Z`;
@@ -483,6 +488,70 @@ describe('professional web workbench', () => {
     );
   });
 
+  it('indexes multiple ToolRuns without mixing their input and output summaries', () => {
+    const toolEvents = [
+      event(1, 'turn.queued', { payload: { ordinal: 1 } }),
+      event(2, 'tool.started', {
+        payload: {
+          inputSummary: 'README.md',
+          toolId: 'fs.read_text',
+          toolRunId: 'tool-run-1',
+        },
+        toolRunId: 'tool-run-1',
+      }),
+      event(3, 'tool.succeeded', {
+        payload: {
+          outputBytes: 10,
+          outputSummary: 'First output',
+          toolRunId: 'tool-run-1',
+        },
+        toolRunId: 'tool-run-1',
+      }),
+      event(4, 'tool.started', {
+        payload: {
+          inputSummary: 'package.json',
+          toolId: 'fs.read_text',
+          toolRunId: 'tool-run-2',
+        },
+        toolRunId: 'tool-run-2',
+      }),
+      event(5, 'tool.succeeded', {
+        payload: {
+          outputBytes: 20,
+          outputSummary: 'Second output',
+          toolRunId: 'tool-run-2',
+        },
+        toolRunId: 'tool-run-2',
+      }),
+    ];
+    const timeline = projectTimeline(
+      snapshot({
+        events: toolEvents,
+        messages: [message('user', 'Read two files')],
+        turns: [turn('succeeded')],
+      }),
+    );
+    const index = buildToolPresentationIndex(timeline);
+    const firstRun = timeline.find((item) => item.seq === 3);
+    const secondRun = timeline.find((item) => item.seq === 5);
+
+    expect(index.presentations.size).toBe(2);
+    expect(firstRun && getToolPresentation(firstRun, index)).toMatchObject({
+      inputSummary: 'README.md',
+      outputBytes: 10,
+      outputSummary: 'First output',
+      toolId: 'fs.read_text',
+      toolRunId: 'tool-run-1',
+    });
+    expect(secondRun && getToolPresentation(secondRun, index)).toMatchObject({
+      inputSummary: 'package.json',
+      outputBytes: 20,
+      outputSummary: 'Second output',
+      toolId: 'fs.read_text',
+      toolRunId: 'tool-run-2',
+    });
+  });
+
   it('restores the saved session from localStorage', async () => {
     window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
     const getSnapshot = vi.fn(async () =>
@@ -748,6 +817,42 @@ describe('professional web workbench', () => {
     expect(document.activeElement).toBe(toolCard);
   });
 
+  it('allows Tab to leave the desktop Inspector panel', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const desktopSnapshot = snapshot({
+      events: [
+        event(1, 'turn.queued', { payload: { ordinal: 1 } }),
+        event(2, 'tool.started', {
+          payload: {
+            inputSummary: 'README.md',
+            toolId: 'fs.read_text',
+            toolRunId: 'tool-run-1',
+          },
+          toolRunId: 'tool-run-1',
+        }),
+      ],
+      messages: [message('user', 'Read README.md')],
+      runtimeStatus: 'idle',
+      turns: [turn('succeeded')],
+    });
+    const user = userEvent.setup();
+
+    render(<App api={fakeApi({ getSnapshot: async () => desktopSnapshot })} />);
+
+    await user.click(
+      await screen.findByRole('button', {
+        name: 'Tool fs.read_text started',
+      }),
+    );
+    const panel = screen.getByRole('complementary', { name: 'Inspector' });
+    const payload = within(panel).getByLabelText('Event payload');
+    payload.focus();
+
+    await user.tab();
+
+    expect(document.activeElement).not.toBe(payload);
+  });
+
   it('retries the same failed mutation operation instead of creating a new id', async () => {
     const execute = vi.fn(async () => {
       throw new TypeError('network unavailable');
@@ -786,6 +891,65 @@ describe('professional web workbench', () => {
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
+  it('drops a stale deferred poll after a mutation adopts a newer Snapshot', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const initialSnapshot = snapshot({
+      runtimeStatus: 'running',
+      title: 'Initial running task',
+    });
+    const mutationSnapshot = snapshot({
+      runtimeStatus: 'idle',
+      title: 'Mutation authoritative task',
+    });
+    const stalePollSnapshot = snapshot({
+      runtimeStatus: 'idle',
+      title: 'Stale poll task',
+    });
+    const pendingPoll = deferred<Awaited<ReturnType<ApiClient['getEvents']>>>();
+    const getEvents = vi
+      .fn<ApiClient['getEvents']>()
+      .mockImplementationOnce(() => pendingPoll.promise)
+      .mockImplementationOnce(() => new Promise(() => undefined));
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockResolvedValueOnce(initialSnapshot)
+      .mockResolvedValueOnce(mutationSnapshot)
+      .mockResolvedValueOnce(stalePollSnapshot);
+    const createTurnOperation = vi.fn<ApiClient['createTurnOperation']>(() =>
+      operation(async () => ({ turnId: 'turn-2' })),
+    );
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({
+          createTurnOperation,
+          getEvents,
+          getSnapshot,
+        })}
+        pollIntervals={fastPolling}
+      />,
+    );
+
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(1));
+    await user.type(await screen.findByLabelText('Task prompt'), 'New turn');
+    await user.click(screen.getByRole('button', { name: 'Queue turn' }));
+    expect(await screen.findByText('Mutation authoritative task')).toBeTruthy();
+
+    await act(async () => {
+      pendingPoll.resolve({
+        events: [event(1, 'session.created', { turnId: null })],
+        highWaterSeq: 1,
+      });
+      await pendingPoll.promise;
+    });
+
+    expect(screen.getByText('Mutation authoritative task')).toBeTruthy();
+    expect(screen.queryByText('Stale poll task')).toBeNull();
+    expect(screen.queryByText('session.created')).toBeNull();
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it('defines the desktop grid, visible focus, and reduced-motion fallback', () => {
     const styles = readFileSync(
       resolve(process.cwd(), 'apps/web-console/src/client/styles.css'),
@@ -795,6 +959,16 @@ describe('professional web workbench', () => {
     expect(styles).toMatch(
       /grid-template-columns:\s*240px\s+minmax\(480px,\s*1fr\)\s+320px/,
     );
+    expect(styles).toMatch(
+      /grid-template-areas:\s*"header"\s*"status"\s*"timeline"\s*"composer"/,
+    );
+    expect(styles).toMatch(
+      /grid-template-rows:\s*auto\s+auto\s+minmax\(0,\s*1fr\)\s+auto/,
+    );
+    expect(styles).toMatch(/\.session-header\s*\{[^}]*grid-area:\s*header/s);
+    expect(styles).toMatch(/\.runtime-status\s*\{[^}]*grid-area:\s*status/s);
+    expect(styles).toMatch(/\.timeline\s*\{[^}]*grid-area:\s*timeline/s);
+    expect(styles).toMatch(/\.composer\s*\{[^}]*grid-area:\s*composer/s);
     expect(styles).toMatch(/:focus-visible/);
     expect(styles).toMatch(/@media\s*\(max-width:\s*1099px\)/);
     expect(styles).toMatch(/@media\s*\(max-width:\s*819px\)/);

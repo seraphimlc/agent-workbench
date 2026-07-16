@@ -44,7 +44,7 @@ export function Inspector({
       onClose();
       return;
     }
-    if (event.key !== 'Tab') return;
+    if (event.key !== 'Tab' || presentation !== 'drawer') return;
     const focusable = panelRef.current?.querySelectorAll<HTMLElement>(
       'button:not([disabled]), [href], textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
     );

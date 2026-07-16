@@ -1,3 +1,5 @@
+import { useMemo } from 'react';
+
 import type { TimelineItem } from '../view-model.js';
 
 export type ToolPresentation = Readonly<{
@@ -9,11 +11,17 @@ export type ToolPresentation = Readonly<{
   toolRunId: string | null;
 }>;
 
+export type ToolPresentationIndex = Readonly<{
+  latestItemIds: ReadonlyMap<string, string>;
+  presentations: ReadonlyMap<string, ToolPresentation>;
+}>;
+
 type TimelineProps = Readonly<{
   items: readonly TimelineItem[];
   onSelect(item: TimelineItem): void;
   runtimeUnavailable: boolean;
   selectedItemId: string | null;
+  toolPresentationIndex: ToolPresentationIndex;
 }>;
 
 const activeItemStatuses = new Set<TimelineItem['status']>([
@@ -57,49 +65,59 @@ const toolRunId = (item: TimelineItem): string | null => {
   );
 };
 
-export const getToolPresentation = (
-  item: TimelineItem,
-  items: readonly TimelineItem[],
-): ToolPresentation | null => {
+const toolIndexKey = (item: TimelineItem): string | null => {
   if (item.kind !== 'tool') return null;
-  const runId = toolRunId(item);
-  const related = items.filter(
-    (candidate) => candidate.kind === 'tool' && toolRunId(candidate) === runId,
-  );
-  let toolId = 'Unknown tool';
-  let inputSummary: string | null = null;
-  let outputSummary: string | null = null;
-  let outputBytes: number | null = null;
+  return toolRunId(item) ?? item.id;
+};
 
-  for (const candidate of related) {
-    const payload = eventPayload(candidate);
-    toolId = stringValue(payload, 'toolId') ?? toolId;
-    inputSummary = stringValue(payload, 'inputSummary') ?? inputSummary;
-    outputSummary = stringValue(payload, 'outputSummary') ?? outputSummary;
-    outputBytes = numberValue(payload, 'outputBytes') ?? outputBytes;
+export const buildToolPresentationIndex = (
+  items: readonly TimelineItem[],
+): ToolPresentationIndex => {
+  const latestItemIds = new Map<string, string>();
+  const presentations = new Map<string, ToolPresentation>();
+
+  for (const item of items) {
+    const key = toolIndexKey(item);
+    if (key === null) continue;
+    const payload = eventPayload(item);
+    const previous = presentations.get(key);
+    presentations.set(key, {
+      inputSummary:
+        stringValue(payload, 'inputSummary') ??
+        previous?.inputSummary ??
+        null,
+      outputBytes:
+        numberValue(payload, 'outputBytes') ?? previous?.outputBytes ?? null,
+      outputSummary:
+        stringValue(payload, 'outputSummary') ??
+        previous?.outputSummary ??
+        null,
+      status: item.status,
+      toolId: stringValue(payload, 'toolId') ?? previous?.toolId ?? 'Unknown tool',
+      toolRunId: toolRunId(item),
+    });
+    latestItemIds.set(key, item.id);
   }
 
-  return {
-    inputSummary,
-    outputBytes,
-    outputSummary,
-    status: item.status,
-    toolId,
-    toolRunId: runId,
-  };
+  return Object.freeze({ latestItemIds, presentations });
 };
 
-const displayItems = (items: readonly TimelineItem[]): readonly TimelineItem[] => {
-  const latestToolByRun = new Map<string, number>();
-  items.forEach((item, index) => {
-    const runId = toolRunId(item);
-    if (runId !== null) latestToolByRun.set(runId, index);
-  });
-  return items.filter((item, index) => {
-    const runId = toolRunId(item);
-    return runId === null || latestToolByRun.get(runId) === index;
-  });
+export const getToolPresentation = (
+  item: TimelineItem,
+  index: ToolPresentationIndex,
+): ToolPresentation | null => {
+  const key = toolIndexKey(item);
+  return key === null ? null : (index.presentations.get(key) ?? null);
 };
+
+const displayItems = (
+  items: readonly TimelineItem[],
+  index: ToolPresentationIndex,
+): readonly TimelineItem[] =>
+  items.filter((item) => {
+    const key = toolIndexKey(item);
+    return key === null || index.latestItemIds.get(key) === item.id;
+  });
 
 const modelText = (item: TimelineItem): string => {
   if (item.status === 'started') return 'Model is working';
@@ -141,18 +159,18 @@ function TimelineIcon({ kind }: Readonly<{ kind: TimelineItem['kind'] }>) {
 
 function TimelineCard({
   item,
-  items,
   onSelect,
   runtimeUnavailable,
   selected,
+  toolPresentationIndex,
 }: Readonly<{
   item: TimelineItem;
-  items: readonly TimelineItem[];
   onSelect(item: TimelineItem): void;
   runtimeUnavailable: boolean;
   selected: boolean;
+  toolPresentationIndex: ToolPresentationIndex;
 }>) {
-  const tool = getToolPresentation(item, items);
+  const tool = getToolPresentation(item, toolPresentationIndex);
   const showLastKnownState =
     runtimeUnavailable && activeItemStatuses.has(item.status);
   const displayedStatus = showLastKnownState
@@ -283,8 +301,12 @@ export function Timeline({
   onSelect,
   runtimeUnavailable,
   selectedItemId,
+  toolPresentationIndex,
 }: TimelineProps) {
-  const visibleItems = displayItems(items);
+  const visibleItems = useMemo(
+    () => displayItems(items, toolPresentationIndex),
+    [items, toolPresentationIndex],
+  );
 
   return (
     <section
@@ -305,10 +327,10 @@ export function Timeline({
             <li key={item.id}>
               <TimelineCard
                 item={item}
-                items={items}
                 onSelect={onSelect}
                 runtimeUnavailable={runtimeUnavailable}
                 selected={selectedItemId === item.id}
+                toolPresentationIndex={toolPresentationIndex}
               />
             </li>
           ))}

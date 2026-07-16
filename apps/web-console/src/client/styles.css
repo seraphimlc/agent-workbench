@@ -341,12 +341,18 @@ textarea:disabled {
 
 .workspace-main {
   display: grid;
+  grid-template-areas:
+    "header"
+    "status"
+    "timeline"
+    "composer";
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-height: 0;
   overflow: hidden;
 }
 
 .session-header {
+  grid-area: header;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -484,6 +490,7 @@ textarea:disabled {
 }
 
 .runtime-status {
+  grid-area: status;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -525,6 +532,7 @@ textarea:disabled {
 }
 
 .timeline {
+  grid-area: timeline;
   min-width: 0;
   min-height: 0;
   overflow-x: hidden;
@@ -812,6 +820,7 @@ textarea:disabled {
 }
 
 .composer {
+  grid-area: composer;
   position: relative;
   z-index: 2;
   margin: 0;
