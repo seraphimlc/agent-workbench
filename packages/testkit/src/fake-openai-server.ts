@@ -16,6 +16,8 @@ export type FakeOpenAiScript = {
     readonly headers: Readonly<Record<string, string>>;
     readonly jsonBody?: unknown;
   };
+  readonly onRequestMatched?: () => void;
+  readonly onRequestAborted?: () => void;
   readonly response: {
     readonly status?: number;
     readonly headers?: Readonly<Record<string, string>>;
@@ -87,6 +89,12 @@ export const startFakeOpenAiServer = async (input: {
       return;
     }
     activeRequests += 1;
+    let requestAborted = false;
+    const handleResponseClose = (): void => {
+      if (response.writableEnded || requestAborted) return;
+      requestAborted = true;
+      script.onRequestAborted?.();
+    };
 
     try {
       const body = await readBody(request);
@@ -118,6 +126,8 @@ export const startFakeOpenAiServer = async (input: {
         throw new Error('Fake OpenAI Server request body was not expected');
       }
 
+      response.once('close', handleResponseClose);
+      script.onRequestMatched?.();
       response.writeHead(script.response.status ?? 200, script.response.headers ?? {});
       for (const chunk of script.response.chunks) {
         const scripted = chunk instanceof Uint8Array ? { bytes: chunk } : chunk;
@@ -135,6 +145,7 @@ export const startFakeOpenAiServer = async (input: {
       }
       response.end(error instanceof Error ? error.message : 'Fake OpenAI Server failed');
     } finally {
+      response.off('close', handleResponseClose);
       activeRequests -= 1;
       settleCompleted();
     }
