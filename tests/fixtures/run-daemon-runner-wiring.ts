@@ -1,10 +1,12 @@
 import { fileURLToPath } from 'node:url';
 
 import { runDaemon } from '../../services/daemon/src/index.js';
+import {
+  RUNNER_PRODUCTION_BOOTSTRAP_BASE64,
+  RUNNER_PRODUCTION_BOOTSTRAP_HEX,
+} from './runner-production-secrets.js';
 
 const providerApiKey = 'production-wiring-key';
-const toolResultHex = process.env.TEST_TOOL_RESULT_HEX;
-if (!toolResultHex) throw new Error('Tool result fixture value is required');
 
 let modelCallCount = 0;
 
@@ -52,7 +54,7 @@ await runDaemon({
     },
     toolHandlers: {
       'fs.read_text': async () => ({
-        content: `${providerApiKey}:${toolResultHex}:visible`,
+        content: `${providerApiKey}:${RUNNER_PRODUCTION_BOOTSTRAP_HEX}:${RUNNER_PRODUCTION_BOOTSTRAP_BASE64}:visible`,
       }),
     },
   },

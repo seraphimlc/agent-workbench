@@ -16,12 +16,17 @@ import {
   type TempRuntime,
 } from '../../packages/testkit/src/temp-runtime.js';
 import { openRuntimeDatabase } from '../../services/daemon/src/db/database.js';
+import {
+  RUNNER_PRODUCTION_BOOTSTRAP_BASE64,
+  RUNNER_PRODUCTION_BOOTSTRAP_HEX,
+  RUNNER_PRODUCTION_BOOTSTRAP_SECRET,
+} from '../fixtures/runner-production-secrets.js';
 
 const fixtureEntryPoint = fileURLToPath(
   new URL('../fixtures/run-daemon-runner-wiring.ts', import.meta.url),
 );
 const PROVIDER_API_KEY = 'production-wiring-key';
-const REDACTED_TOOL_CONTENT = '[REDACTED]:[REDACTED]:visible';
+const REDACTED_TOOL_CONTENT = '[REDACTED]:[REDACTED]:[REDACTED]:visible';
 
 const mutationRequest = (
   client: RpcClient,
@@ -58,16 +63,24 @@ describe('runDaemon Runner production wiring', () => {
 
   it('redacts bootstrap and Provider secrets through the real runDaemon Tool chain', async () => {
     runtime = createTempRuntime();
-    const bootstrapSecret = Buffer.alloc(32, 0x6d);
-    const bootstrapHex = bootstrapSecret.toString('hex');
     daemon = runtime.spawnDaemon({
       entryPoint: fixtureEntryPoint,
-      bootstrapSecret,
-      environment: { TEST_TOOL_RESULT_HEX: bootstrapHex },
+      bootstrapSecret: RUNNER_PRODUCTION_BOOTSTRAP_SECRET,
     });
+    const launchEnvironmentValues = Object.values(daemon.launchEnvironment).filter(
+      (value): value is string => typeof value === 'string',
+    );
+    expect(Object.hasOwn(daemon.launchEnvironment, 'TEST_TOOL_RESULT_HEX')).toBe(false);
+    expect(
+      launchEnvironmentValues.some(
+        (value) =>
+          value.includes(RUNNER_PRODUCTION_BOOTSTRAP_HEX) ||
+          value.includes(RUNNER_PRODUCTION_BOOTSTRAP_BASE64),
+      ),
+    ).toBe(false);
     await daemon.waitForReady();
     client = await connectRpcClient(runtime.socketPath);
-    const auth = await client.authenticate(bootstrapSecret);
+    const auth = await client.authenticate(RUNNER_PRODUCTION_BOOTSTRAP_SECRET);
     expect(auth.ok).toBe(true);
     const workspacePath = join(runtime.rootDir, 'workspace');
     mkdirSync(workspacePath);
@@ -133,11 +146,11 @@ describe('runDaemon Runner production wiring', () => {
           .all(created.turnId),
         messages: database.prepare('SELECT * FROM messages WHERE turn_id = ?').all(created.turnId),
       });
-      expect(persisted.includes(bootstrapHex)).toBe(false);
+      expect(persisted.includes(RUNNER_PRODUCTION_BOOTSTRAP_HEX)).toBe(false);
+      expect(persisted.includes(RUNNER_PRODUCTION_BOOTSTRAP_BASE64)).toBe(false);
       expect(persisted.includes(PROVIDER_API_KEY)).toBe(false);
     } finally {
       database.close();
-      bootstrapSecret.fill(0);
     }
   });
 });
