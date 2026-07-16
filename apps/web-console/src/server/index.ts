@@ -27,9 +27,11 @@ import {
 } from './daemon-rpc-client.js';
 import { createHttpApiHandler } from './http-api.js';
 import {
+  createCspNonce,
   createHttpSecurityHeaders,
   createRuntimeSecurity,
   injectCsrfMeta,
+  replaceCspNoncePlaceholder,
   type RuntimeSecurity,
   validateBrowserRequest,
 } from './http-security.js';
@@ -41,6 +43,7 @@ import {
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const indexHtmlPath = join(appRoot, 'index.html');
+const viteCspNoncePlaceholder = 'agent-workbench-csp-nonce-placeholder';
 
 type DaemonManagerLike = {
   start(options: DaemonProcessStartOptions): Promise<DaemonProcessHandle>;
@@ -68,9 +71,12 @@ export type WebConsoleServerDependencies = {
   readonly connectDaemonRpcClient: (
     socketPath: string,
   ) => Promise<RpcControllerClient>;
-  readonly createViteServer: (cspNonce: string) => Promise<ViteServerLike>;
+  readonly createViteServer: (
+    cspNoncePlaceholder: string,
+  ) => Promise<ViteServerLike>;
   readonly loadIndexHtml: () => Promise<string>;
   readonly createCsrfToken: () => string;
+  readonly createCspNonce: () => string;
   readonly sleep: (milliseconds: number) => Promise<void>;
   readonly writeReady: (line: string) => void;
 };
@@ -94,14 +100,14 @@ export type ShutdownSignalSource = {
 };
 
 const createDefaultViteServer = async (
-  cspNonce: string,
+  cspNoncePlaceholder: string,
 ): Promise<ViteServerLike> => {
   const vite = await import('vite');
   return await vite.createServer({
     root: appRoot,
     appType: 'custom',
     clearScreen: false,
-    html: { cspNonce },
+    html: { cspNonce: cspNoncePlaceholder },
     logLevel: 'silent',
     server: { middlewareMode: true, hmr: false },
   });
@@ -115,6 +121,7 @@ const defaultDependencies = (): WebConsoleServerDependencies => ({
   createViteServer: createDefaultViteServer,
   loadIndexHtml: async () => await readFile(indexHtmlPath, 'utf8'),
   createCsrfToken: () => randomBytes(32).toString('base64url'),
+  createCspNonce,
   sleep: async (milliseconds) =>
     await new Promise<void>((resolvePromise) => {
       setTimeout(resolvePromise, milliseconds);
@@ -238,10 +245,10 @@ const sendPublicError = (
 const sendHtml = (
   response: ServerResponse,
   html: string,
-  runtimeSecurity: RuntimeSecurity,
+  cspNonce: string,
 ): void => {
   response.writeHead(200, {
-    ...createHttpSecurityHeaders('html', runtimeSecurity),
+    ...createHttpSecurityHeaders('html', cspNonce),
     'content-type': 'text/html; charset=utf-8',
   });
   response.end(html);
@@ -252,6 +259,7 @@ const createBrowserHandler = (options: {
   readonly runtimeSecurity: RuntimeSecurity;
   readonly vite: ViteServerLike;
   readonly indexHtml: string;
+  readonly createCspNonce: () => string;
 }): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) =>
   async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
@@ -290,14 +298,20 @@ const createBrowserHandler = (options: {
     }
 
     if (url.pathname === '/' || url.pathname === '/index.html') {
+      const cspNonce = options.createCspNonce();
       const transformed = await options.vite.transformIndexHtml(
         url.pathname,
         options.indexHtml,
       );
+      const nonceScopedHtml = replaceCspNoncePlaceholder(
+        transformed,
+        viteCspNoncePlaceholder,
+        cspNonce,
+      );
       sendHtml(
         response,
-        injectCsrfMeta(transformed, options.runtimeSecurity),
-        options.runtimeSecurity,
+        injectCsrfMeta(nonceScopedHtml, options.runtimeSecurity),
+        cspNonce,
       );
       return;
     }
@@ -545,7 +559,7 @@ export const startWebConsoleServer = async (
       workspace,
     });
     vite = await raceWithAbort(
-      dependencies.createViteServer(runtimeSecurity.cspNonce),
+      dependencies.createViteServer(viteCspNoncePlaceholder),
       startupAbort.signal,
       async (lateVite) => await lateVite.close(),
     );
@@ -560,6 +574,7 @@ export const startWebConsoleServer = async (
       runtimeSecurity,
       vite,
       indexHtml,
+      createCspNonce: dependencies.createCspNonce,
     });
     const url = `http://127.0.0.1:${port}/`;
     assertStartupActive();

@@ -57,7 +57,7 @@ type ServerModule = {
         send(request: RpcRequest): Promise<unknown>;
         close(): Promise<void>;
       }>;
-      createViteServer(cspNonce: string): Promise<{
+      createViteServer(cspNoncePlaceholder: string): Promise<{
         middlewares(
           request: IncomingMessage,
           response: ServerResponse,
@@ -68,6 +68,7 @@ type ServerModule = {
       }>;
       loadIndexHtml(): Promise<string>;
       createCsrfToken(): string;
+      createCspNonce?(): string;
       sleep?(milliseconds: number): Promise<void>;
       writeReady(line: string): void;
     };
@@ -115,14 +116,21 @@ const within = async <Value>(
   ]);
 
 describe('web console server', () => {
-  it('starts in order, serves secured HTTP, prints one ready URL, and stops once', async () => {
+  it('starts in order, serves per-response HTML nonces, prints one ready URL, and stops once', async () => {
     const { startWebConsoleServer } = await loadServer();
     const lifecycle: string[] = [];
     const readyLines: string[] = [];
     const bootstrapSecret = Buffer.alloc(32, 7);
     let requestSequence = 0;
     let serverUrl = '';
-    let viteCspNonce = '';
+    let viteCspNoncePlaceholder = '';
+    const responseCspNonces = [
+      'response-nonce-1',
+      'response-nonce-2',
+      'response-nonce-3',
+      'response-nonce-4',
+    ];
+    let nextResponseCspNonce = 0;
     const server = await startWebConsoleServer({
       cwd: process.cwd(),
       environment,
@@ -194,9 +202,9 @@ describe('web console server', () => {
             },
           };
         },
-        createViteServer: async (cspNonce) => {
+        createViteServer: async (cspNoncePlaceholder) => {
           lifecycle.push('vite');
-          viteCspNonce = cspNonce ?? '';
+          viteCspNoncePlaceholder = cspNoncePlaceholder ?? '';
           return {
             middlewares: (request, response, next) => {
               if (request.url === '/asset.js') {
@@ -209,7 +217,7 @@ describe('web console server', () => {
             transformIndexHtml: async (_url, html) =>
               html.replace(
                 '<title>',
-                `<meta property="csp-nonce" nonce="${viteCspNonce}"><meta name="vite-test" content="ok"><title>`,
+                `<meta property="csp-nonce" nonce="${viteCspNoncePlaceholder}"><style nonce="${viteCspNoncePlaceholder}">body{display:grid}</style><meta name="vite-test" content="ok"><title>`,
               ),
             close: async () => {
               lifecycle.push('vite.close');
@@ -219,6 +227,12 @@ describe('web console server', () => {
         loadIndexHtml: async () =>
           '<!doctype html><html><head><title>Agent Workbench</title></head><body></body></html>',
         createCsrfToken: () => 'csrf-token',
+        createCspNonce: () => {
+          const cspNonce = responseCspNonces[nextResponseCspNonce];
+          nextResponseCspNonce += 1;
+          if (cspNonce === undefined) throw new Error('Unexpected HTML response');
+          return cspNonce;
+        },
         writeReady: (line) => {
           lifecycle.push('ready');
           readyLines.push(line);
@@ -251,19 +265,51 @@ describe('web console server', () => {
       workspace: { name: expect.any(String) },
     });
 
-    const html = await fetch(server.url);
-    const htmlBody = await html.text();
-    expect(html.status).toBe(200);
-    expect(html.headers.get('cache-control')).toBe('no-store');
-    expect(html.headers.get('content-security-policy')).toBe(
-      `default-src 'self'; connect-src 'self'; style-src 'self' 'nonce-${viteCspNonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'`,
+    expect(viteCspNoncePlaceholder).toBe(
+      'agent-workbench-csp-nonce-placeholder',
     );
-    expect(viteCspNonce).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(htmlBody).toContain('<meta name="agent-workbench-csrf" content="csrf-token">');
-    expect(htmlBody).toContain(
-      `<meta property="csp-nonce" nonce="${viteCspNonce}">`,
+    const readHtmlCspNonce = async (): Promise<string> => {
+      const html = await fetch(server.url);
+      const htmlBody = await html.text();
+      expect(html.status).toBe(200);
+      expect(html.headers.get('cache-control')).toBe('no-store');
+      const contentSecurityPolicy =
+        html.headers.get('content-security-policy') ?? '';
+      const cspNonce = /style-src 'self' 'nonce-([^']+)'/.exec(
+        contentSecurityPolicy,
+      )?.[1];
+      expect(cspNonce).toBeDefined();
+      expect(contentSecurityPolicy).toBe(
+        `default-src 'self'; connect-src 'self'; style-src 'self' 'nonce-${cspNonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'`,
+      );
+      expect(
+        [...htmlBody.matchAll(/\snonce="([^"]+)"/g)].map(
+          (match) => match[1],
+        ),
+      ).toEqual([cspNonce, cspNonce]);
+      expect(htmlBody).not.toContain(viteCspNoncePlaceholder);
+      expect(htmlBody).toContain(
+        '<meta name="agent-workbench-csrf" content="csrf-token">',
+      );
+      expect(htmlBody).toContain('<meta name="vite-test" content="ok">');
+      return cspNonce ?? '';
+    };
+
+    const repeatedCspNonces = [
+      await readHtmlCspNonce(),
+      await readHtmlCspNonce(),
+    ];
+    const concurrentCspNonces = await Promise.all([
+      readHtmlCspNonce(),
+      readHtmlCspNonce(),
+    ]);
+    expect(repeatedCspNonces).toEqual(responseCspNonces.slice(0, 2));
+    expect(new Set(concurrentCspNonces)).toEqual(
+      new Set(responseCspNonces.slice(2)),
     );
-    expect(htmlBody).toContain('<meta name="vite-test" content="ok">');
+    expect(
+      new Set([...repeatedCspNonces, ...concurrentCspNonces]),
+    ).toHaveProperty('size', 4);
 
     const asset = await fetch(`${server.url}asset.js`);
     expect(asset.status).toBe(200);

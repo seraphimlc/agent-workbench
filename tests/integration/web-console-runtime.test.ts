@@ -143,6 +143,23 @@ const cspNonceFrom = (contentSecurityPolicy: string | null): string => {
   return match[1];
 };
 
+const readSecuredHtml = async (
+  response: Response,
+): Promise<{ readonly html: string; readonly cspNonce: string }> => {
+  const html = await response.text();
+  expect(response.status).toBe(200);
+  const cspNonce = cspNonceFrom(
+    response.headers.get('content-security-policy'),
+  );
+  const htmlNonceValues = [
+    ...html.matchAll(/\snonce=(["'])([^"']+)\1/g),
+  ].map((match) => match[2]);
+  expect(htmlNonceValues.length).toBeGreaterThan(0);
+  expect(new Set(htmlNonceValues)).toEqual(new Set([cspNonce]));
+  expect(html).not.toContain('agent-workbench-csp-nonce-placeholder');
+  return { html, cspNonce };
+};
+
 describe('Web Console real execution lifecycle', () => {
   let rootDir: string | undefined;
   let provider: FakeOpenAiServer | undefined;
@@ -322,15 +339,21 @@ describe('Web Console real execution lifecycle', () => {
     });
 
     const origin = new URL(server.url).origin;
-    const htmlResponse = await fetch(server.url);
-    const html = await htmlResponse.text();
-    expect(htmlResponse.status).toBe(200);
-    const cspNonce = cspNonceFrom(
-      htmlResponse.headers.get('content-security-policy'),
+    const repeatedHtml = [
+      await readSecuredHtml(await fetch(server.url)),
+      await readSecuredHtml(await fetch(server.url)),
+    ];
+    const concurrentHtml = await Promise.all(
+      Array.from({ length: 8 }, async () =>
+        await readSecuredHtml(await fetch(server.url)),
+      ),
     );
-    expect(html).toContain(
-      `<meta property="csp-nonce" nonce="${cspNonce}">`,
+    const htmlResponses = [...repeatedHtml, ...concurrentHtml];
+    expect(new Set(htmlResponses.map(({ cspNonce }) => cspNonce))).toHaveProperty(
+      'size',
+      htmlResponses.length,
     );
+    const html = repeatedHtml[0]?.html ?? '';
     const csrfToken = csrfTokenFrom(html);
 
     const runtime = await readJson<unknown>(await fetch(`${origin}/api/runtime`));

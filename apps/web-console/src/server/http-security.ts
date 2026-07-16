@@ -7,7 +7,6 @@ const API_SECURITY_HEADERS = Object.freeze({
 export type RuntimeSecurity = {
   readonly port: number;
   readonly csrfToken: string;
-  readonly cspNonce: string;
 };
 
 export type BrowserRequestSecurityInput = {
@@ -76,16 +75,25 @@ const escapeHtmlAttribute = (value: string): string =>
     }
   });
 
+const readQuotedHtmlAttribute = (
+  tag: string,
+  attributeName: string,
+): string | undefined => {
+  const match = new RegExp(
+    `\\s${attributeName}\\s*=\\s*(["'])([^"']*)\\1`,
+    'i',
+  ).exec(tag);
+  return match?.[2];
+};
+
+export const createCspNonce = (): string =>
+  randomBytes(32).toString('base64url');
+
 export const createRuntimeSecurity = (
   port: number,
   csrfToken = randomBytes(32).toString('base64url'),
-  cspNonce = randomBytes(32).toString('base64url'),
 ): RuntimeSecurity => {
-  if (
-    !isValidPort(port) ||
-    csrfToken.length === 0 ||
-    !isValidCspNonce(cspNonce)
-  ) {
+  if (!isValidPort(port) || csrfToken.length === 0) {
     throw new Error('Invalid web console runtime security configuration');
   }
 
@@ -94,12 +102,6 @@ export const createRuntimeSecurity = (
     configurable: false,
     enumerable: false,
     value: csrfToken,
-    writable: false,
-  });
-  Object.defineProperty(runtimeSecurity, 'cspNonce', {
-    configurable: false,
-    enumerable: false,
-    value: cspNonce,
     writable: false,
   });
   return Object.freeze(runtimeSecurity);
@@ -148,24 +150,88 @@ export function createHttpSecurityHeaders(
 ): Readonly<Record<string, string>>;
 export function createHttpSecurityHeaders(
   kind: 'html',
-  runtimeSecurity: RuntimeSecurity,
+  cspNonce: string,
 ): Readonly<Record<string, string>>;
 export function createHttpSecurityHeaders(
   kind: 'api' | 'html',
-  runtimeSecurity?: RuntimeSecurity,
+  cspNonce?: string,
 ): Readonly<Record<string, string>> {
   if (kind === 'api') return API_SECURITY_HEADERS;
-  if (runtimeSecurity === undefined) {
-    throw new Error('HTML security headers require runtime security');
+  if (cspNonce === undefined || !isValidCspNonce(cspNonce)) {
+    throw new Error('Invalid web console runtime security configuration');
   }
   return Object.freeze({
     ...API_SECURITY_HEADERS,
     'content-security-policy':
       `default-src 'self'; connect-src 'self'; style-src 'self' ` +
-      `'nonce-${runtimeSecurity.cspNonce}'; img-src 'self' data:; ` +
+      `'nonce-${cspNonce}'; img-src 'self' data:; ` +
       `frame-ancestors 'none'; base-uri 'none'`,
   });
 }
+
+export const replaceCspNoncePlaceholder = (
+  html: string,
+  placeholder: string,
+  cspNonce: string,
+): string => {
+  const reject = (): never => {
+    throw new Error('Invalid Vite CSP nonce transformation');
+  };
+  if (
+    !isValidCspNonce(placeholder) ||
+    !isValidCspNonce(cspNonce) ||
+    placeholder === cspNonce ||
+    cspNonce.includes(placeholder)
+  ) {
+    return reject();
+  }
+
+  const cspNonceMetaTags = (html.match(/<meta\b[^>]*>/gi) ?? []).filter(
+    (tag) => readQuotedHtmlAttribute(tag, 'property') === 'csp-nonce',
+  );
+  if (
+    cspNonceMetaTags.length !== 1 ||
+    readQuotedHtmlAttribute(cspNonceMetaTags[0] ?? '', 'nonce') !== placeholder
+  ) {
+    return reject();
+  }
+
+  let nonceAttributeCount = 0;
+  let replacementCount = 0;
+  let unexpectedNonceAttribute = false;
+  const replaced = html.replace(/<[A-Za-z][^>]*>/g, (tag) => {
+    const nonceAssignmentCount = tag.match(/\snonce\s*=/gi)?.length ?? 0;
+    let parsedNonceAttributes = 0;
+    const replacedTag = tag.replace(
+      /\snonce\s*=\s*(["'])([^"']*)\1/gi,
+      (attribute, _quote: string, value: string) => {
+        parsedNonceAttributes += 1;
+        nonceAttributeCount += 1;
+        if (value !== placeholder) {
+          unexpectedNonceAttribute = true;
+          return attribute;
+        }
+        replacementCount += 1;
+        return attribute.replace(placeholder, cspNonce);
+      },
+    );
+    if (nonceAssignmentCount !== parsedNonceAttributes) {
+      unexpectedNonceAttribute = true;
+    }
+    return replacedTag;
+  });
+  const placeholderOccurrences = html.split(placeholder).length - 1;
+  if (
+    unexpectedNonceAttribute ||
+    replacementCount === 0 ||
+    replacementCount !== nonceAttributeCount ||
+    replacementCount !== placeholderOccurrences ||
+    replaced.includes(placeholder)
+  ) {
+    return reject();
+  }
+  return replaced;
+};
 
 export const injectCsrfMeta = (
   html: string,
