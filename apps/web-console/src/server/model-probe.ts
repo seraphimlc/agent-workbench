@@ -50,6 +50,7 @@ export type ProviderModelProbeOptions = {
   readonly adapter?: ProviderModelProbeAdapter;
   readonly requestTimeoutMs?: number;
   readonly totalTimeoutMs?: number;
+  readonly signal?: AbortSignal;
 };
 
 export class ProviderModelProbeError extends Error {
@@ -211,6 +212,9 @@ export const probeProviderModel = async (
     throw new ProviderModelProbeError();
   }
   const total = new AbortController();
+  const abortFromCaller = (): void => total.abort();
+  if (options.signal?.aborted) total.abort();
+  options.signal?.addEventListener('abort', abortFromCaller, { once: true });
   const totalTimer = setTimeout(() => total.abort(), totalTimeoutMs);
   const adapter =
     options.adapter ?? new OpenAiCompatibleAdapter({ timeoutMs: requestTimeoutMs });
@@ -236,5 +240,6 @@ export const probeProviderModel = async (
     throw new ProviderModelProbeError();
   } finally {
     clearTimeout(totalTimer);
+    options.signal?.removeEventListener('abort', abortFromCaller);
   }
 };

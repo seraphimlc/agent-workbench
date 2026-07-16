@@ -34,7 +34,7 @@ type ServerModule = {
         readonly baseUrl: string;
         readonly apiKey: string;
         readonly modelId: string | null;
-      }): Promise<string>;
+      }, options: { readonly signal: AbortSignal }): Promise<string>;
       createDaemonManager(): {
         start(options: unknown): Promise<{
           readonly pid: number;
@@ -99,6 +99,20 @@ const deferred = <Value>() => {
   });
   return { promise, resolve: resolvePromise };
 };
+
+const within = async <Value>(
+  operation: Promise<Value>,
+  milliseconds = 100,
+): Promise<Value> =>
+  await Promise.race([
+    operation,
+    new Promise<never>((_resolve, rejectPromise) => {
+      setTimeout(
+        () => rejectPromise(new Error('operation did not settle in time')),
+        milliseconds,
+      );
+    }),
+  ]);
 
 describe('web console server', () => {
   it('starts in order, serves secured HTTP, prints one ready URL, and stops once', async () => {
@@ -329,6 +343,227 @@ describe('web console server', () => {
     expect(lifecycle).toEqual(['rpc.close', 'daemon.close', 'vite.close']);
   });
 
+  it('aborts a never-resolving probe without waiting for startup settlement', async () => {
+    const { startWebConsoleServer } = await loadServer();
+    const signals = new EventEmitter();
+    const receivedSignal = deferred<AbortSignal>();
+    const readyLines: string[] = [];
+    const startup = startWebConsoleServer({
+      cwd: process.cwd(),
+      environment,
+      signalSource: signals,
+      dependencies: {
+        parseProviderConfig: () => ({
+          privateConfig: {
+            baseUrl: 'https://api.example.test/v1',
+            apiKey: 'provider-secret',
+            modelId: 'chat-model',
+          },
+          publicConfig: {
+            baseHost: 'api.example.test',
+            modelId: 'chat-model',
+          },
+        }),
+        probeProviderModel: async (_config, options) => {
+          receivedSignal.resolve(options.signal);
+          return await new Promise<never>(() => undefined);
+        },
+        createDaemonManager: () => ({
+          start: async () => {
+            throw new Error('daemon must not start');
+          },
+        }),
+        connectDaemonRpcClient: async () => {
+          throw new Error('RPC must not connect');
+        },
+        createViteServer: async () => {
+          throw new Error('Vite must not start');
+        },
+        loadIndexHtml: async () => {
+          throw new Error('HTML must not load');
+        },
+        createCsrfToken: () => 'csrf-token',
+        writeReady: (line) => readyLines.push(line),
+      },
+    });
+
+    const signal = await receivedSignal.promise;
+    signals.emit('SIGINT');
+
+    await expect(within(startup)).rejects.toMatchObject({
+      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+    });
+    expect(signal.aborted).toBe(true);
+    expect(readyLines).toEqual([]);
+  });
+
+  it('returns from stop before a late daemon resolves and reaps it on arrival', async () => {
+    const { startWebConsoleServer } = await loadServer();
+    const signals = new EventEmitter();
+    const daemonStarted = deferred<void>();
+    const lateDaemon = deferred<{
+      readonly pid: number;
+      readonly socketPath: string;
+      readonly bootstrapSecret: Buffer;
+      readonly failure: Promise<Error>;
+      stop(): Promise<void>;
+    }>();
+    const bootstrapSecret = Buffer.alloc(32, 8);
+    let daemonStops = 0;
+    const readyLines: string[] = [];
+    const startup = startWebConsoleServer({
+      cwd: process.cwd(),
+      environment,
+      signalSource: signals,
+      dependencies: {
+        parseProviderConfig: () => ({
+          privateConfig: {
+            baseUrl: 'https://api.example.test/v1',
+            apiKey: 'provider-secret',
+            modelId: 'chat-model',
+          },
+          publicConfig: {
+            baseHost: 'api.example.test',
+            modelId: 'chat-model',
+          },
+        }),
+        probeProviderModel: async () => 'chat-model',
+        createDaemonManager: () => ({
+          start: async () => {
+            daemonStarted.resolve();
+            return await lateDaemon.promise;
+          },
+        }),
+        connectDaemonRpcClient: async () => {
+          throw new Error('RPC must not connect');
+        },
+        createViteServer: async () => {
+          throw new Error('Vite must not start');
+        },
+        loadIndexHtml: async () => {
+          throw new Error('HTML must not load');
+        },
+        createCsrfToken: () => 'csrf-token',
+        writeReady: (line) => readyLines.push(line),
+      },
+    });
+
+    await daemonStarted.promise;
+    signals.emit('SIGTERM');
+    await expect(within(startup)).rejects.toMatchObject({
+      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+    });
+    expect(daemonStops).toBe(0);
+
+    lateDaemon.resolve({
+      pid: 4321,
+      socketPath: '/tmp/daemon.sock',
+      bootstrapSecret,
+      failure: pendingFailure(),
+      stop: async () => {
+        daemonStops += 1;
+      },
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+
+    expect(daemonStops).toBe(1);
+    expect(bootstrapSecret).toEqual(Buffer.alloc(32));
+    expect(readyLines).toEqual([]);
+  });
+
+  it('returns from stop before a late Vite resolves and closes it on arrival', async () => {
+    const { startWebConsoleServer } = await loadServer();
+    const signals = new EventEmitter();
+    const viteStarted = deferred<void>();
+    const lateVite = deferred<{
+      middlewares(
+        request: IncomingMessage,
+        response: ServerResponse,
+        next: (error?: unknown) => void,
+      ): void;
+      transformIndexHtml(url: string, html: string): Promise<string>;
+      close(): Promise<void>;
+    }>();
+    let daemonStops = 0;
+    let rpcCloses = 0;
+    let viteCloses = 0;
+    const readyLines: string[] = [];
+    const startup = startWebConsoleServer({
+      cwd: process.cwd(),
+      environment,
+      signalSource: signals,
+      dependencies: {
+        parseProviderConfig: () => ({
+          privateConfig: {
+            baseUrl: 'https://api.example.test/v1',
+            apiKey: 'provider-secret',
+            modelId: 'chat-model',
+          },
+          publicConfig: {
+            baseHost: 'api.example.test',
+            modelId: 'chat-model',
+          },
+        }),
+        probeProviderModel: async () => 'chat-model',
+        createDaemonManager: () => ({
+          start: async () => ({
+            pid: 4321,
+            socketPath: '/tmp/daemon.sock',
+            bootstrapSecret: Buffer.alloc(32, 3),
+            failure: pendingFailure(),
+            stop: async () => {
+              daemonStops += 1;
+            },
+          }),
+        }),
+        connectDaemonRpcClient: async () => ({
+          authenticate: async () => undefined,
+          createRequest: (method, payload) => ({
+            requestId: 'request-1',
+            method,
+            payload,
+          }),
+          send: async () => {
+            throw new Error('unused');
+          },
+          close: async () => {
+            rpcCloses += 1;
+          },
+        }),
+        createViteServer: async () => {
+          viteStarted.resolve();
+          return await lateVite.promise;
+        },
+        loadIndexHtml: async () => {
+          throw new Error('HTML must not load');
+        },
+        createCsrfToken: () => 'csrf-token',
+        writeReady: (line) => readyLines.push(line),
+      },
+    });
+
+    await viteStarted.promise;
+    signals.emit('SIGINT');
+    await expect(within(startup)).rejects.toMatchObject({
+      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+    });
+    expect(rpcCloses).toBe(1);
+    expect(daemonStops).toBe(1);
+    expect(viteCloses).toBe(0);
+
+    lateVite.resolve({
+      middlewares: (_request, _response, next) => next(),
+      transformIndexHtml: async (_url, html) => html,
+      close: async () => {
+        viteCloses += 1;
+      },
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+
+    expect(viteCloses).toBe(1);
+    expect(readyLines).toEqual([]);
+  });
+
   it('reaps partial resources when signaled before HTTP bind and emits no ready URL', async () => {
     const { startWebConsoleServer } = await loadServer();
     const signals = new EventEmitter();
@@ -472,7 +707,9 @@ describe('web console server', () => {
             },
             createRequest,
             send: async () => {
-              throw new Error('RPC connection closed');
+              throw Object.assign(new Error('RPC connection closed'), {
+                code: 'RPC_CONNECTION_CLOSED',
+              });
             },
             close: async () => undefined,
           };
@@ -523,9 +760,9 @@ describe('web console server', () => {
     });
 
     expect(readyLines).toHaveLength(1);
-    expect(connections).toBe(4);
+    expect(connections).toBe(7);
     expect(authentications).toBe(2);
-    expect(sleepCalls.length).toBeLessThanOrEqual(3);
+    expect(sleepCalls).toHaveLength(4);
     expect(sleepCalls.every((milliseconds) => milliseconds < 100)).toBe(true);
     await server.stop();
   });

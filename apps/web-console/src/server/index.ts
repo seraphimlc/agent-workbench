@@ -11,13 +11,6 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
-  RpcMethodSchema,
-  type RpcMethod,
-  type RpcRequestEnvelope,
-  type RpcResponse,
-} from '@agent-workbench/protocol';
-
 import { PublicErrorResponseSchema } from '../shared/contracts.js';
 import {
   parseProviderConfig,
@@ -31,15 +24,8 @@ import {
 } from './daemon-process.js';
 import {
   connectDaemonRpcClient,
-  type DaemonRpcClient,
-  type DaemonRpcRequestOptions,
 } from './daemon-rpc-client.js';
-import {
-  createHttpApiHandler,
-  type HttpApiRpc,
-  type HttpApiRpcCall,
-  HttpApiRpcUnavailableError,
-} from './http-api.js';
+import { createHttpApiHandler } from './http-api.js';
 import {
   createHttpSecurityHeaders,
   createRuntimeSecurity,
@@ -48,16 +34,13 @@ import {
   validateBrowserRequest,
 } from './http-security.js';
 import { probeProviderModel } from './model-probe.js';
+import {
+  RpcController,
+  type RpcControllerClient,
+} from './rpc-controller.js';
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const indexHtmlPath = join(appRoot, 'index.html');
-const MAX_RPC_RECONNECT_ATTEMPTS = 3;
-const RPC_RECONNECT_DELAY_MS = 25;
-
-type RpcClientLike = Pick<
-  DaemonRpcClient,
-  'authenticate' | 'createRequest' | 'send' | 'close'
->;
 
 type DaemonManagerLike = {
   start(options: DaemonProcessStartOptions): Promise<DaemonProcessHandle>;
@@ -73,21 +56,18 @@ type ViteServerLike = {
   close(): Promise<void>;
 };
 
-type ReconnectableRpc = HttpApiRpc & {
-  close(): Promise<void>;
-};
-
 export type WebConsoleServerDependencies = {
   readonly parseProviderConfig: (
     environment: Readonly<Record<string, string | undefined>>,
   ) => ParsedProviderConfig;
   readonly probeProviderModel: (
     config: ProviderPrivateConfig,
+    options: { readonly signal: AbortSignal },
   ) => Promise<string>;
   readonly createDaemonManager: () => DaemonManagerLike;
   readonly connectDaemonRpcClient: (
     socketPath: string,
-  ) => Promise<RpcClientLike>;
+  ) => Promise<RpcControllerClient>;
   readonly createViteServer: () => Promise<ViteServerLike>;
   readonly loadIndexHtml: () => Promise<string>;
   readonly createCsrfToken: () => string;
@@ -141,6 +121,54 @@ const defaultDependencies = (): WebConsoleServerDependencies => ({
   },
 });
 
+const startupCanceledError = (): Error & { readonly code: string } =>
+  Object.assign(new Error('Web console startup was canceled'), {
+    code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+  });
+
+const disposeLate = <Value>(
+  operation: Promise<Value>,
+  dispose: ((value: Value) => void | Promise<void>) | undefined,
+): void => {
+  void operation.then(
+    async (value) => {
+      await Promise.resolve(dispose?.(value)).catch(() => undefined);
+    },
+    () => undefined,
+  );
+};
+
+const raceWithAbort = async <Value>(
+  operation: Promise<Value>,
+  signal: AbortSignal,
+  dispose: ((value: Value) => void | Promise<void>) | undefined = undefined,
+): Promise<Value> => {
+  if (signal.aborted) {
+    disposeLate(operation, dispose);
+    throw startupCanceledError();
+  }
+
+  return await new Promise<Value>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const finish = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', handleAbort);
+      action();
+    };
+    const handleAbort = (): void =>
+      finish(() => {
+        disposeLate(operation, dispose);
+        rejectPromise(startupCanceledError());
+      });
+    signal.addEventListener('abort', handleAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolvePromise(value)),
+      (error: unknown) => finish(() => rejectPromise(error)),
+    );
+  });
+};
+
 const resolveWorkspace = (
   cwd: string,
   environment: Readonly<Record<string, string | undefined>>,
@@ -163,103 +191,6 @@ const dataDirectoryForWorkspace = (workspacePath: string): string => {
   return join(tmpdir(), 'agent-workbench-preview', workspaceHash);
 };
 
-const requestOptions = (input: HttpApiRpcCall): DaemonRpcRequestOptions => ({
-  ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
-  ...(input.clientRequestId === undefined
-    ? {}
-    : { clientRequestId: input.clientRequestId }),
-});
-
-const createReconnectableRpc = (options: {
-  readonly initialClient: RpcClientLike;
-  readonly connect: (socketPath: string) => Promise<RpcClientLike>;
-  readonly socketPath: string;
-  readonly authenticationSecret: Buffer;
-  readonly sleep: (milliseconds: number) => Promise<void>;
-}): ReconnectableRpc => {
-  let client: RpcClientLike | undefined = options.initialClient;
-  let reconnectPromise: Promise<void> | undefined;
-  let closePromise: Promise<void> | undefined;
-  let closed = false;
-
-  const closeClient = async (candidate: RpcClientLike | undefined) => {
-    if (candidate === undefined) return;
-    await candidate.close().catch(() => undefined);
-  };
-  const call = async (input: HttpApiRpcCall) => {
-    const currentClient = client;
-    if (closed || currentClient === undefined) {
-      throw new HttpApiRpcUnavailableError();
-    }
-    try {
-      const method: RpcMethod = RpcMethodSchema.parse(input.method);
-      const request: RpcRequestEnvelope = currentClient.createRequest(
-        method,
-        input.payload,
-        requestOptions(input),
-      );
-      const response: RpcResponse = await currentClient.send(request);
-      return response.ok
-        ? { ok: true as const, result: response.result }
-        : { ok: false as const, error: response.error };
-    } catch {
-      if (client === currentClient) client = undefined;
-      await closeClient(currentClient);
-      throw new HttpApiRpcUnavailableError();
-    }
-  };
-  const performReconnect = async (): Promise<void> => {
-    const previousClient = client;
-    client = undefined;
-    await closeClient(previousClient);
-    for (let attempt = 0; attempt < MAX_RPC_RECONNECT_ATTEMPTS; attempt += 1) {
-      if (attempt > 0) await options.sleep(RPC_RECONNECT_DELAY_MS);
-      let candidate: RpcClientLike | undefined;
-      try {
-        candidate = await options.connect(options.socketPath);
-        await candidate.authenticate(options.authenticationSecret);
-        if (closed) {
-          await closeClient(candidate);
-          throw new HttpApiRpcUnavailableError();
-        }
-        client = candidate;
-        return;
-      } catch {
-        await closeClient(candidate);
-      }
-    }
-    throw new HttpApiRpcUnavailableError();
-  };
-  const reconnect = async (): Promise<void> => {
-    if (closed) throw new HttpApiRpcUnavailableError();
-    if (reconnectPromise === undefined) {
-      const operation = performReconnect();
-      reconnectPromise = operation;
-      void operation.then(
-        () => {
-          if (reconnectPromise === operation) reconnectPromise = undefined;
-        },
-        () => {
-          if (reconnectPromise === operation) reconnectPromise = undefined;
-        },
-      );
-    }
-    await reconnectPromise;
-  };
-  const close = async (): Promise<void> => {
-    closePromise ??= (async () => {
-      closed = true;
-      await reconnectPromise?.catch(() => undefined);
-      const currentClient = client;
-      client = undefined;
-      await closeClient(currentClient);
-      options.authenticationSecret.fill(0);
-    })();
-    await closePromise;
-  };
-
-  return { call, reconnect, close };
-};
 
 const headerValue = (
   value: string | readonly string[] | undefined,
@@ -424,9 +355,10 @@ export const startWebConsoleServer = async (
   const dependencies = { ...defaultDependencies(), ...options.dependencies };
   const environment = options.environment ?? process.env;
   const cwd = options.cwd ?? process.cwd();
+  const startupAbort = new AbortController();
   let daemon: DaemonProcessHandle | undefined;
-  let rpcClient: RpcClientLike | undefined;
-  let rpcController: ReconnectableRpc | undefined;
+  let rpcClient: RpcControllerClient | undefined;
+  let rpcController: RpcController | undefined;
   let rpcAuthenticationSecret: Buffer | undefined;
   let http: Server | undefined;
   let vite: ViteServerLike | undefined;
@@ -488,15 +420,14 @@ export const startWebConsoleServer = async (
   };
   const stop = async (): Promise<void> => {
     shutdownRequested = true;
+    startupAbort.abort();
     await startupSettled;
     cleanupPromise ??= cleanup().finally(detachSignals);
     await cleanupPromise;
   };
   const assertStartupActive = (): void => {
-    if (!shutdownRequested) return;
-    throw Object.assign(new Error('Web console startup was canceled'), {
-      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
-    });
+    if (!startupAbort.signal.aborted) return;
+    throw startupCanceledError();
   };
   detachSignals = attachShutdownSignals(
     { stop },
@@ -511,28 +442,47 @@ export const startWebConsoleServer = async (
     const provider = dependencies.parseProviderConfig(environment);
     const workspace = resolveWorkspace(cwd, environment);
     assertStartupActive();
-    const modelId = await dependencies.probeProviderModel(provider.privateConfig);
+    const modelId = await raceWithAbort(
+      dependencies.probeProviderModel(provider.privateConfig, {
+        signal: startupAbort.signal,
+      }),
+      startupAbort.signal,
+    );
     assertStartupActive();
-    daemon = await dependencies.createDaemonManager().start({
-      dataDir: dataDirectoryForWorkspace(workspace.path),
-      workspacePath: workspace.path,
-      provider: {
-        baseUrl: provider.privateConfig.baseUrl,
-        apiKey: provider.privateConfig.apiKey,
-        modelId,
+    daemon = await raceWithAbort(
+      dependencies.createDaemonManager().start({
+        dataDir: dataDirectoryForWorkspace(workspace.path),
+        workspacePath: workspace.path,
+        provider: {
+          baseUrl: provider.privateConfig.baseUrl,
+          apiKey: provider.privateConfig.apiKey,
+          modelId,
+        },
+      }),
+      startupAbort.signal,
+      async (lateDaemon) => {
+        lateDaemon.bootstrapSecret.fill(0);
+        await lateDaemon.stop();
       },
-    });
+    );
     assertStartupActive();
     rpcAuthenticationSecret = Buffer.from(daemon.bootstrapSecret);
-    rpcClient = await dependencies.connectDaemonRpcClient(daemon.socketPath);
+    rpcClient = await raceWithAbort(
+      dependencies.connectDaemonRpcClient(daemon.socketPath),
+      startupAbort.signal,
+      async (lateClient) => await lateClient.close(),
+    );
     assertStartupActive();
     try {
-      await rpcClient.authenticate(rpcAuthenticationSecret);
+      await raceWithAbort(
+        rpcClient.authenticate(rpcAuthenticationSecret),
+        startupAbort.signal,
+      );
     } finally {
       zeroBootstrapSecret();
     }
     assertStartupActive();
-    rpcController = createReconnectableRpc({
+    rpcController = new RpcController({
       initialClient: rpcClient,
       connect: dependencies.connectDaemonRpcClient,
       socketPath: daemon.socketPath,
@@ -567,7 +517,11 @@ export const startWebConsoleServer = async (
         );
       });
     });
-    const port = await listenOnLoopback(http);
+    const port = await raceWithAbort(
+      listenOnLoopback(http),
+      startupAbort.signal,
+      async () => await closeHttpServer(http!),
+    );
     assertStartupActive();
     const runtimeSecurity = createRuntimeSecurity(
       port,
@@ -582,9 +536,16 @@ export const startWebConsoleServer = async (
       },
       workspace,
     });
-    vite = await dependencies.createViteServer();
+    vite = await raceWithAbort(
+      dependencies.createViteServer(),
+      startupAbort.signal,
+      async (lateVite) => await lateVite.close(),
+    );
     assertStartupActive();
-    const indexHtml = await dependencies.loadIndexHtml();
+    const indexHtml = await raceWithAbort(
+      dependencies.loadIndexHtml(),
+      startupAbort.signal,
+    );
     assertStartupActive();
     activeHandler = createBrowserHandler({
       api,
@@ -599,9 +560,7 @@ export const startWebConsoleServer = async (
   } catch (error) {
     zeroBootstrapSecret();
     startupFailure = shutdownRequested
-      ? Object.assign(new Error('Web console startup was canceled'), {
-          code: 'WEB_CONSOLE_STARTUP_CANCELLED',
-        })
+      ? startupCanceledError()
       : error;
   } finally {
     resolveStartupSettled();

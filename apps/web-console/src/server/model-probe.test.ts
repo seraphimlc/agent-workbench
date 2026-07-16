@@ -33,6 +33,7 @@ type ModelProbeModule = {
       };
       readonly requestTimeoutMs?: number;
       readonly totalTimeoutMs?: number;
+      readonly signal?: AbortSignal;
     },
   ): Promise<string>;
 };
@@ -223,6 +224,30 @@ afterEach(() => {
 });
 
 describe('probeProviderModel', () => {
+  it('aborts promptly when the caller signal is canceled', async () => {
+    const { probeProviderModel } = await loadProbe();
+    const controller = new AbortController();
+    const operation = expectProbeFailure(
+      probeProviderModel(providerConfig('https://provider.example.test', 'slow'), {
+        adapter: { call: async () => await new Promise<never>(() => undefined) },
+        requestTimeoutMs: 10_000,
+        totalTimeoutMs: 10_000,
+        signal: controller.signal,
+      }),
+    );
+
+    controller.abort();
+
+    await expect(
+      Promise.race([
+        operation,
+        new Promise<never>((_resolve, rejectPromise) => {
+          setTimeout(() => rejectPromise(new Error('probe abort timed out')), 100);
+        }),
+      ]),
+    ).resolves.toMatchObject({ code: 'PROVIDER_MODEL_PROBE_FAILED' });
+  });
+
   it('uses an explicit model as the only candidate but still runs chat and Tool probes', async () => {
     const { probeProviderModel } = await loadProbe();
     const { startFakeOpenAiServer } = await loadFakeServer();

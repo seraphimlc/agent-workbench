@@ -40,7 +40,6 @@ export type HttpApiRpcReply =
 
 export interface HttpApiRpc {
   call(input: HttpApiRpcCall): Promise<HttpApiRpcReply>;
-  reconnect?(): Promise<void>;
 }
 
 export class HttpApiRpcUnavailableError extends Error {
@@ -340,18 +339,6 @@ const readRuntimeHealth = async (options: HttpApiHandlerOptions) =>
     await callRpc(options.rpc, { method: 'app.health', payload: {} }),
   );
 
-const recoverRuntimeHealth = async (
-  options: HttpApiHandlerOptions,
-): Promise<ReturnType<typeof AppHealthResultSchema.parse> | null> => {
-  if (options.rpc.reconnect === undefined) return null;
-  try {
-    await options.rpc.reconnect();
-    return await readRuntimeHealth(options);
-  } catch {
-    return null;
-  }
-};
-
 export const createHttpApiHandler = (
   options: HttpApiHandlerOptions,
 ): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) => {
@@ -401,19 +388,6 @@ export const createHttpApiHandler = (
           }),
         );
       } catch {
-        const recoveredHealth = await recoverRuntimeHealth(options);
-        if (recoveredHealth !== null) {
-          sendJson(
-            response,
-            200,
-            RuntimePublicInfoSchema.parse({
-              daemon: recoveredHealth,
-              provider: options.provider,
-              workspace: { name: options.workspace.name },
-            }),
-          );
-          return;
-        }
         sendJson(response, 200, unavailableRuntime(options));
       }
       return;

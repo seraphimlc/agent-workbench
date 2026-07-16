@@ -322,7 +322,7 @@ describe('web console HTTP API', () => {
         ok: false,
         error: {
           code: 'PRIVATE_VALIDATION_FAILURE',
-          category: 'validation',
+          category: 'internal',
           message:
             'apiKey=provider-secret socketPath=/tmp/private.sock path=/private/workspace',
           retryable: false,
@@ -338,11 +338,11 @@ describe('web console HTTP API', () => {
     );
     const body = await response.json();
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(500);
     expect(body).toEqual({
       error: {
-        code: 'INVALID_REQUEST',
-        message: 'Request was rejected',
+        code: 'INTERNAL',
+        message: 'Request failed',
         retryable: false,
         userAction: null,
       },
@@ -501,7 +501,7 @@ describe('web console HTTP API', () => {
     expect(calls).toEqual([]);
   });
 
-  it('returns a fresh unavailable runtime after reconnect is exhausted', async () => {
+  it('returns a fresh unavailable runtime without coordinating reconnect itself', async () => {
     let reconnects = 0;
     const api = await startApi({
       call: async () => {
@@ -521,6 +521,6 @@ describe('web console HTTP API', () => {
       provider: { baseHost: 'api.example.test', modelId: 'chat-model' },
       workspace: { name: 'agent-workbench' },
     });
-    expect(reconnects).toBe(1);
+    expect(reconnects).toBe(0);
   });
 });
