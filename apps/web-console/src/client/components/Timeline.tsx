@@ -12,8 +12,15 @@ export type ToolPresentation = Readonly<{
 type TimelineProps = Readonly<{
   items: readonly TimelineItem[];
   onSelect(item: TimelineItem): void;
+  runtimeUnavailable: boolean;
   selectedItemId: string | null;
 }>;
+
+const activeItemStatuses = new Set<TimelineItem['status']>([
+  'queued',
+  'started',
+  'streaming',
+]);
 
 const eventPayload = (
   item: TimelineItem,
@@ -136,18 +143,25 @@ function TimelineCard({
   item,
   items,
   onSelect,
+  runtimeUnavailable,
   selected,
 }: Readonly<{
   item: TimelineItem;
   items: readonly TimelineItem[];
   onSelect(item: TimelineItem): void;
+  runtimeUnavailable: boolean;
   selected: boolean;
 }>) {
   const tool = getToolPresentation(item, items);
+  const showLastKnownState =
+    runtimeUnavailable && activeItemStatuses.has(item.status);
+  const displayedStatus = showLastKnownState
+    ? 'Connection unavailable'
+    : item.status;
   const label =
     tool === null
-      ? `${item.title} ${item.status}`
-      : `Tool ${tool.toolId} ${tool.status}`;
+      ? `${showLastKnownState ? 'Last known state' : item.title} ${displayedStatus}`
+      : `Tool ${tool.toolId} ${displayedStatus}`;
 
   return (
     <button
@@ -156,15 +170,25 @@ function TimelineCard({
       aria-label={label}
       aria-pressed={selected}
       data-kind={item.kind}
-      data-status={item.status}
+      data-status={showLastKnownState ? 'unavailable' : item.status}
       onClick={() => onSelect(item)}
     >
       {item.kind === 'message' ? (
         <>
           <span className="timeline-card-heading">
             <TimelineIcon kind={item.kind} />
-            <strong>{item.role === 'user' ? 'You' : 'Assistant'}</strong>
-            <time dateTime={item.createdAt}>{item.createdAt}</time>
+            <strong>
+              {showLastKnownState
+                ? 'Last known state'
+                : item.role === 'user'
+                  ? 'You'
+                  : 'Assistant'}
+            </strong>
+            {showLastKnownState ? (
+              <span className="status-chip">Connection unavailable</span>
+            ) : (
+              <time dateTime={item.createdAt}>{item.createdAt}</time>
+            )}
           </span>
           <span className="timeline-card-copy">{item.summary}</span>
         </>
@@ -174,8 +198,8 @@ function TimelineCard({
         <>
           <span className="timeline-card-heading">
             <TimelineIcon kind={item.kind} />
-            <strong>{modelText(item)}</strong>
-            <span className="status-chip">{item.status}</span>
+            <strong>{showLastKnownState ? 'Last known state' : modelText(item)}</strong>
+            <span className="status-chip">{displayedStatus}</span>
           </span>
           {item.summary === null ? null : (
             <code className="timeline-card-code">{item.summary}</code>
@@ -188,8 +212,11 @@ function TimelineCard({
           <span className="timeline-card-heading">
             <TimelineIcon kind={item.kind} />
             <strong>{tool.toolId}</strong>
-            <span className="status-chip">{tool.status}</span>
+            <span className="status-chip">{displayedStatus}</span>
           </span>
+          {showLastKnownState ? (
+            <span className="timeline-card-copy">Last known state</span>
+          ) : null}
           {tool.inputSummary === null ? null : (
             <span className="timeline-detail-row">
               <span>Input</span>
@@ -215,8 +242,8 @@ function TimelineCard({
         <>
           <span className="timeline-card-heading">
             <TimelineIcon kind={item.kind} />
-            <strong>{item.title}</strong>
-            <span className="status-chip">{item.status}</span>
+            <strong>{showLastKnownState ? 'Last known state' : item.title}</strong>
+            <span className="status-chip">{displayedStatus}</span>
           </span>
           {item.summary === null ? null :
             item.status === 'failed' ? (
@@ -251,7 +278,12 @@ function TimelineCard({
   );
 }
 
-export function Timeline({ items, onSelect, selectedItemId }: TimelineProps) {
+export function Timeline({
+  items,
+  onSelect,
+  runtimeUnavailable,
+  selectedItemId,
+}: TimelineProps) {
   const visibleItems = displayItems(items);
 
   return (
@@ -259,7 +291,7 @@ export function Timeline({ items, onSelect, selectedItemId }: TimelineProps) {
       className="timeline"
       aria-label="Session timeline"
       aria-atomic="false"
-      aria-live="polite"
+      aria-live={runtimeUnavailable ? 'off' : 'polite'}
       aria-relevant="additions text"
     >
       {visibleItems.length === 0 ? (
@@ -275,6 +307,7 @@ export function Timeline({ items, onSelect, selectedItemId }: TimelineProps) {
                 item={item}
                 items={items}
                 onSelect={onSelect}
+                runtimeUnavailable={runtimeUnavailable}
                 selected={selectedItemId === item.id}
               />
             </li>

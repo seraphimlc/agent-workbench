@@ -26,7 +26,11 @@ export function Inspector({
   const panelRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    if (open && presentation === 'drawer') panelRef.current?.focus();
+    if (!open || presentation !== 'drawer') return;
+    const firstFocusable = panelRef.current?.querySelector<HTMLElement>(
+      'button:not([disabled]), [href], textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    (firstFocusable ?? panelRef.current)?.focus();
   }, [open, presentation]);
 
   if (!open) return null;
@@ -47,22 +51,34 @@ export function Inspector({
     if (!focusable || focusable.length === 0) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
+    const activeElement = document.activeElement;
+    if (
+      event.shiftKey &&
+      (activeElement === first || activeElement === panelRef.current)
+    ) {
       event.preventDefault();
       last?.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
+    } else if (
+      !event.shiftKey &&
+      (activeElement === last || activeElement === panelRef.current)
+    ) {
       event.preventDefault();
       first?.focus();
+    } else if (
+      activeElement instanceof Node &&
+      !panelRef.current?.contains(activeElement)
+    ) {
+      event.preventDefault();
+      (event.shiftKey ? last : first)?.focus();
     }
   };
 
   return (
     <>
       {drawer ? (
-        <button
-          type="button"
+        <div
           className="inspector-backdrop"
-          aria-label="Close inspector drawer"
+          aria-hidden="true"
           onClick={onClose}
         />
       ) : null}

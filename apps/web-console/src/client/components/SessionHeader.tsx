@@ -6,6 +6,7 @@ type SessionHeaderProps = Readonly<{
   modelId: string;
   onToggleInspector(): void;
   session: SessionRow | null;
+  statusOverride: 'Unavailable' | null;
   workspaceName: string;
 }>;
 
@@ -18,8 +19,16 @@ export function SessionHeader({
   modelId,
   onToggleInspector,
   session,
+  statusOverride,
   workspaceName,
 }: SessionHeaderProps) {
+  const displayedStatus =
+    statusOverride ??
+    (session === null ? 'Ready' : statusLabel(session.runtimeStatus));
+  const statusData = statusOverride === null
+    ? (session?.runtimeStatus ?? 'idle')
+    : 'unavailable';
+
   return (
     <header className="session-header">
       <div>
@@ -39,10 +48,10 @@ export function SessionHeader({
           <li>Full Access</li>
           <li
             className="session-status-pill"
-            data-status={session?.runtimeStatus ?? 'idle'}
+            data-status={statusData}
           >
             <span aria-hidden="true" />
-            {session === null ? 'Ready' : statusLabel(session.runtimeStatus)}
+            {displayedStatus}
           </li>
         </ul>
         {compactInspector ? (

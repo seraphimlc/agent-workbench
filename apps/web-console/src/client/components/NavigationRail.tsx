@@ -5,6 +5,7 @@ type NavigationRailProps = Readonly<{
   newTaskDisabled: boolean;
   onNewTask(): void;
   session: SessionRow | null;
+  sessionStatusOverride: 'disconnected' | null;
   workspaceName: string;
 }>;
 
@@ -13,6 +14,7 @@ export function NavigationRail({
   newTaskDisabled,
   onNewTask,
   session,
+  sessionStatusOverride,
   workspaceName,
 }: NavigationRailProps) {
   return (
@@ -60,8 +62,9 @@ export function NavigationRail({
           {session === null ? 'No active session' : `Current: ${session.title}`}
         </p>
         {session === null ? null : (
-          <small data-status={session.runtimeStatus}>
-            Status: {session.runtimeStatus.replaceAll('_', ' ')}
+          <small data-status={sessionStatusOverride ?? session.runtimeStatus}>
+            Status:{' '}
+            {sessionStatusOverride ?? session.runtimeStatus.replaceAll('_', ' ')}
           </small>
         )}
       </section>

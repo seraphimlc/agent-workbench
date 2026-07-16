@@ -1,5 +1,6 @@
 import type { SessionRuntimeStatus, SessionSnapshot } from '@agent-workbench/protocol';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ZodError } from 'zod';
 
 import {
   ApiPublicError,
@@ -105,9 +106,11 @@ const errorDetails = (
   };
 };
 
-const isSequenceFailure = (error: unknown): boolean =>
+const isIncrementalResponseInvalid = (error: unknown): boolean =>
   error instanceof EventSequenceGapError ||
-  error instanceof EventSequenceConflictError;
+  error instanceof EventSequenceConflictError ||
+  error instanceof SyntaxError ||
+  error instanceof ZodError;
 
 const readStoredSessionId = (storage: Storage): string | null => {
   try {
@@ -270,14 +273,14 @@ export function App({
           afterSeq: currentEvents.cursor,
           limit: 100,
         } as const;
-        const page = await api.getEvents(request);
-        if (canceled) return;
-
+        let page: Awaited<ReturnType<ApiClient['getEvents']>>;
         let nextEvents: EventPageState;
         try {
+          page = await api.getEvents(request);
+          if (canceled) return;
           nextEvents = applyEventPage(currentEvents, request, page);
         } catch (error) {
-          if (!isSequenceFailure(error)) throw error;
+          if (!isIncrementalResponseInvalid(error)) throw error;
           const resyncedSnapshot = await api.getSnapshot(sessionId);
           if (canceled) return;
           adoptSnapshot(resyncedSnapshot);
@@ -446,8 +449,8 @@ export function App({
     );
   }
 
-  const runtimeUnavailable = bootstrap.runtime.daemon.status !== 'ready';
-  const liveUnavailable = runtimeUnavailable || pollError !== null;
+  const daemonUnavailable = bootstrap.runtime.daemon.status !== 'ready';
+  const runtimeUnavailable = daemonUnavailable || pollError !== null;
   const compactInspector = viewportWidth < 1_100;
   const inspectorPresentation =
     viewportWidth < 820
@@ -466,6 +469,7 @@ export function App({
         newTaskDisabled={mutationPending}
         onNewTask={startNewTask}
         session={snapshot?.session ?? null}
+        sessionStatusOverride={runtimeUnavailable ? 'disconnected' : null}
         workspaceName={bootstrap.runtime.workspace.name}
       />
 
@@ -476,10 +480,11 @@ export function App({
           modelId={bootstrap.runtime.provider.modelId}
           onToggleInspector={() => setInspectorOpen((value) => !value)}
           session={snapshot?.session ?? null}
+          statusOverride={runtimeUnavailable ? 'Unavailable' : null}
           workspaceName={bootstrap.runtime.workspace.name}
         />
 
-        {liveUnavailable ? (
+        {runtimeUnavailable ? (
           <div
             className="runtime-status"
             role="status"
@@ -487,16 +492,16 @@ export function App({
             aria-live="polite"
           >
             <strong>
-              {runtimeUnavailable
+              {daemonUnavailable
                 ? 'Runtime unavailable'
                 : 'Live updates unavailable'}
             </strong>
             <span>
-              {runtimeUnavailable
+              {daemonUnavailable
                 ? 'The local daemon is not ready.'
                 : pollError}
             </span>
-            {runtimeUnavailable ? (
+            {daemonUnavailable ? (
               <button
                 type="button"
                 onClick={() => setBootstrapAttempt((value) => value + 1)}
@@ -510,11 +515,12 @@ export function App({
         <Timeline
           items={timeline}
           onSelect={selectTimelineItem}
+          runtimeUnavailable={runtimeUnavailable}
           selectedItemId={selectedItemId}
         />
 
         <Composer
-          disabled={liveUnavailable}
+          disabled={runtimeUnavailable}
           error={mutationFailure}
           hasSession={snapshot !== null}
           onRetry={() => void retryMutation()}

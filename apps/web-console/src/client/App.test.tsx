@@ -1,21 +1,24 @@
 // @vitest-environment jsdom
 
-import type {
-  MessageRow,
-  RendererSessionEventEnvelope,
-  SessionRuntimeStatus,
-  SessionSnapshot,
-  TurnRow,
-  TurnStatus,
+import {
+  EventListAfterResultSchema,
+  type MessageRow,
+  type RendererSessionEventEnvelope,
+  type SessionRuntimeStatus,
+  type SessionSnapshot,
+  type TurnRow,
+  type TurnStatus,
 } from '@agent-workbench/protocol';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -540,6 +543,133 @@ describe('professional web workbench', () => {
     expect(getSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it('resyncs malformed event responses and continues polling from the authoritative Snapshot', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const firstSnapshot = snapshot({
+      events: [event(1, 'turn.queued', { payload: { ordinal: 1 } })],
+      messages: [message('user', 'Read README.md')],
+      runtimeStatus: 'running',
+      turns: [turn('running')],
+    });
+    const resyncedSnapshot = snapshot({
+      events: [
+        event(1, 'turn.queued', { payload: { ordinal: 1 } }),
+        event(2, 'model.started', {
+          actor: 'model',
+          payload: { modelCallId: 'model-call-1' },
+        }),
+      ],
+      messages: [message('user', 'Read README.md')],
+      runtimeStatus: 'running',
+      turns: [turn('running')],
+    });
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockResolvedValueOnce(firstSnapshot)
+      .mockResolvedValueOnce(resyncedSnapshot);
+    const getEvents = vi
+      .fn<ApiClient['getEvents']>()
+      .mockImplementationOnce(async () =>
+        EventListAfterResultSchema.parse({
+          events: 'not-an-event-list',
+          highWaterSeq: 1,
+        }),
+      )
+      .mockImplementationOnce(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({ getEvents, getSnapshot })}
+        pollIntervals={fastPolling}
+      />,
+    );
+
+    expect(await screen.findByText('Model is working')).toBeTruthy();
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(2));
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('Live updates unavailable')).toBeNull();
+  });
+
+  it('overrides a stale running Snapshot while RPC is disconnected and restores it after recovery', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const runningSnapshot = snapshot({
+      events: [
+        event(1, 'turn.queued', { payload: { ordinal: 1 } }),
+        event(2, 'model.started', {
+          actor: 'model',
+          payload: { modelCallId: 'model-call-1' },
+        }),
+      ],
+      messages: [message('user', 'Read README.md')],
+      runtimeStatus: 'running',
+      turns: [turn('running')],
+    });
+    const recoveredPage = deferred<
+      Awaited<ReturnType<ApiClient['getEvents']>>
+    >();
+    const getEvents = vi
+      .fn<ApiClient['getEvents']>()
+      .mockRejectedValueOnce(new TypeError('RPC disconnected'))
+      .mockImplementationOnce(() => recoveredPage.promise)
+      .mockImplementationOnce(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({
+          getEvents,
+          getSnapshot: async () => runningSnapshot,
+        })}
+        pollIntervals={{ activeMs: 1, idleMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('Live updates unavailable')).toBeTruthy();
+    const configuration = screen.getByRole('list', {
+      name: 'Session configuration',
+    });
+    expect(within(configuration).getByText('Unavailable')).toBeTruthy();
+    expect(within(configuration).queryByText('Running')).toBeNull();
+    expect(screen.queryByText('Running')).toBeNull();
+    expect(screen.queryByText('Model is working')).toBeNull();
+    expect(screen.queryByText('Turn queued')).toBeNull();
+    expect(screen.getAllByText('Last known state').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Connection unavailable').length).toBeGreaterThan(
+      0,
+    );
+    expect(
+      screen
+        .getByRole('region', { name: 'Session timeline' })
+        .getAttribute('aria-live'),
+    ).toBe('off');
+    expect(
+      within(screen.getByRole('region', { name: 'Current task' })).getByText(
+        'Status: disconnected',
+      ),
+    ).toBeTruthy();
+
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      recoveredPage.resolve({ events: [], highWaterSeq: 2 });
+      await recoveredPage.promise;
+    });
+
+    await waitFor(() =>
+      expect(within(configuration).getByText('Running')).toBeTruthy(),
+    );
+    expect(screen.getByText('Model is working')).toBeTruthy();
+    expect(screen.getByText('Turn queued')).toBeTruthy();
+    expect(
+      screen
+        .getByRole('region', { name: 'Session timeline' })
+        .getAttribute('aria-live'),
+    ).toBe('polite');
+    expect(
+      within(screen.getByRole('region', { name: 'Current task' })).getByText(
+        'Status: running',
+      ),
+    ).toBeTruthy();
+  });
+
   it('shows an unavailable top status and disables submission', async () => {
     render(
       <App api={fakeApi({ getRuntime: async () => unavailableRuntime })} />,
@@ -596,8 +726,24 @@ describe('professional web workbench', () => {
 
     const dialog = screen.getByRole('dialog', { name: 'Inspector' });
     expect(dialog.getAttribute('aria-modal')).toBe('true');
-    await waitFor(() => expect(document.activeElement).toBe(dialog));
-    await user.click(screen.getByRole('button', { name: 'Close inspector' }));
+    const closeButton = screen.getByRole('button', { name: 'Close inspector' });
+    const payload = screen.getByLabelText('Event payload');
+    await waitFor(() => expect(document.activeElement).toBe(closeButton));
+
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(payload);
+    await user.tab();
+    expect(document.activeElement).toBe(closeButton);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Inspector' })).toBeNull();
+    expect(document.activeElement).toBe(toolCard);
+
+    await user.click(toolCard);
+    const backdrop = document.querySelector<HTMLElement>('.inspector-backdrop');
+    expect(backdrop?.tagName).toBe('DIV');
+    expect(backdrop?.getAttribute('aria-hidden')).toBe('true');
+    expect(backdrop?.tabIndex).toBe(-1);
+    fireEvent.click(backdrop as HTMLElement);
     expect(screen.queryByRole('dialog', { name: 'Inspector' })).toBeNull();
     expect(document.activeElement).toBe(toolCard);
   });

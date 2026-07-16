@@ -335,6 +335,10 @@ textarea:disabled {
   color: var(--danger);
 }
 
+.current-task small[data-status="disconnected"] {
+  color: var(--danger);
+}
+
 .workspace-main {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
@@ -452,6 +456,17 @@ textarea:disabled {
   border-color: var(--danger-border);
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.session-status-pill[data-status="unavailable"] {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.session-status-pill[data-status="unavailable"] > span {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgb(179 58 58 / 12%);
 }
 
 .inspector-toggle {
@@ -693,6 +708,15 @@ textarea:disabled {
   background: var(--danger-soft);
 }
 
+.timeline-card[data-status="unavailable"] {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+}
+
+.timeline-card[data-status="unavailable"] .timeline-card-heading > svg {
+  color: var(--warning);
+}
+
 .timeline-card[data-status="succeeded"] {
   border-color: var(--success-border);
 }
@@ -739,6 +763,12 @@ textarea:disabled {
   border-color: var(--danger-border);
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.timeline-card[data-status="unavailable"] .status-chip {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .timeline-detail-row {
