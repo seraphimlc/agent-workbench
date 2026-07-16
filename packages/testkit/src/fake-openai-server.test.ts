@@ -19,10 +19,10 @@ type FakeOpenAiServerModule = {
     readonly scripts: readonly [
       {
         readonly expectedRequest: {
-          readonly method: 'POST';
-          readonly path: '/v1/chat/completions';
+          readonly method: 'GET' | 'POST';
+          readonly path: string;
           readonly headers: Readonly<Record<string, string>>;
-          readonly jsonBody: unknown;
+          readonly jsonBody?: unknown;
         };
         readonly response: {
           readonly status?: number;
@@ -32,10 +32,10 @@ type FakeOpenAiServerModule = {
       },
       ...Array<{
         readonly expectedRequest: {
-          readonly method: 'POST';
-          readonly path: '/v1/chat/completions';
+          readonly method: 'GET' | 'POST';
+          readonly path: string;
           readonly headers: Readonly<Record<string, string>>;
-          readonly jsonBody: unknown;
+          readonly jsonBody?: unknown;
         };
         readonly response: {
           readonly status?: number;
@@ -68,6 +68,58 @@ const deferred = (): {
 };
 
 describe('Fake OpenAI Server', () => {
+  it('supports a bodyless GET models script without changing POST request matching', async () => {
+    const { startFakeOpenAiServer } = await loadFakeServer();
+    const server = await startFakeOpenAiServer({
+      scripts: [
+        {
+          expectedRequest: {
+            method: 'GET',
+            path: '/v1/models',
+            headers: { authorization: 'Bearer test-key' },
+          },
+          response: {
+            headers: { 'content-type': 'application/json' },
+            chunks: [encoder.encode('{"data":[{"id":"chat-model"}]}')],
+          },
+        },
+        {
+          expectedRequest: {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: { 'content-type': 'application/json' },
+            jsonBody: { model: 'chat-model' },
+          },
+          response: { chunks: [encoder.encode('complete')] },
+        },
+      ],
+    });
+    let completed = false;
+    void server.completed.then(() => {
+      completed = true;
+    });
+
+    try {
+      const modelsResponse = await fetch(new URL('/v1/models', server.baseUrl), {
+        headers: { authorization: 'Bearer test-key' },
+      });
+      expect(await modelsResponse.json()).toEqual({ data: [{ id: 'chat-model' }] });
+      await Promise.resolve();
+      expect(completed).toBe(false);
+
+      const chatResponse = await fetch(new URL('/v1/chat/completions', server.baseUrl), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'chat-model' }),
+      });
+      expect(await chatResponse.text()).toBe('complete');
+      await server.completed;
+      expect(completed).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
   it('serves scripted chunks over real loopback HTTP and validates the native fetch request', async () => {
     const { startFakeOpenAiServer } = await loadFakeServer();
     const server = await startFakeOpenAiServer({

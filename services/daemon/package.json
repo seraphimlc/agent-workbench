@@ -3,6 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./model/model-gateway": {
+      "types": "./src/model/model-gateway.ts",
+      "development": "./src/model/model-gateway.ts",
+      "default": "./dist/model/model-gateway.js"
+    },
+    "./model/openai-compatible-adapter": {
+      "types": "./src/model/openai-compatible-adapter.ts",
+      "development": "./src/model/openai-compatible-adapter.ts",
+      "default": "./dist/model/openai-compatible-adapter.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-migrations.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

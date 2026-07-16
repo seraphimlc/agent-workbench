@@ -8,6 +8,10 @@
     "typecheck": "pnpm typecheck:server",
     "test": "vitest --root ../.. --config vitest.config.ts run apps/web-console/src/server"
   },
+  "dependencies": {
+    "@agent-workbench/daemon": "workspace:*",
+    "zod": "4.4.3"
+  },
   "devDependencies": {
     "@types/node": "26.1.1",
     "tsx": "4.23.1",

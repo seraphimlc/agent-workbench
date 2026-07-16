@@ -11,10 +11,10 @@ export type ScriptedChunk =
 
 export type FakeOpenAiScript = {
   readonly expectedRequest: {
-    readonly method: 'POST';
-    readonly path: '/v1/chat/completions';
+    readonly method: 'GET' | 'POST';
+    readonly path: string;
     readonly headers: Readonly<Record<string, string>>;
-    readonly jsonBody: unknown;
+    readonly jsonBody?: unknown;
   };
   readonly response: {
     readonly status?: number;
@@ -102,16 +102,20 @@ export const startFakeOpenAiServer = async (input: {
           throw new Error(`Expected request header ${name}=${expected}, received ${String(actual)}`);
         }
       }
-      let jsonBody: unknown;
-      try {
-        jsonBody = JSON.parse(body.toString('utf8')) as unknown;
-      } catch {
-        throw new Error('Fake OpenAI Server request body is not valid JSON');
-      }
-      if (stableJson(jsonBody) !== stableJson(script.expectedRequest.jsonBody)) {
-        throw new Error(
-          `Unexpected request JSON: ${stableJson(jsonBody)} expected ${stableJson(script.expectedRequest.jsonBody)}`,
-        );
+      if (Object.hasOwn(script.expectedRequest, 'jsonBody')) {
+        let jsonBody: unknown;
+        try {
+          jsonBody = JSON.parse(body.toString('utf8')) as unknown;
+        } catch {
+          throw new Error('Fake OpenAI Server request body is not valid JSON');
+        }
+        if (stableJson(jsonBody) !== stableJson(script.expectedRequest.jsonBody)) {
+          throw new Error(
+            `Unexpected request JSON: ${stableJson(jsonBody)} expected ${stableJson(script.expectedRequest.jsonBody)}`,
+          );
+        }
+      } else if (body.byteLength !== 0) {
+        throw new Error('Fake OpenAI Server request body was not expected');
       }
 
       response.writeHead(script.response.status ?? 200, script.response.headers ?? {});
