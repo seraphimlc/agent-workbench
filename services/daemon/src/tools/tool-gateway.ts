@@ -1,13 +1,16 @@
+import { posix, win32 } from 'node:path';
+
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
 import { ExecutionRepository } from '../db/execution-repository.js';
 import { SessionEventWriter } from '../db/session-event-writer.js';
 import type { Claim } from '../runtime/scheduler.js';
-import { redactAndLimit, redactSecrets } from '../security/secret-redactor.js';
+import { redactSecrets } from '../security/secret-redactor.js';
 
 const TOOL_EVENT_SUMMARY_MAX_BYTES = 1_024;
 const TOOL_EXECUTION_FAILED = 'TOOL_EXECUTION_FAILED';
+const UNSAFE_PATH_SUMMARY = '[UNSAFE_PATH]';
 
 export class ToolGatewayError extends Error {
   readonly code: string;
@@ -45,6 +48,44 @@ const parseInput = (json: string): Record<string, unknown> => {
     throw new ToolGatewayError('MODEL_TOOL_INPUT_INVALID', 'Persisted Tool input is invalid');
   }
   return parsed as Record<string, unknown>;
+};
+
+const truncateSummary = (value: string): string => {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.byteLength <= TOOL_EVENT_SUMMARY_MAX_BYTES) return value;
+
+  let end = TOOL_EVENT_SUMMARY_MAX_BYTES;
+  while (end > 0 && ((bytes[end] as number) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+};
+
+const isSafeRelativePath = (value: string): boolean =>
+  value.length > 0 &&
+  !value.includes('\0') &&
+  !posix.isAbsolute(value) &&
+  !win32.isAbsolute(value) &&
+  !/^[a-z]:/i.test(value) &&
+  !value.split(/[\\/]+/).includes('..');
+
+const summarizeInput = (
+  toolId: string,
+  argumentsJson: string,
+  secrets: readonly string[],
+): string => {
+  if (toolId !== 'fs.read_text') return UNSAFE_PATH_SUMMARY;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsJson) as unknown;
+  } catch {
+    return UNSAFE_PATH_SUMMARY;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return UNSAFE_PATH_SUMMARY;
+  }
+  const path = (parsed as { readonly path?: unknown }).path;
+  if (typeof path !== 'string' || !isSafeRelativePath(path)) return UNSAFE_PATH_SUMMARY;
+  return truncateSummary(redactSecrets(path, secrets));
 };
 
 export class ToolGateway {
@@ -217,10 +258,10 @@ export class ToolGateway {
               payload: {
                 toolRunId,
                 toolId: candidate.toolId,
-                inputSummary: redactAndLimit(
+                inputSummary: summarizeInput(
+                  candidate.toolId,
                   candidate.argumentsJson,
                   this.secrets,
-                  TOOL_EVENT_SUMMARY_MAX_BYTES,
                 ),
               },
             },
@@ -302,11 +343,7 @@ export class ToolGateway {
             payload: {
               toolRunId,
               outputBytes: Buffer.byteLength(content, 'utf8'),
-              outputSummary: redactAndLimit(
-                content,
-                this.secrets,
-                TOOL_EVENT_SUMMARY_MAX_BYTES,
-              ),
+              outputSummary: truncateSummary(content),
             },
           },
         ],

@@ -370,12 +370,14 @@ const insertSucceededToolCall = (
     readonly turnId: string;
     readonly suffix: string;
     readonly logicalCallId?: string;
+    readonly argumentsJson?: string;
   },
 ): { readonly attemptId: string; readonly logicalCallId: string } => {
   const callId = `model-call-${input.suffix}`;
   const attemptId = `model-attempt-${input.suffix}`;
   const logicalCallId = input.logicalCallId ?? `logical-${input.suffix}`;
-  const resultJson = JSON.stringify(successfulToolResult({ logicalCallId }));
+  const argumentsJson = input.argumentsJson ?? '{"path":"notes.md"}';
+  const resultJson = JSON.stringify(successfulToolResult({ logicalCallId, argumentsJson }));
   const transaction = database.transaction(() => {
     database
       .prepare(
@@ -415,9 +417,9 @@ const insertSucceededToolCall = (
         `INSERT INTO model_tool_calls (
           model_attempt_id, logical_call_id, call_index, tool_id,
           arguments_json, normalized_input_hash
-        ) VALUES (?, ?, 0, 'fs.read_text', '{"path":"notes.md"}', ?)`,
+        ) VALUES (?, ?, 0, 'fs.read_text', ?, ?)`,
       )
-      .run(attemptId, logicalCallId, `hash-${input.suffix}`);
+      .run(attemptId, logicalCallId, argumentsJson, `hash-${input.suffix}`);
   });
   transaction.immediate();
   return { attemptId, logicalCallId };
@@ -1093,8 +1095,8 @@ describe('ModelAttempt and ToolCall authorization', () => {
       suffix: 'success-events',
     });
     const registeredSecret = 'registered-tool-secret';
-    const handlerContent = `${registeredSecret}:${'x'.repeat(2_048)}`;
-    const redactedContent = `[REDACTED]:${'x'.repeat(2_048)}`;
+    const handlerContent = `${registeredSecret}:${'😀'.repeat(512)}`;
+    const redactedContent = `[REDACTED]:${'😀'.repeat(512)}`;
     let handlerObservedCommittedStart = false;
     const { ToolGateway } = await loadToolGateway();
     const gateway = new ToolGateway(fixture.database, {
@@ -1155,7 +1157,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
         payload: {
           toolRunId: result.toolRunId,
           toolId: 'fs.read_text',
-          inputSummary: '{"path":"notes.md"}',
+          inputSummary: 'notes.md',
         },
       });
       expect(events[1]).toEqual({
@@ -1173,6 +1175,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
       expect(Buffer.byteLength(String(events[1]?.payload.outputSummary), 'utf8')).toBeLessThanOrEqual(
         1_024,
       );
+      expect(String(events[1]?.payload.outputSummary)).not.toContain('\uFFFD');
       const sessionSequences = (
         fixture.database
           .prepare('SELECT seq FROM session_events WHERE session_id = ? ORDER BY seq')
@@ -1182,6 +1185,52 @@ describe('ModelAttempt and ToolCall authorization', () => {
         Array.from({ length: sessionSequences.length }, (_, index) => index + 1),
       );
       expect(JSON.stringify({ toolRun, events, result })).not.toContain(registeredSecret);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it.each([
+    { name: 'POSIX absolute', path: '/outside/secret.txt' },
+    { name: 'parent traversal', path: '../outside/secret.txt' },
+    { name: 'Windows absolute', path: 'C:\\outside\\secret.txt' },
+  ])('uses a stable placeholder for a $name fs.read_text path', async ({ name, path }) => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: `unsafe-path-${name.replaceAll(' ', '-').toLowerCase()}`,
+      argumentsJson: JSON.stringify({ path }),
+    });
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: {
+        'fs.read_text': async () => ({ content: 'hidden path content' }),
+      },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('unsafe-path-tool'),
+    });
+
+    try {
+      const result = await gateway.execute({
+        binding: fixture.claim,
+        modelAttemptId: source.attemptId,
+        logicalCallId: source.logicalCallId,
+      });
+      const started = readToolEvents(fixture.database, fixture.turnId)[0];
+
+      expect(started).toMatchObject({
+        type: 'tool.started',
+        toolRunId: result.toolRunId,
+        payload: {
+          toolRunId: result.toolRunId,
+          toolId: 'fs.read_text',
+          inputSummary: '[UNSAFE_PATH]',
+        },
+      });
+      expect(JSON.stringify(started?.payload)).not.toContain('outside');
+      expect(JSON.stringify(started?.payload)).not.toContain('secret.txt');
     } finally {
       fixture.database.close();
     }
@@ -1282,7 +1331,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
           payload: {
             toolRunId: toolRun.id,
             toolId: 'fs.read_text',
-            inputSummary: '{"path":"notes.md"}',
+            inputSummary: 'notes.md',
           },
         },
         {
