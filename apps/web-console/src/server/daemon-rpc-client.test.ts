@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { createServer, type Server, type Socket } from 'node:net';
 
 import {
@@ -36,6 +36,7 @@ type DaemonRpcClient = {
 };
 
 type RpcClientModule = {
+  DaemonRpcClient: new (socket: Socket) => DaemonRpcClient;
   connectDaemonRpcClient(socketPath: string, timeoutMs?: number): Promise<DaemonRpcClient>;
 };
 
@@ -49,6 +50,33 @@ type RpcFixture = {
   readonly server: Server;
   readonly sockets: ReadonlySet<Socket>;
 };
+
+class ControlledCloseSocket extends EventEmitter {
+  destroyed = false;
+  destroyCalled = false;
+  endCalled = false;
+  endFailure: Error | undefined;
+
+  write(): boolean {
+    return true;
+  }
+
+  end(): this {
+    this.endCalled = true;
+    if (this.endFailure) throw this.endFailure;
+    return this;
+  }
+
+  destroy(): this {
+    this.destroyCalled = true;
+    this.destroyed = true;
+    return this;
+  }
+
+  releaseClose(): void {
+    this.emit('close');
+  }
+}
 
 const loadRpcClient = async (): Promise<RpcClientModule> =>
   (await import('./daemon-rpc-client.js')) as unknown as RpcClientModule;
@@ -180,6 +208,20 @@ const stopRpcFixture = async (fixture: RpcFixture | undefined): Promise<void> =>
   });
 };
 
+const waitForCondition = async (
+  condition: () => boolean,
+  description: string,
+  timeoutMs = 500,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${description}`);
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+  }
+};
+
 describe('production daemon RPC client', () => {
   let runtime: TempRuntime | undefined;
   let daemon: DaemonProcess | undefined;
@@ -265,6 +307,38 @@ describe('production daemon RPC client', () => {
     await expect(original).rejects.toMatchObject({ code: 'RPC_REQUEST_TIMEOUT' });
   });
 
+  it('rejects an invalid local request without failing the authenticated connection', async () => {
+    runtime = createTempRuntime();
+    fixture = await startRpcFixture(runtime.socketPath, 'respond');
+    const { connectDaemonRpcClient } = await loadRpcClient();
+    client = await connectDaemonRpcClient(runtime.socketPath);
+    await client.authenticate(fixtureSecret);
+
+    await expect(
+      client.send(client.createRequest('workspace.register', { path: '/workspace' })),
+    ).rejects.toMatchObject({ code: 'RPC_REQUEST_INVALID' });
+    await expect(
+      client.send(client.createRequest('app.health', {})),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects a local frame encoding error without failing the authenticated connection', async () => {
+    runtime = createTempRuntime();
+    fixture = await startRpcFixture(runtime.socketPath, 'respond');
+    const { connectDaemonRpcClient } = await loadRpcClient();
+    client = await connectDaemonRpcClient(runtime.socketPath);
+    await client.authenticate(fixtureSecret);
+    const oversized = client.createRequest('app.health', {});
+    oversized.requestId = 'x'.repeat(MAX_FRAME_BYTES);
+
+    await expect(client.send(oversized)).rejects.toMatchObject({
+      code: 'RPC_REQUEST_INVALID',
+    });
+    await expect(
+      client.send(client.createRequest('app.health', {})),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
   it('rejects pending and future requests with the same failure when the connection closes', async () => {
     runtime = createTempRuntime();
     fixture = await startRpcFixture(runtime.socketPath, 'close');
@@ -303,5 +377,44 @@ describe('production daemon RPC client', () => {
     await expect(
       client.send(client.createRequest('app.health', {}), 500),
     ).rejects.toMatchObject({ code: 'RPC_PROTOCOL_ERROR' });
+  });
+
+  it('waits for the close event after a timeout-triggered socket destroy', async () => {
+    const socket = new ControlledCloseSocket();
+    const { DaemonRpcClient } = await loadRpcClient();
+    const controlledClient = new DaemonRpcClient(socket as unknown as Socket);
+    let settled = false;
+    const closeResult = controlledClient.close(20).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    ).finally(() => {
+      settled = true;
+    });
+
+    await waitForCondition(() => socket.destroyCalled, 'timeout socket destroy');
+    expect(settled).toBe(false);
+    socket.releaseClose();
+
+    expect((await closeResult).error).toMatchObject({ code: 'RPC_CLOSE_TIMEOUT' });
+  });
+
+  it('destroys and waits for close when starting socket shutdown fails', async () => {
+    const socket = new ControlledCloseSocket();
+    socket.endFailure = new Error('controlled socket end failure');
+    const { DaemonRpcClient } = await loadRpcClient();
+    const controlledClient = new DaemonRpcClient(socket as unknown as Socket);
+    let settled = false;
+    const closeResult = controlledClient.close(500).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    ).finally(() => {
+      settled = true;
+    });
+
+    await waitForCondition(() => socket.destroyCalled, 'failed socket destroy');
+    expect(settled).toBe(false);
+    socket.releaseClose();
+
+    expect((await closeResult).error).toMatchObject({ code: 'RPC_CLOSE_FAILED' });
   });
 });

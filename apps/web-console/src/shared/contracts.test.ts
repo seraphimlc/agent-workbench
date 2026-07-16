@@ -16,6 +16,13 @@ type ContractsModule = {
   SessionEventsHttpResponseSchema: {
     parse(value: unknown): unknown;
   };
+  createSessionEventsHttpResponseSchema(request: {
+    readonly sessionId: string;
+    readonly afterSeq: number;
+    readonly limit: number;
+  }): {
+    parse(value: unknown): unknown;
+  };
   PublicErrorResponseSchema: {
     parse(value: unknown): unknown;
   };
@@ -50,6 +57,21 @@ const emptySnapshot = {
   highWaterSeq: 0,
   events: [],
 };
+
+const event = (sessionId: string, seq: number) => ({
+  id: `event-${sessionId}-${seq}`,
+  sessionId,
+  turnId: null,
+  toolRunId: null,
+  seq,
+  actor: 'daemon',
+  audience: 'ui',
+  createdAt: '2026-07-16T00:00:00.000Z',
+  type: 'turn.queued',
+  redacted: false,
+  payload: {},
+  blobId: null,
+});
 
 describe('web console HTTP contracts', () => {
   it('accepts only sanitized runtime public information', async () => {
@@ -103,6 +125,54 @@ describe('web console HTTP contracts', () => {
         socketPath: '/tmp/private.sock',
       }),
     ).toThrow();
+  });
+
+  it('validates event pages against the requested session, cursor, and limit', async () => {
+    const { createSessionEventsHttpResponseSchema } = await loadContracts();
+    const schema = createSessionEventsHttpResponseSchema({
+      sessionId: 'session-1',
+      afterSeq: 4,
+      limit: 2,
+    });
+    const response = {
+      events: [event('session-1', 5), event('session-1', 6)],
+      highWaterSeq: 6,
+    };
+
+    expect(schema.parse(response)).toEqual(response);
+  });
+
+  it.each([
+    [
+      'out-of-order events',
+      {
+        events: [event('session-1', 2), event('session-1', 1)],
+        highWaterSeq: 2,
+      },
+    ],
+    [
+      'cross-session events',
+      {
+        events: [event('session-1', 1), event('session-2', 2)],
+        highWaterSeq: 2,
+      },
+    ],
+    [
+      'an event above the high-water mark',
+      {
+        events: [event('session-1', 1), event('session-1', 2)],
+        highWaterSeq: 1,
+      },
+    ],
+  ])('rejects %s in an event page', async (_name, response) => {
+    const { createSessionEventsHttpResponseSchema } = await loadContracts();
+    const schema = createSessionEventsHttpResponseSchema({
+      sessionId: 'session-1',
+      afterSeq: 0,
+      limit: 2,
+    });
+
+    expect(() => schema.parse(response)).toThrow();
   });
 
   it('exposes a strict sanitized public error wrapper', async () => {

@@ -29,6 +29,7 @@ export type DaemonRpcClientErrorCode =
   | 'RPC_REQUEST_TIMEOUT'
   | 'RPC_DUPLICATE_REQUEST_ID'
   | 'RPC_PROTOCOL_ERROR'
+  | 'RPC_CLOSE_FAILED'
   | 'RPC_CLOSE_TIMEOUT';
 
 export class DaemonRpcClientError extends Error {
@@ -225,6 +226,16 @@ export class DaemonRpcClient {
       );
     }
 
+    let requestFrame: Buffer;
+    try {
+      requestFrame = encodeFrame(parsedRequest.data);
+    } catch {
+      throw new DaemonRpcClientError(
+        'RPC_REQUEST_INVALID',
+        'Daemon RPC request cannot be encoded as a protocol frame',
+      );
+    }
+
     let pending!: PendingResponse;
     const responsePromise = new Promise<RpcResponse>(
       (resolvePromise, rejectPromise) => {
@@ -248,7 +259,7 @@ export class DaemonRpcClient {
 
     try {
       try {
-        await this.writeFrame(parsedRequest.data);
+        await this.writeBytes(requestFrame);
       } catch {
         const failure =
           this.failed ??
@@ -409,8 +420,7 @@ export class DaemonRpcClient {
     }
   }
 
-  private async writeFrame(value: unknown): Promise<void> {
-    const bytes = encodeFrame(value);
+  private async writeBytes(bytes: Uint8Array): Promise<void> {
     if (this.socket.write(bytes)) {
       return;
     }
@@ -450,8 +460,18 @@ export class DaemonRpcClient {
       ),
     );
 
-    if (!this.socket.destroyed) {
-      this.socket.end();
+    try {
+      if (!this.socket.destroyed) {
+        this.socket.end();
+      }
+    } catch {
+      const failure = new DaemonRpcClientError(
+        'RPC_CLOSE_FAILED',
+        'Unable to start daemon RPC socket shutdown',
+      );
+      this.socket.destroy();
+      await this.socketClosePromise;
+      throw failure;
     }
 
     try {
@@ -462,6 +482,7 @@ export class DaemonRpcClient {
       );
     } catch (error) {
       this.socket.destroy();
+      await this.socketClosePromise;
       throw error;
     }
   }

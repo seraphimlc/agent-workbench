@@ -1,6 +1,8 @@
 import {
-  RendererSessionEventEnvelopeSchema,
+  createEventListAfterResultSchema,
+  EventListAfterResultSchema,
   SessionSnapshotSchema,
+  type EventListAfterPayload,
 } from '@agent-workbench/protocol';
 import { z } from 'zod';
 
@@ -64,12 +66,11 @@ export const SessionSnapshotHttpResponseSchema = z
   .object({ snapshot: SessionSnapshotSchema })
   .strict();
 
-export const SessionEventsHttpResponseSchema = z
-  .object({
-    events: z.array(RendererSessionEventEnvelopeSchema),
-    highWaterSeq: z.number().int().nonnegative(),
-  })
-  .strict();
+export const SessionEventsHttpResponseSchema = EventListAfterResultSchema;
+
+export const createSessionEventsHttpResponseSchema = (
+  request: EventListAfterPayload,
+) => createEventListAfterResultSchema(request);
 
 export const PublicErrorSchema = z
   .object({
