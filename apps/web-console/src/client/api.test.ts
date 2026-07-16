@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiPublicError,
   createApiClient,
-  createLogicalSubmission,
 } from './api.js';
 
 const submissionId = '123e4567-e89b-42d3-a456-426614174000';
@@ -177,28 +176,48 @@ describe('web console client API', () => {
     await expect(api.getRuntime()).rejects.toThrow();
   });
 
-  it('creates one logical submission id that retries reuse unchanged', async () => {
-    const randomUUID = vi.fn(() => submissionId);
-    const submission = createLogicalSubmission('Read README.md', { randomUUID });
-    const fetch = vi
-      .fn<typeof globalThis.fetch>()
-      .mockRejectedValueOnce(new TypeError('network unavailable'))
-      .mockResolvedValueOnce(
-        jsonResponse({ sessionId: 'session-1', turnId: 'turn-1' }, 201),
+  it.each(['session', 'turn'] as const)(
+    'creates one stable %s operation whose retry reuses the exact submission body',
+    async (kind) => {
+      const randomUUID = vi.fn(() => submissionId);
+      const success =
+        kind === 'session'
+          ? { sessionId: 'session-1', turnId: 'turn-1' }
+          : { turnId: 'turn-2' };
+      const fetch = vi
+        .fn<typeof globalThis.fetch>()
+        .mockRejectedValueOnce(new TypeError('network unavailable'))
+        .mockResolvedValueOnce(
+          jsonResponse(success, kind === 'session' ? 201 : 202),
+        );
+      const api = createApiClient({
+        document: documentWithToken(),
+        fetch,
+        uuidSource: { randomUUID },
+      });
+      const operation =
+        kind === 'session'
+          ? api.createSessionOperation({ prompt: 'Read README.md' })
+          : api.createTurnOperation('session/1', { prompt: 'Read README.md' });
+
+      await expect(operation.execute()).rejects.toThrow('network unavailable');
+      await expect(operation.retry()).resolves.toEqual(success);
+
+      const bodies = fetch.mock.calls.map(([, init]) => String(init?.body));
+      expect(randomUUID).toHaveBeenCalledTimes(1);
+      expect(bodies[0]).toBe(bodies[1]);
+      expect(bodies.map((body) => JSON.parse(body))).toEqual([
+        { submissionId, prompt: 'Read README.md' },
+        { submissionId, prompt: 'Read README.md' },
+      ]);
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual(
+        kind === 'session'
+          ? ['/api/sessions', '/api/sessions']
+          : [
+              '/api/sessions/session%2F1/turns',
+              '/api/sessions/session%2F1/turns',
+            ],
       );
-    const api = createApiClient({ document: documentWithToken(), fetch });
-
-    await expect(api.createSession(submission)).rejects.toThrow(
-      'network unavailable',
-    );
-    await expect(api.createSession(submission)).resolves.toEqual({
-      sessionId: 'session-1',
-      turnId: 'turn-1',
-    });
-
-    expect(randomUUID).toHaveBeenCalledTimes(1);
-    expect(
-      fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body))),
-    ).toEqual([submission, submission]);
-  });
+    },
+  );
 });

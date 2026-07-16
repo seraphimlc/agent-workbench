@@ -31,11 +31,21 @@ type Fetch = typeof globalThis.fetch;
 type ClientDependencies = {
   readonly document?: Document;
   readonly fetch?: Fetch;
+  readonly uuidSource?: RandomUuidSource;
 };
 
 type RandomUuidSource = {
   randomUUID(): string;
 };
+
+export type MutationOperationInput = Readonly<{
+  prompt: string;
+}>;
+
+export type MutationOperation<Result> = Readonly<{
+  execute(): Promise<Result>;
+  retry(): Promise<Result>;
+}>;
 
 export class ApiPublicError extends Error {
   readonly status: number;
@@ -88,19 +98,31 @@ const sessionPath = (sessionId: string): string => encodeURIComponent(sessionId)
 export type ApiClient = {
   getRuntime(): Promise<RuntimePublicInfo>;
   createSession(submission: SessionSubmission): Promise<SessionCreatedHttpResponse>;
+  createSessionOperation(
+    input: MutationOperationInput,
+  ): MutationOperation<SessionCreatedHttpResponse>;
   submitTurn(
     sessionId: string,
     submission: TurnSubmission,
   ): Promise<TurnSubmittedHttpResponse>;
+  createTurnOperation(
+    sessionId: string,
+    input: MutationOperationInput,
+  ): MutationOperation<TurnSubmittedHttpResponse>;
   getSnapshot(sessionId: string): Promise<SessionSnapshot>;
   getEvents(request: EventListAfterPayload): Promise<SessionEventsHttpResponse>;
 };
+
+const mutationOperation = <Result>(
+  execute: () => Promise<Result>,
+): MutationOperation<Result> => Object.freeze({ execute, retry: execute });
 
 export const createApiClient = (
   dependencies: ClientDependencies = {},
 ): ApiClient => {
   const csrfToken = readCsrfToken(dependencies.document ?? document);
   const fetch = dependencies.fetch ?? globalThis.fetch;
+  const uuidSource = dependencies.uuidSource ?? crypto;
   const get = async <Output>(url: string, schema: ZodType<Output>) =>
     parseResponse(
       await fetch(url, {
@@ -127,20 +149,31 @@ export const createApiClient = (
       schema,
     );
 
+  const createSession = (submission: SessionSubmission) =>
+    post(
+      '/api/sessions',
+      SessionSubmissionSchema.parse(submission),
+      SessionCreatedHttpResponseSchema,
+    );
+  const submitTurn = (sessionId: string, submission: TurnSubmission) =>
+    post(
+      `/api/sessions/${sessionPath(sessionId)}/turns`,
+      TurnSubmissionSchema.parse(submission),
+      TurnSubmittedHttpResponseSchema,
+    );
+
   return {
     getRuntime: () => get('/api/runtime', RuntimePublicInfoSchema),
-    createSession: (submission) =>
-      post(
-        '/api/sessions',
-        SessionSubmissionSchema.parse(submission),
-        SessionCreatedHttpResponseSchema,
-      ),
-    submitTurn: (sessionId, submission) =>
-      post(
-        `/api/sessions/${sessionPath(sessionId)}/turns`,
-        TurnSubmissionSchema.parse(submission),
-        TurnSubmittedHttpResponseSchema,
-      ),
+    createSession,
+    createSessionOperation: (input) => {
+      const submission = createLogicalSubmission(input.prompt, uuidSource);
+      return mutationOperation(() => createSession(submission));
+    },
+    submitTurn,
+    createTurnOperation: (sessionId, input) => {
+      const submission = createLogicalSubmission(input.prompt, uuidSource);
+      return mutationOperation(() => submitTurn(sessionId, submission));
+    },
     getSnapshot: async (sessionId) =>
       (
         await get(

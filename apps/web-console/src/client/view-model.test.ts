@@ -7,6 +7,7 @@ import type {
 import { describe, expect, it } from 'vitest';
 
 import {
+  EVENT_SEQUENCE_CONFLICT,
   EVENT_SEQUENCE_GAP,
   applyEventPage,
   checkEventPage,
@@ -381,6 +382,58 @@ describe('authoritative timeline projection', () => {
     if (!detail || detail.source !== 'event') throw new Error('Expected event detail');
     expect(Object.isFrozen(detail.event)).toBe(true);
     expect(Object.isFrozen(detail.event.payload)).toBe(true);
+  });
+
+  it('deduplicates exact event replays and preserves unique timeline item ids', () => {
+    const replayedEvents = events.flatMap((event) => [
+      event,
+      structuredClone(event),
+    ]);
+
+    const timeline = projectTimeline(snapshot, replayedEvents);
+    const baseline = projectTimeline(snapshot, events);
+    const itemIds = timeline.map(({ id }) => id);
+
+    expect(timeline).toEqual(baseline);
+    expect(new Set(itemIds).size).toBe(itemIds.length);
+  });
+
+  it.each([
+    [
+      'the same seq has a different id',
+      [
+        visibleEvent(1, 'session.created'),
+        { ...visibleEvent(1, 'session.created'), id: 'event-conflict' },
+      ],
+      EVENT_SEQUENCE_CONFLICT,
+    ],
+    [
+      'the same id has different content',
+      [
+        visibleEvent(1, 'session.created', { payload: { revision: 1 } }),
+        visibleEvent(1, 'session.created', { payload: { revision: 2 } }),
+      ],
+      EVENT_SEQUENCE_CONFLICT,
+    ],
+    [
+      'the ordered event stream has a gap',
+      [
+        visibleEvent(1, 'session.created'),
+        visibleEvent(3, 'turn.started'),
+      ],
+      EVENT_SEQUENCE_GAP,
+    ],
+  ])('fails closed when %s', (_name, projectionEvents, errorCode) => {
+    expect(() =>
+      projectTimeline(
+        {
+          ...snapshot,
+          messages: [],
+          turns: [],
+        },
+        projectionEvents,
+      ),
+    ).toThrow(errorCode);
   });
 });
 

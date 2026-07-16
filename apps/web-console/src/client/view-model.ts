@@ -7,6 +7,7 @@ import type {
 } from '@agent-workbench/protocol';
 
 export const EVENT_SEQUENCE_GAP = 'EVENT_SEQUENCE_GAP';
+export const EVENT_SEQUENCE_CONFLICT = 'EVENT_SEQUENCE_CONFLICT';
 
 export class EventSequenceGapError extends Error {
   readonly code = EVENT_SEQUENCE_GAP;
@@ -14,6 +15,15 @@ export class EventSequenceGapError extends Error {
   constructor() {
     super(EVENT_SEQUENCE_GAP);
     this.name = 'EventSequenceGapError';
+  }
+}
+
+export class EventSequenceConflictError extends Error {
+  readonly code = EVENT_SEQUENCE_CONFLICT;
+
+  constructor() {
+    super(EVENT_SEQUENCE_CONFLICT);
+    this.name = 'EventSequenceConflictError';
   }
 }
 
@@ -233,6 +243,75 @@ const terminalTurnEvents = new Set([
   'turn.interrupted',
 ]);
 
+const sameValue = (left: unknown, right: unknown): boolean => {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null) return false;
+  if (typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => sameValue(item, right[index]))
+    );
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key, index) =>
+        key === rightKeys[index] && sameValue(leftRecord[key], rightRecord[key]),
+    )
+  );
+};
+
+const failSequenceConflict = (): never => {
+  throw new EventSequenceConflictError();
+};
+
+const failSequenceCheck = (): never => {
+  throw new EventSequenceGapError();
+};
+
+const normalizeRendererEvents = (
+  rendererEvents: readonly RendererSessionEventEnvelope[],
+): readonly RendererSessionEventEnvelope[] => {
+  const ordered = [...rendererEvents].sort(
+    (left, right) => left.seq - right.seq || left.id.localeCompare(right.id),
+  );
+  const bySeq = new Map<number, RendererSessionEventEnvelope>();
+  const byId = new Map<string, RendererSessionEventEnvelope>();
+  const unique: RendererSessionEventEnvelope[] = [];
+
+  for (const event of ordered) {
+    const sameSeq = bySeq.get(event.seq);
+    const sameId = byId.get(event.id);
+    if (sameSeq || sameId) {
+      if (
+        sameSeq === undefined ||
+        sameId === undefined ||
+        sameSeq !== sameId ||
+        !sameValue(sameSeq, event)
+      ) {
+        failSequenceConflict();
+      }
+      continue;
+    }
+    bySeq.set(event.seq, event);
+    byId.set(event.id, event);
+    unique.push(event);
+  }
+
+  unique.forEach((event, index) => {
+    const previous = unique[index - 1];
+    if (previous && event.seq !== previous.seq + 1) failSequenceCheck();
+  });
+  return unique;
+};
+
 export const projectTimeline = (
   snapshot: SessionSnapshot,
   rendererEvents: readonly RendererSessionEventEnvelope[] = snapshot.events,
@@ -259,9 +338,7 @@ export const projectTimeline = (
     items.push(itemFromMessage(message, turn));
   };
 
-  const orderedEvents = [...rendererEvents].sort(
-    (left, right) => left.seq - right.seq || left.id.localeCompare(right.id),
-  );
+  const orderedEvents = normalizeRendererEvents(rendererEvents);
   for (const event of orderedEvents) {
     const turn = event.turnId ? turns.get(event.turnId) : undefined;
     if (event.type === 'turn.queued') appendMessage(turn?.inputMessageId);
@@ -280,11 +357,13 @@ export const projectTimeline = (
     appendMessage(turn.resultMessageId);
   }
 
-  return Object.freeze(items);
-};
+  const itemIds = new Set<string>();
+  for (const item of items) {
+    if (itemIds.has(item.id)) failSequenceConflict();
+    itemIds.add(item.id);
+  }
 
-const failSequenceCheck = (): never => {
-  throw new EventSequenceGapError();
+  return Object.freeze(items);
 };
 
 const checkState = (state: EventPageState): void => {
