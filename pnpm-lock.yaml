@@ -41,6 +41,9 @@ importers:
       '@agent-workbench/daemon':
         specifier: workspace:*
         version: link:../../services/daemon
+      '@agent-workbench/session-runner':
+        specifier: workspace:*
+        version: link:../../runtimes/session-runner
       zod:
         specifier: 4.4.3
         version: 4.4.3
