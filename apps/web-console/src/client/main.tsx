@@ -24,7 +24,11 @@ const loadRuntime = async (): Promise<RuntimePublicInfo> => {
     headers: { accept: 'application/json' },
   });
   if (!response.ok) throw new Error('Runtime request failed');
-  return RuntimePublicInfoSchema.parse(await response.json());
+  const runtime = RuntimePublicInfoSchema.parse(await response.json());
+  if (runtime.daemon.status !== 'ready') {
+    throw new Error('Runtime is unavailable');
+  }
+  return runtime;
 };
 
 const StatusShell = ({ state }: { readonly state: ShellState }) => (

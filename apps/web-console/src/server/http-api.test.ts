@@ -24,6 +24,7 @@ type HttpApiModule = {
   createHttpApiHandler(options: {
     readonly rpc: {
       call(input: RpcCall): Promise<RpcReply>;
+      reconnect?(): Promise<void>;
     };
     readonly runtimeSecurity: ReturnType<typeof createRuntimeSecurity>;
     readonly provider: {
@@ -91,7 +92,10 @@ afterEach(async () => {
   servers.clear();
 });
 
-const startApi = async (rpc: { call(input: RpcCall): Promise<RpcReply> }) => {
+const startApi = async (rpc: {
+  call(input: RpcCall): Promise<RpcReply>;
+  reconnect?(): Promise<void>;
+}) => {
   const { createHttpApiHandler } = (await import(
     './http-api.js'
   )) as unknown as HttpApiModule;
@@ -312,17 +316,18 @@ describe('web console HTTP API', () => {
     ]);
   });
 
-  it('returns only the validated public portion of an RPC error', async () => {
+  it('maps RPC errors to local public text without reflecting private fields', async () => {
     const api = await startApi({
       call: async () => ({
         ok: false,
         error: {
-          code: 'SESSION_NOT_FOUND',
+          code: 'PRIVATE_VALIDATION_FAILURE',
           category: 'validation',
-          message: 'Session was not found',
+          message:
+            'apiKey=provider-secret socketPath=/tmp/private.sock path=/private/workspace',
           retryable: false,
-          userAction: 'Refresh and choose an existing session',
-          detailsRef: 'private-details',
+          userAction: 'Open /private/workspace and inspect provider-secret',
+          detailsRef: '/tmp/private.sock#private-details',
           traceId: 'private-trace',
         },
       }),
@@ -333,17 +338,23 @@ describe('web console HTTP API', () => {
     );
     const body = await response.json();
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(400);
     expect(body).toEqual({
       error: {
-        code: 'SESSION_NOT_FOUND',
-        message: 'Session was not found',
+        code: 'INVALID_REQUEST',
+        message: 'Request was rejected',
         retryable: false,
-        userAction: 'Refresh and choose an existing session',
+        userAction: null,
       },
     });
-    expect(JSON.stringify(body)).not.toContain('private-details');
-    expect(JSON.stringify(body)).not.toContain('private-trace');
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain('apiKey');
+    expect(serialized).not.toContain('provider-secret');
+    expect(serialized).not.toContain('socketPath');
+    expect(serialized).not.toContain('/tmp/private.sock');
+    expect(serialized).not.toContain('/private/workspace');
+    expect(serialized).not.toContain('private-details');
+    expect(serialized).not.toContain('private-trace');
   });
 
   it('distinguishes unknown API routes from unsupported methods', async () => {
@@ -393,7 +404,12 @@ describe('web console HTTP API', () => {
     const response = await fetch(`${api.origin}/api/runtime`);
     const body = await response.text();
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
+    expect(JSON.parse(body)).toEqual({
+      daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+      provider: { baseHost: 'api.example.test', modelId: 'chat-model' },
+      workspace: { name: 'agent-workbench' },
+    });
     expect(body).not.toContain('apiKey');
     expect(body).not.toContain('provider-secret');
     expect(body).not.toContain('bootstrapSecret');
@@ -459,5 +475,52 @@ describe('web console HTTP API', () => {
         userAction: null,
       },
     });
+  });
+
+  it('rejects unknown or duplicate query parameters on every route', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        throw new Error('RPC must not be called');
+      },
+    });
+
+    const responses = await Promise.all([
+      fetch(`${api.origin}/api/runtime?debug=true`),
+      fetch(`${api.origin}/api/sessions/session-1/snapshot?x=1&x=2`),
+      fetch(
+        `${api.origin}/api/sessions/session-1/events?afterSeq=0&limit=1&extra=true`,
+      ),
+      fetch(
+        `${api.origin}/api/sessions/session-1/events?afterSeq=0&afterSeq=1&limit=1`,
+      ),
+    ]);
+
+    expect(responses.map(({ status }) => status)).toEqual([400, 400, 400, 400]);
+    expect(calls).toEqual([]);
+  });
+
+  it('returns a fresh unavailable runtime after reconnect is exhausted', async () => {
+    let reconnects = 0;
+    const api = await startApi({
+      call: async () => {
+        throw new Error('RPC connection closed');
+      },
+      reconnect: async () => {
+        reconnects += 1;
+        throw new Error('Reconnect failed');
+      },
+    });
+
+    const response = await fetch(`${api.origin}/api/runtime`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+      provider: { baseHost: 'api.example.test', modelId: 'chat-model' },
+      workspace: { name: 'agent-workbench' },
+    });
+    expect(reconnects).toBe(1);
   });
 });

@@ -40,6 +40,14 @@ export type HttpApiRpcReply =
 
 export interface HttpApiRpc {
   call(input: HttpApiRpcCall): Promise<HttpApiRpcReply>;
+  reconnect?(): Promise<void>;
+}
+
+export class HttpApiRpcUnavailableError extends Error {
+  constructor() {
+    super('Runtime RPC is unavailable');
+    this.name = 'HttpApiRpcUnavailableError';
+  }
 }
 
 export type HttpApiHandlerOptions = {
@@ -66,6 +74,7 @@ const EventQuerySchema = z
     limit: z.string().regex(/^[1-9]\d*$/).transform(Number),
   })
   .strict();
+const EmptyQuerySchema = z.object({}).strict();
 
 const headerValue = (
   value: string | readonly string[] | undefined,
@@ -116,13 +125,105 @@ class RpcPublicError extends Error {
   }
 }
 
-const rpcErrorStatus = (
+type LocalRpcError = {
+  readonly statusCode: number;
+  readonly code: string;
+  readonly message: string;
+  readonly retryable: boolean;
+};
+
+const knownRpcError = (
   error: ReturnType<typeof ErrorEnvelopeSchema.parse>,
-): number => {
-  if (error.code === 'SESSION_NOT_FOUND') return 404;
-  if (error.category === 'validation') return 400;
-  if (error.retryable) return 503;
-  return 500;
+): LocalRpcError | null => {
+  switch (error.code) {
+    case 'SESSION_NOT_FOUND':
+      return {
+        statusCode: 404,
+        code: 'SESSION_NOT_FOUND',
+        message: 'Session was not found',
+        retryable: false,
+      };
+    case 'WORKSPACE_NOT_FOUND':
+      return {
+        statusCode: 404,
+        code: 'WORKSPACE_NOT_FOUND',
+        message: 'Workspace was not found',
+        retryable: false,
+      };
+    case 'WORKSPACE_PATH_INVALID':
+      return {
+        statusCode: 400,
+        code: 'INVALID_REQUEST',
+        message: 'Request was rejected',
+        retryable: false,
+      };
+    case 'EVENT_CURSOR_AHEAD':
+      return {
+        statusCode: 409,
+        code: 'EVENT_CURSOR_INVALID',
+        message: 'Event cursor is invalid',
+        retryable: false,
+      };
+    case 'IDEMPOTENCY_CONFLICT':
+      return {
+        statusCode: 409,
+        code: 'REQUEST_CONFLICT',
+        message: 'Request conflicts with an earlier submission',
+        retryable: false,
+      };
+    default:
+      return null;
+  }
+};
+
+const mapRpcError = (
+  error: ReturnType<typeof ErrorEnvelopeSchema.parse>,
+): LocalRpcError => {
+  const known = knownRpcError(error);
+  if (known !== null) return known;
+
+  switch (error.category) {
+    case 'validation':
+      return {
+        statusCode: 400,
+        code: 'INVALID_REQUEST',
+        message: 'Request was rejected',
+        retryable: false,
+      };
+    case 'configuration':
+    case 'model':
+    case 'tool':
+    case 'connector':
+    case 'runtime':
+    case 'storage':
+      return {
+        statusCode: 503,
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'Runtime is unavailable',
+        retryable: true,
+      };
+    case 'canceled':
+      return {
+        statusCode: 409,
+        code: 'REQUEST_CANCELED',
+        message: 'Request was canceled',
+        retryable: false,
+      };
+    case 'interrupted':
+      return {
+        statusCode: 503,
+        code: 'REQUEST_INTERRUPTED',
+        message: 'Request was interrupted',
+        retryable: true,
+      };
+    case 'internal':
+      return {
+        statusCode: 500,
+        code: 'INTERNAL',
+        message: 'Request failed',
+        retryable: false,
+      };
+  }
 };
 
 const callRpc = async (
@@ -133,14 +234,15 @@ const callRpc = async (
   if (reply.ok) return reply.result;
 
   const error = ErrorEnvelopeSchema.parse(reply.error);
+  const local = mapRpcError(error);
   throw new RpcPublicError(
-    rpcErrorStatus(error),
+    local.statusCode,
     PublicErrorResponseSchema.parse({
       error: {
-        code: error.code,
-        message: error.message,
-        retryable: error.retryable,
-        userAction: error.userAction,
+        code: local.code,
+        message: local.message,
+        retryable: local.retryable,
+        userAction: null,
       },
     }),
   );
@@ -149,6 +251,21 @@ const callRpc = async (
 const sendRpcFailure = (response: ServerResponse, error: unknown): void => {
   if (error instanceof RpcPublicError) {
     sendJson(response, error.statusCode, error.response);
+    return;
+  }
+  if (error instanceof HttpApiRpcUnavailableError) {
+    sendJson(
+      response,
+      503,
+      PublicErrorResponseSchema.parse({
+        error: {
+          code: 'RUNTIME_UNAVAILABLE',
+          message: 'Runtime is unavailable',
+          retryable: true,
+          userAction: null,
+        },
+      }),
+    );
     return;
   }
   sendPublicError(
@@ -184,12 +301,55 @@ const parseEventQuery = (
   url: URL,
   sessionId: string,
 ): ReturnType<typeof EventListAfterPayloadSchema.parse> => {
-  const query = Object.fromEntries(url.searchParams.entries());
-  if ([...url.searchParams.keys()].length !== Object.keys(query).length) {
-    throw new Error('Duplicate event query parameter');
-  }
-  const parsed = EventQuerySchema.parse(query);
+  const parsed = parseExactQuery(url.searchParams, EventQuerySchema);
   return EventListAfterPayloadSchema.parse({ sessionId, ...parsed });
+};
+
+const parseExactQuery = <Output>(
+  searchParams: URLSearchParams,
+  schema: z.ZodType<Output>,
+): Output => {
+  const query: Record<string, string> = {};
+  for (const [key, value] of searchParams.entries()) {
+    if (Object.hasOwn(query, key)) {
+      throw new Error('Duplicate query parameter');
+    }
+    query[key] = value;
+  }
+  return schema.parse(query);
+};
+
+const hasInvalidEmptyQuery = (url: URL): boolean => {
+  try {
+    parseExactQuery(url.searchParams, EmptyQuerySchema);
+    return false;
+  } catch {
+    return true;
+  }
+};
+
+const unavailableRuntime = (options: HttpApiHandlerOptions) =>
+  RuntimePublicInfoSchema.parse({
+    daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+    provider: options.provider,
+    workspace: { name: options.workspace.name },
+  });
+
+const readRuntimeHealth = async (options: HttpApiHandlerOptions) =>
+  AppHealthResultSchema.parse(
+    await callRpc(options.rpc, { method: 'app.health', payload: {} }),
+  );
+
+const recoverRuntimeHealth = async (
+  options: HttpApiHandlerOptions,
+): Promise<ReturnType<typeof AppHealthResultSchema.parse> | null> => {
+  if (options.rpc.reconnect === undefined) return null;
+  try {
+    await options.rpc.reconnect();
+    return await readRuntimeHealth(options);
+  } catch {
+    return null;
+  }
 };
 
 export const createHttpApiHandler = (
@@ -220,10 +380,17 @@ export const createHttpApiHandler = (
 
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (request.method === 'GET' && url.pathname === '/api/runtime') {
-      try {
-        const health = AppHealthResultSchema.parse(
-          await callRpc(options.rpc, { method: 'app.health', payload: {} }),
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
         );
+        return;
+      }
+      try {
+        const health = await readRuntimeHealth(options);
         sendJson(
           response,
           200,
@@ -233,13 +400,35 @@ export const createHttpApiHandler = (
             workspace: { name: options.workspace.name },
           }),
         );
-      } catch (error) {
-        sendRpcFailure(response, error);
+      } catch {
+        const recoveredHealth = await recoverRuntimeHealth(options);
+        if (recoveredHealth !== null) {
+          sendJson(
+            response,
+            200,
+            RuntimePublicInfoSchema.parse({
+              daemon: recoveredHealth,
+              provider: options.provider,
+              workspace: { name: options.workspace.name },
+            }),
+          );
+          return;
+        }
+        sendJson(response, 200, unavailableRuntime(options));
       }
       return;
     }
 
     if (request.method === 'POST' && url.pathname === '/api/sessions') {
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
+        );
+        return;
+      }
       let submission;
       try {
         submission = SessionSubmissionSchema.parse(await readJsonBody(request));
@@ -289,6 +478,15 @@ export const createHttpApiHandler = (
 
     const turnPath = matchSessionPath(url.pathname, 'turns');
     if (request.method === 'POST' && turnPath !== null) {
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
+        );
+        return;
+      }
       let submission;
       try {
         submission = TurnSubmissionSchema.parse(await readJsonBody(request));
@@ -327,6 +525,15 @@ export const createHttpApiHandler = (
 
     const snapshotPath = matchSessionPath(url.pathname, 'snapshot');
     if (request.method === 'GET' && snapshotPath !== null) {
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
+        );
+        return;
+      }
       try {
         const snapshot = SessionGetSnapshotResultSchema.parse(
           await callRpc(options.rpc, {

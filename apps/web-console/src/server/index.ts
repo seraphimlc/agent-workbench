@@ -38,6 +38,7 @@ import {
   createHttpApiHandler,
   type HttpApiRpc,
   type HttpApiRpcCall,
+  HttpApiRpcUnavailableError,
 } from './http-api.js';
 import {
   createHttpSecurityHeaders,
@@ -50,6 +51,8 @@ import { probeProviderModel } from './model-probe.js';
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const indexHtmlPath = join(appRoot, 'index.html');
+const MAX_RPC_RECONNECT_ATTEMPTS = 3;
+const RPC_RECONNECT_DELAY_MS = 25;
 
 type RpcClientLike = Pick<
   DaemonRpcClient,
@@ -70,6 +73,10 @@ type ViteServerLike = {
   close(): Promise<void>;
 };
 
+type ReconnectableRpc = HttpApiRpc & {
+  close(): Promise<void>;
+};
+
 export type WebConsoleServerDependencies = {
   readonly parseProviderConfig: (
     environment: Readonly<Record<string, string | undefined>>,
@@ -84,6 +91,7 @@ export type WebConsoleServerDependencies = {
   readonly createViteServer: () => Promise<ViteServerLike>;
   readonly loadIndexHtml: () => Promise<string>;
   readonly createCsrfToken: () => string;
+  readonly sleep: (milliseconds: number) => Promise<void>;
   readonly writeReady: (line: string) => void;
 };
 
@@ -91,6 +99,8 @@ export type StartWebConsoleServerOptions = {
   readonly cwd?: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly dependencies?: Partial<WebConsoleServerDependencies>;
+  readonly signalSource?: ShutdownSignalSource;
+  readonly onShutdownError?: (error: unknown) => void;
 };
 
 export type WebConsoleServerHandle = {
@@ -122,6 +132,10 @@ const defaultDependencies = (): WebConsoleServerDependencies => ({
   createViteServer: createDefaultViteServer,
   loadIndexHtml: async () => await readFile(indexHtmlPath, 'utf8'),
   createCsrfToken: () => randomBytes(32).toString('base64url'),
+  sleep: async (milliseconds) =>
+    await new Promise<void>((resolvePromise) => {
+      setTimeout(resolvePromise, milliseconds);
+    }),
   writeReady: (line) => {
     process.stdout.write(line);
   },
@@ -156,20 +170,96 @@ const requestOptions = (input: HttpApiRpcCall): DaemonRpcRequestOptions => ({
     : { clientRequestId: input.clientRequestId }),
 });
 
-const createRpcBridge = (client: RpcClientLike): HttpApiRpc => ({
-  call: async (input) => {
-    const method: RpcMethod = RpcMethodSchema.parse(input.method);
-    const request: RpcRequestEnvelope = client.createRequest(
-      method,
-      input.payload,
-      requestOptions(input),
-    );
-    const response: RpcResponse = await client.send(request);
-    return response.ok
-      ? { ok: true, result: response.result }
-      : { ok: false, error: response.error };
-  },
-});
+const createReconnectableRpc = (options: {
+  readonly initialClient: RpcClientLike;
+  readonly connect: (socketPath: string) => Promise<RpcClientLike>;
+  readonly socketPath: string;
+  readonly authenticationSecret: Buffer;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+}): ReconnectableRpc => {
+  let client: RpcClientLike | undefined = options.initialClient;
+  let reconnectPromise: Promise<void> | undefined;
+  let closePromise: Promise<void> | undefined;
+  let closed = false;
+
+  const closeClient = async (candidate: RpcClientLike | undefined) => {
+    if (candidate === undefined) return;
+    await candidate.close().catch(() => undefined);
+  };
+  const call = async (input: HttpApiRpcCall) => {
+    const currentClient = client;
+    if (closed || currentClient === undefined) {
+      throw new HttpApiRpcUnavailableError();
+    }
+    try {
+      const method: RpcMethod = RpcMethodSchema.parse(input.method);
+      const request: RpcRequestEnvelope = currentClient.createRequest(
+        method,
+        input.payload,
+        requestOptions(input),
+      );
+      const response: RpcResponse = await currentClient.send(request);
+      return response.ok
+        ? { ok: true as const, result: response.result }
+        : { ok: false as const, error: response.error };
+    } catch {
+      if (client === currentClient) client = undefined;
+      await closeClient(currentClient);
+      throw new HttpApiRpcUnavailableError();
+    }
+  };
+  const performReconnect = async (): Promise<void> => {
+    const previousClient = client;
+    client = undefined;
+    await closeClient(previousClient);
+    for (let attempt = 0; attempt < MAX_RPC_RECONNECT_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await options.sleep(RPC_RECONNECT_DELAY_MS);
+      let candidate: RpcClientLike | undefined;
+      try {
+        candidate = await options.connect(options.socketPath);
+        await candidate.authenticate(options.authenticationSecret);
+        if (closed) {
+          await closeClient(candidate);
+          throw new HttpApiRpcUnavailableError();
+        }
+        client = candidate;
+        return;
+      } catch {
+        await closeClient(candidate);
+      }
+    }
+    throw new HttpApiRpcUnavailableError();
+  };
+  const reconnect = async (): Promise<void> => {
+    if (closed) throw new HttpApiRpcUnavailableError();
+    if (reconnectPromise === undefined) {
+      const operation = performReconnect();
+      reconnectPromise = operation;
+      void operation.then(
+        () => {
+          if (reconnectPromise === operation) reconnectPromise = undefined;
+        },
+        () => {
+          if (reconnectPromise === operation) reconnectPromise = undefined;
+        },
+      );
+    }
+    await reconnectPromise;
+  };
+  const close = async (): Promise<void> => {
+    closePromise ??= (async () => {
+      closed = true;
+      await reconnectPromise?.catch(() => undefined);
+      const currentClient = client;
+      client = undefined;
+      await closeClient(currentClient);
+      options.authenticationSecret.fill(0);
+    })();
+    await closePromise;
+  };
+
+  return { call, reconnect, close };
+};
 
 const headerValue = (
   value: string | readonly string[] | undefined,
@@ -335,13 +425,21 @@ export const startWebConsoleServer = async (
   const environment = options.environment ?? process.env;
   const cwd = options.cwd ?? process.cwd();
   let daemon: DaemonProcessHandle | undefined;
-  let rpc: RpcClientLike | undefined;
+  let rpcClient: RpcClientLike | undefined;
+  let rpcController: ReconnectableRpc | undefined;
+  let rpcAuthenticationSecret: Buffer | undefined;
   let http: Server | undefined;
   let vite: ViteServerLike | undefined;
   let activeHandler:
     | ((request: IncomingMessage, response: ServerResponse) => Promise<void>)
     | undefined;
-  let stopPromise: Promise<void> | undefined;
+  let cleanupPromise: Promise<void> | undefined;
+  let shutdownRequested = false;
+  let resolveStartupSettled!: () => void;
+  const startupSettled = new Promise<void>((resolvePromise) => {
+    resolveStartupSettled = resolvePromise;
+  });
+  let detachSignals = (): void => undefined;
 
   const zeroBootstrapSecret = (): void => {
     daemon?.bootstrapSecret.fill(0);
@@ -356,13 +454,20 @@ export const startWebConsoleServer = async (
         failures.push(error);
       }
     }
-    if (rpc !== undefined) {
+    if (rpcController !== undefined) {
       try {
-        await rpc.close();
+        await rpcController.close();
+      } catch (error) {
+        failures.push(error);
+      }
+    } else if (rpcClient !== undefined) {
+      try {
+        await rpcClient.close();
       } catch (error) {
         failures.push(error);
       }
     }
+    rpcAuthenticationSecret?.fill(0);
     if (daemon !== undefined) {
       try {
         await daemon.stop();
@@ -381,11 +486,33 @@ export const startWebConsoleServer = async (
       throw new AggregateError(failures, 'Web console shutdown failed');
     }
   };
+  const stop = async (): Promise<void> => {
+    shutdownRequested = true;
+    await startupSettled;
+    cleanupPromise ??= cleanup().finally(detachSignals);
+    await cleanupPromise;
+  };
+  const assertStartupActive = (): void => {
+    if (!shutdownRequested) return;
+    throw Object.assign(new Error('Web console startup was canceled'), {
+      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+    });
+  };
+  detachSignals = attachShutdownSignals(
+    { stop },
+    options.signalSource ?? process,
+    options.onShutdownError ?? (() => undefined),
+  );
 
+  let startupFailure: unknown;
+  let startedUrl: string | undefined;
   try {
+    assertStartupActive();
     const provider = dependencies.parseProviderConfig(environment);
     const workspace = resolveWorkspace(cwd, environment);
+    assertStartupActive();
     const modelId = await dependencies.probeProviderModel(provider.privateConfig);
+    assertStartupActive();
     daemon = await dependencies.createDaemonManager().start({
       dataDir: dataDirectoryForWorkspace(workspace.path),
       workspacePath: workspace.path,
@@ -395,12 +522,25 @@ export const startWebConsoleServer = async (
         modelId,
       },
     });
-    rpc = await dependencies.connectDaemonRpcClient(daemon.socketPath);
+    assertStartupActive();
+    rpcAuthenticationSecret = Buffer.from(daemon.bootstrapSecret);
+    rpcClient = await dependencies.connectDaemonRpcClient(daemon.socketPath);
+    assertStartupActive();
     try {
-      await rpc.authenticate(daemon.bootstrapSecret);
+      await rpcClient.authenticate(rpcAuthenticationSecret);
     } finally {
       zeroBootstrapSecret();
     }
+    assertStartupActive();
+    rpcController = createReconnectableRpc({
+      initialClient: rpcClient,
+      connect: dependencies.connectDaemonRpcClient,
+      socketPath: daemon.socketPath,
+      authenticationSecret: rpcAuthenticationSecret,
+      sleep: dependencies.sleep,
+    });
+    rpcClient = undefined;
+    rpcAuthenticationSecret = undefined;
 
     http = createServer((request, response) => {
       const handler = activeHandler;
@@ -428,12 +568,13 @@ export const startWebConsoleServer = async (
       });
     });
     const port = await listenOnLoopback(http);
+    assertStartupActive();
     const runtimeSecurity = createRuntimeSecurity(
       port,
       dependencies.createCsrfToken(),
     );
     const api = createHttpApiHandler({
-      rpc: createRpcBridge(rpc),
+      rpc: rpcController,
       runtimeSecurity,
       provider: {
         baseHost: provider.publicConfig.baseHost,
@@ -442,7 +583,9 @@ export const startWebConsoleServer = async (
       workspace,
     });
     vite = await dependencies.createViteServer();
+    assertStartupActive();
     const indexHtml = await dependencies.loadIndexHtml();
+    assertStartupActive();
     activeHandler = createBrowserHandler({
       api,
       runtimeSecurity,
@@ -450,20 +593,30 @@ export const startWebConsoleServer = async (
       indexHtml,
     });
     const url = `http://127.0.0.1:${port}/`;
+    assertStartupActive();
     dependencies.writeReady(`${JSON.stringify({ event: 'ready', url })}\n`);
-
-    return Object.freeze({
-      url,
-      stop: async () => {
-        stopPromise ??= cleanup();
-        await stopPromise;
-      },
-    });
+    startedUrl = url;
   } catch (error) {
     zeroBootstrapSecret();
-    await cleanup().catch(() => undefined);
-    throw error;
+    startupFailure = shutdownRequested
+      ? Object.assign(new Error('Web console startup was canceled'), {
+          code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+        })
+      : error;
+  } finally {
+    resolveStartupSettled();
   }
+
+  if (startupFailure !== undefined) {
+    await stop().catch(() => undefined);
+    throw startupFailure;
+  }
+  if (startedUrl === undefined) {
+    await stop().catch(() => undefined);
+    throw new Error('Web console startup did not produce a ready URL');
+  }
+
+  return Object.freeze({ url: startedUrl, stop });
 };
 
 export const attachShutdownSignals = (
@@ -508,14 +661,16 @@ const errorCode = (error: unknown): string => {
 
 const main = async (): Promise<void> => {
   try {
-    const server = await startWebConsoleServer();
-    attachShutdownSignals(server, process, () => {
-      process.stderr.write(
-        `${JSON.stringify({ event: 'shutdown_error', code: 'WEB_CONSOLE_SHUTDOWN_FAILED' })}\n`,
-      );
-      process.exitCode = 1;
+    await startWebConsoleServer({
+      onShutdownError: () => {
+        process.stderr.write(
+          `${JSON.stringify({ event: 'shutdown_error', code: 'WEB_CONSOLE_SHUTDOWN_FAILED' })}\n`,
+        );
+        process.exitCode = 1;
+      },
     });
   } catch (error) {
+    if (errorCode(error) === 'WEB_CONSOLE_STARTUP_CANCELLED') return;
     process.stderr.write(
       `${JSON.stringify({ event: 'startup_error', code: errorCode(error) })}\n`,
     );

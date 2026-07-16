@@ -15,6 +15,7 @@ type ServerModule = {
   startWebConsoleServer(options: {
     readonly cwd: string;
     readonly environment: Readonly<Record<string, string | undefined>>;
+    readonly signalSource?: Pick<EventEmitter, 'once' | 'off'>;
     readonly dependencies: {
       parseProviderConfig(
         environment: Readonly<Record<string, string | undefined>>,
@@ -67,6 +68,7 @@ type ServerModule = {
       }>;
       loadIndexHtml(): Promise<string>;
       createCsrfToken(): string;
+      sleep?(milliseconds: number): Promise<void>;
       writeReady(line: string): void;
     };
   }): Promise<{
@@ -89,6 +91,14 @@ const environment = {
 };
 
 const pendingFailure = (): Promise<Error> => new Promise(() => undefined);
+
+const deferred = <Value>() => {
+  let resolvePromise!: (value: Value) => void;
+  const promise = new Promise<Value>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+};
 
 describe('web console server', () => {
   it('starts in order, serves secured HTTP, prints one ready URL, and stops once', async () => {
@@ -317,6 +327,207 @@ describe('web console server', () => {
     expect(bootstrapSecret).toEqual(Buffer.alloc(32));
     expect(readyLines).toEqual([]);
     expect(lifecycle).toEqual(['rpc.close', 'daemon.close', 'vite.close']);
+  });
+
+  it('reaps partial resources when signaled before HTTP bind and emits no ready URL', async () => {
+    const { startWebConsoleServer } = await loadServer();
+    const signals = new EventEmitter();
+    const daemonStarted = deferred<void>();
+    const releaseConnect = deferred<void>();
+    const lifecycle: string[] = [];
+    const readyLines: string[] = [];
+    const bootstrapSecret = Buffer.alloc(32, 5);
+    const startup = startWebConsoleServer({
+      cwd: process.cwd(),
+      environment,
+      signalSource: signals,
+      dependencies: {
+        parseProviderConfig: () => ({
+          privateConfig: {
+            baseUrl: 'https://api.example.test/v1',
+            apiKey: 'provider-secret',
+            modelId: 'chat-model',
+          },
+          publicConfig: {
+            baseHost: 'api.example.test',
+            modelId: 'chat-model',
+          },
+        }),
+        probeProviderModel: async () => 'chat-model',
+        createDaemonManager: () => ({
+          start: async () => {
+            lifecycle.push('daemon.start');
+            daemonStarted.resolve();
+            return {
+              pid: 4321,
+              socketPath: '/tmp/daemon.sock',
+              bootstrapSecret,
+              failure: pendingFailure(),
+              stop: async () => {
+                lifecycle.push('daemon.close');
+              },
+            };
+          },
+        }),
+        connectDaemonRpcClient: async () => {
+          lifecycle.push('connect');
+          await releaseConnect.promise;
+          return {
+            authenticate: async () => undefined,
+            createRequest: (method, payload) => ({
+              requestId: 'request-1',
+              method,
+              payload,
+            }),
+            send: async () => {
+              throw new Error('unused');
+            },
+            close: async () => {
+              lifecycle.push('rpc.close');
+            },
+          };
+        },
+        createViteServer: async () => {
+          lifecycle.push('vite.unexpected');
+          throw new Error('Vite must not start after shutdown');
+        },
+        loadIndexHtml: async () => {
+          throw new Error('HTML must not load after shutdown');
+        },
+        createCsrfToken: () => 'csrf-token',
+        writeReady: (line) => readyLines.push(line),
+      },
+    });
+
+    await daemonStarted.promise;
+    signals.emit('SIGTERM');
+    releaseConnect.resolve();
+
+    await expect(startup).rejects.toMatchObject({
+      code: 'WEB_CONSOLE_STARTUP_CANCELLED',
+    });
+    expect(bootstrapSecret).toEqual(Buffer.alloc(32));
+    expect(readyLines).toEqual([]);
+    expect(lifecycle).toEqual(['daemon.start', 'daemon.close']);
+  });
+
+  it('limits reconnect attempts, reauthenticates candidates, and degrades runtime safely', async () => {
+    const { startWebConsoleServer } = await loadServer();
+    const bootstrapSecret = Buffer.alloc(32, 6);
+    const readyLines: string[] = [];
+    const sleepCalls: number[] = [];
+    let connections = 0;
+    let authentications = 0;
+    const createRequest = (method: string, payload: unknown) => ({
+      requestId: `request-${method}`,
+      method,
+      payload,
+    });
+    const server = await startWebConsoleServer({
+      cwd: process.cwd(),
+      environment,
+      dependencies: {
+        parseProviderConfig: () => ({
+          privateConfig: {
+            baseUrl: 'https://api.example.test/v1',
+            apiKey: 'provider-secret',
+            modelId: 'chat-model',
+          },
+          publicConfig: {
+            baseHost: 'api.example.test',
+            modelId: 'chat-model',
+          },
+        }),
+        probeProviderModel: async () => 'chat-model',
+        createDaemonManager: () => ({
+          start: async () => ({
+            pid: 4321,
+            socketPath: '/tmp/daemon.sock',
+            bootstrapSecret,
+            failure: pendingFailure(),
+            stop: async () => undefined,
+          }),
+        }),
+        connectDaemonRpcClient: async () => {
+          connections += 1;
+          if (connections >= 3) throw new Error('Reconnect unavailable');
+          if (connections === 2) {
+            return {
+              authenticate: async (secret) => {
+                authentications += 1;
+                expect(Buffer.from(secret)).toEqual(Buffer.alloc(32, 6));
+                throw new Error('Candidate authentication failed');
+              },
+              createRequest,
+              send: async () => {
+                throw new Error('unused');
+              },
+              close: async () => undefined,
+            };
+          }
+          return {
+            authenticate: async (secret) => {
+              authentications += 1;
+              expect(Buffer.from(secret)).toEqual(Buffer.alloc(32, 6));
+            },
+            createRequest,
+            send: async () => {
+              throw new Error('RPC connection closed');
+            },
+            close: async () => undefined,
+          };
+        },
+        createViteServer: async () => ({
+          middlewares: (_request, _response, next) => next(),
+          transformIndexHtml: async (_url, html) => html,
+          close: async () => undefined,
+        }),
+        loadIndexHtml: async () =>
+          '<!doctype html><html><head><title>Agent Workbench</title></head><body></body></html>',
+        createCsrfToken: () => 'csrf-token',
+        sleep: async (milliseconds) => {
+          sleepCalls.push(milliseconds);
+        },
+        writeReady: (line) => readyLines.push(line),
+      },
+    });
+
+    const runtime = await fetch(`${server.url}api/runtime`);
+    expect(runtime.status).toBe(200);
+    expect(await runtime.json()).toEqual({
+      daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+      provider: { baseHost: 'api.example.test', modelId: 'chat-model' },
+      workspace: { name: expect.any(String) },
+    });
+
+    const mutation = await fetch(`${server.url}api/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: new URL(server.url).origin,
+        'x-agent-workbench-csrf': 'csrf-token',
+      },
+      body: JSON.stringify({
+        submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        prompt: 'Read README.md',
+      }),
+    });
+    expect(mutation.status).toBe(503);
+    expect(await mutation.json()).toEqual({
+      error: {
+        code: 'RUNTIME_UNAVAILABLE',
+        message: 'Runtime is unavailable',
+        retryable: true,
+        userAction: null,
+      },
+    });
+
+    expect(readyLines).toHaveLength(1);
+    expect(connections).toBe(4);
+    expect(authentications).toBe(2);
+    expect(sleepCalls.length).toBeLessThanOrEqual(3);
+    expect(sleepCalls.every((milliseconds) => milliseconds < 100)).toBe(true);
+    await server.stop();
   });
 
   it('coalesces SIGINT and SIGTERM into one idempotent shutdown', async () => {
