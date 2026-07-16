@@ -14,6 +14,7 @@ import type Database from 'better-sqlite3';
 
 import { openRuntimeDatabase } from '../db/database.js';
 import { ModelGateway, type ModelAdapter } from '../model/model-gateway.js';
+import { redactAndLimit } from '../security/secret-redactor.js';
 import { ToolGateway } from '../tools/tool-gateway.js';
 import type { ExecutionDriver, ExecutionRun } from './execution-coordinator.js';
 import { RunnerChannel } from './runner-channel.js';
@@ -119,13 +120,7 @@ const outputText = (
   chunks: readonly Buffer[],
   secrets: readonly string[],
   limit: number,
-): string => {
-  let value = Buffer.concat(chunks).toString('utf8');
-  for (const secret of secrets) {
-    if (secret.length > 0) value = value.split(secret).join('[REDACTED]');
-  }
-  return Buffer.from(value, 'utf8').subarray(0, limit).toString('utf8');
-};
+): string => redactAndLimit(Buffer.concat(chunks).toString('utf8'), secrets, limit);
 
 const runnerErrorCode = (stderr: string): string | undefined => {
   for (const line of stderr.trim().split('\n').reverse()) {
