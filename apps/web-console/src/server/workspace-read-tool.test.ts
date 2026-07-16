@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,7 @@ type WorkspaceReadToolModule = {
     readonly controlPlanePaths: readonly string[];
     readonly hooks?: {
       readonly afterOpen?: () => void | Promise<void>;
+      readonly afterRealpath?: () => void | Promise<void>;
     };
   }): WorkspaceReadHandler;
 };
@@ -177,6 +178,55 @@ describe('createWorkspaceReadHandler', () => {
       'WORKSPACE_PATH_ESCAPE',
     );
     expect(error.message).not.toContain(outsidePath);
+  });
+
+  it('rejects a workspace hardlink to a control-plane file', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    const controlPlaneFile = join(fixture.controlPlanePath, 'secret.md');
+    await writeFile(controlPlaneFile, 'control-plane secret');
+    await link(controlPlaneFile, join(fixture.workspacePath, 'linked-secret.md'));
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+    });
+
+    const error = await expectCode(
+      executeRead(handler, { path: 'linked-secret.md' }),
+      'WORKSPACE_PATH_INVALID',
+    );
+    expect(error.message).not.toContain(fixture.controlPlanePath);
+  });
+
+  it('rejects an intermediate symlink switched between realpath and lstat', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    const workspaceDirectory = join(fixture.workspacePath, 'workspace-files');
+    const linkedDirectory = join(fixture.workspacePath, 'linked-directory');
+    const replacementLink = join(fixture.workspacePath, 'replacement-link');
+    await mkdir(workspaceDirectory);
+    await writeFile(join(workspaceDirectory, 'README.md'), 'workspace file');
+    await symlink(workspaceDirectory, linkedDirectory);
+    await symlink(fixture.controlPlanePath, replacementLink);
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+      hooks: {
+        afterRealpath: async () => {
+          await rename(
+            join(workspaceDirectory, 'README.md'),
+            join(fixture.controlPlanePath, 'README.md'),
+          );
+          await rename(replacementLink, linkedDirectory);
+        },
+      },
+    });
+
+    const error = await expectCode(
+      executeRead(handler, { path: 'linked-directory/README.md' }),
+      'WORKSPACE_FILE_CHANGED',
+    );
+    expect(error.message).not.toContain(fixture.controlPlanePath);
   });
 
   it('rejects a path identity swap after opening', async () => {

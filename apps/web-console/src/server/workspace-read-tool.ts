@@ -33,6 +33,7 @@ export type WorkspaceReadBoundary = {
   readonly controlPlanePaths: readonly string[];
   readonly hooks?: {
     readonly afterOpen?: () => void | Promise<void>;
+    readonly afterRealpath?: () => void | Promise<void>;
   };
 };
 
@@ -159,7 +160,7 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
       } catch {
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
-      if (!opened.isFile()) {
+      if (!opened.isFile() || opened.nlink !== 1n) {
         throw codedError('WORKSPACE_PATH_INVALID');
       }
 
@@ -173,6 +174,12 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
         throw codedError('WORKSPACE_PATH_ESCAPE');
       }
 
+      try {
+        await boundary.hooks?.afterRealpath?.();
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
       let pathIdentity;
       try {
         pathIdentity = await lstat(candidatePath, { bigint: true });
@@ -184,6 +191,16 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
         pathIdentity.dev !== opened.dev ||
         pathIdentity.ino !== opened.ino
       ) {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
+      let verifiedCanonicalPath: string;
+      try {
+        verifiedCanonicalPath = await realpath(candidatePath);
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+      if (verifiedCanonicalPath !== canonicalPath || !isWithin(workspacePath, verifiedCanonicalPath)) {
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
 

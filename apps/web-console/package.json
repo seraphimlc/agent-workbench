@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
     "typecheck": "pnpm typecheck:server",
-    "test": "vitest run src/server"
+    "test": "vitest --root ../.. --config vitest.config.ts run apps/web-console/src/server"
   },
   "devDependencies": {
     "@types/node": "26.1.1",
