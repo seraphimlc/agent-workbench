@@ -1,20 +1,13 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
-const CONTENT_SECURITY_POLICY =
-  "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
-
 const API_SECURITY_HEADERS = Object.freeze({
   'cache-control': 'no-store',
-});
-
-const HTML_SECURITY_HEADERS = Object.freeze({
-  ...API_SECURITY_HEADERS,
-  'content-security-policy': CONTENT_SECURITY_POLICY,
 });
 
 export type RuntimeSecurity = {
   readonly port: number;
   readonly csrfToken: string;
+  readonly cspNonce: string;
 };
 
 export type BrowserRequestSecurityInput = {
@@ -47,6 +40,9 @@ const rejected = (
 
 const isValidPort = (port: number): boolean =>
   Number.isInteger(port) && port >= 1 && port <= 65_535;
+
+const isValidCspNonce = (cspNonce: string): boolean =>
+  /^[A-Za-z0-9+/_-]+={0,2}$/.test(cspNonce);
 
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined &&
@@ -83,8 +79,13 @@ const escapeHtmlAttribute = (value: string): string =>
 export const createRuntimeSecurity = (
   port: number,
   csrfToken = randomBytes(32).toString('base64url'),
+  cspNonce = randomBytes(32).toString('base64url'),
 ): RuntimeSecurity => {
-  if (!isValidPort(port) || csrfToken.length === 0) {
+  if (
+    !isValidPort(port) ||
+    csrfToken.length === 0 ||
+    !isValidCspNonce(cspNonce)
+  ) {
     throw new Error('Invalid web console runtime security configuration');
   }
 
@@ -93,6 +94,12 @@ export const createRuntimeSecurity = (
     configurable: false,
     enumerable: false,
     value: csrfToken,
+    writable: false,
+  });
+  Object.defineProperty(runtimeSecurity, 'cspNonce', {
+    configurable: false,
+    enumerable: false,
+    value: cspNonce,
     writable: false,
   });
   return Object.freeze(runtimeSecurity);
@@ -136,10 +143,29 @@ export const validateBrowserRequest = (
   return allowedDecision;
 };
 
-export const createHttpSecurityHeaders = (
+export function createHttpSecurityHeaders(
+  kind: 'api',
+): Readonly<Record<string, string>>;
+export function createHttpSecurityHeaders(
+  kind: 'html',
+  runtimeSecurity: RuntimeSecurity,
+): Readonly<Record<string, string>>;
+export function createHttpSecurityHeaders(
   kind: 'api' | 'html',
-): Readonly<Record<string, string>> =>
-  kind === 'html' ? HTML_SECURITY_HEADERS : API_SECURITY_HEADERS;
+  runtimeSecurity?: RuntimeSecurity,
+): Readonly<Record<string, string>> {
+  if (kind === 'api') return API_SECURITY_HEADERS;
+  if (runtimeSecurity === undefined) {
+    throw new Error('HTML security headers require runtime security');
+  }
+  return Object.freeze({
+    ...API_SECURITY_HEADERS,
+    'content-security-policy':
+      `default-src 'self'; connect-src 'self'; style-src 'self' ` +
+      `'nonce-${runtimeSecurity.cspNonce}'; img-src 'self' data:; ` +
+      `frame-ancestors 'none'; base-uri 'none'`,
+  });
+}
 
 export const injectCsrfMeta = (
   html: string,

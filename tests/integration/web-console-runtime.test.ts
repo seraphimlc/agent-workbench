@@ -135,6 +135,14 @@ const csrfTokenFrom = (html: string): string => {
   return match[1];
 };
 
+const cspNonceFrom = (contentSecurityPolicy: string | null): string => {
+  const match = /(?:^|; )style-src 'self' 'nonce-([^']+)'(?:;|$)/.exec(
+    contentSecurityPolicy ?? '',
+  );
+  if (!match?.[1]) throw new Error('Web Console CSP did not contain a style nonce');
+  return match[1];
+};
+
 describe('Web Console real execution lifecycle', () => {
   let rootDir: string | undefined;
   let provider: FakeOpenAiServer | undefined;
@@ -317,6 +325,12 @@ describe('Web Console real execution lifecycle', () => {
     const htmlResponse = await fetch(server.url);
     const html = await htmlResponse.text();
     expect(htmlResponse.status).toBe(200);
+    const cspNonce = cspNonceFrom(
+      htmlResponse.headers.get('content-security-policy'),
+    );
+    expect(html).toContain(
+      `<meta property="csp-nonce" nonce="${cspNonce}">`,
+    );
     const csrfToken = csrfTokenFrom(html);
 
     const runtime = await readJson<unknown>(await fetch(`${origin}/api/runtime`));

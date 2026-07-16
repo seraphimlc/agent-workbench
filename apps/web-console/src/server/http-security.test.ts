@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 type RuntimeSecurity = {
   readonly port: number;
   readonly csrfToken: string;
+  readonly cspNonce: string;
 };
 
 type SecurityInput = {
@@ -22,12 +23,19 @@ type SecurityDecision =
     };
 
 type HttpSecurityModule = {
-  createRuntimeSecurity(port: number, csrfToken?: string): RuntimeSecurity;
+  createRuntimeSecurity(
+    port: number,
+    csrfToken?: string,
+    cspNonce?: string,
+  ): RuntimeSecurity;
   validateBrowserRequest(
     request: SecurityInput,
     runtimeSecurity: RuntimeSecurity,
   ): SecurityDecision;
-  createHttpSecurityHeaders(kind: 'api' | 'html'): Readonly<Record<string, string>>;
+  createHttpSecurityHeaders(
+    kind: 'api' | 'html',
+    runtimeSecurity?: RuntimeSecurity,
+  ): Readonly<Record<string, string>>;
   injectCsrfMeta(html: string, runtimeSecurity: RuntimeSecurity): string;
 };
 
@@ -235,22 +243,43 @@ describe('web console HTTP security', () => {
     ).toBe(false);
   });
 
-  it('provides no-store API headers and the exact HTML CSP', async () => {
-    const { createHttpSecurityHeaders } = await loadHttpSecurity();
+  it('provides unchanged API headers and an exact nonce-scoped HTML CSP', async () => {
+    const { createHttpSecurityHeaders, createRuntimeSecurity } =
+      await loadHttpSecurity();
+    const security = createRuntimeSecurity(
+      4173,
+      'csrf-token',
+      'specific-csp-nonce',
+    );
 
     expect(createHttpSecurityHeaders('api')).toEqual({
       'cache-control': 'no-store',
     });
-    expect(createHttpSecurityHeaders('html')).toEqual({
+    expect(createHttpSecurityHeaders('html', security)).toEqual({
       'cache-control': 'no-store',
       'content-security-policy':
-        "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'self'; connect-src 'self'; style-src 'self' 'nonce-specific-csp-nonce'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
     });
   });
 
+  it.each(['', 'nonce value', "nonce'; style-src *"])(
+    'rejects an invalid CSP nonce %s',
+    async (cspNonce) => {
+      const { createRuntimeSecurity } = await loadHttpSecurity();
+
+      expect(() =>
+        createRuntimeSecurity(4173, 'csrf-token', cspNonce),
+      ).toThrow('Invalid web console runtime security configuration');
+    },
+  );
+
   it('injects the CSRF token into HTML metadata without placing it in a URL', async () => {
     const { createRuntimeSecurity, injectCsrfMeta } = await loadHttpSecurity();
-    const security = createRuntimeSecurity(4173, 'csrf-token&value');
+    const security = createRuntimeSecurity(
+      4173,
+      'csrf-token&value',
+      'specific-csp-nonce',
+    );
     const html = '<html><head><title>Workbench</title></head><body></body></html>';
     const injected = injectCsrfMeta(html, security);
 
@@ -259,6 +288,7 @@ describe('web console HTTP security', () => {
     );
     expect(injected).not.toContain('?csrf');
     expect(injected.indexOf('<meta')).toBeLessThan(injected.indexOf('</head>'));
+    expect(security.cspNonce).toBe('specific-csp-nonce');
     expect(JSON.stringify(security)).toBe('{"port":4173}');
   });
 });

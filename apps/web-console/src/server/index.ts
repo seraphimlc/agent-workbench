@@ -68,7 +68,7 @@ export type WebConsoleServerDependencies = {
   readonly connectDaemonRpcClient: (
     socketPath: string,
   ) => Promise<RpcControllerClient>;
-  readonly createViteServer: () => Promise<ViteServerLike>;
+  readonly createViteServer: (cspNonce: string) => Promise<ViteServerLike>;
   readonly loadIndexHtml: () => Promise<string>;
   readonly createCsrfToken: () => string;
   readonly sleep: (milliseconds: number) => Promise<void>;
@@ -93,12 +93,15 @@ export type ShutdownSignalSource = {
   off(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
 };
 
-const createDefaultViteServer = async (): Promise<ViteServerLike> => {
+const createDefaultViteServer = async (
+  cspNonce: string,
+): Promise<ViteServerLike> => {
   const vite = await import('vite');
   return await vite.createServer({
     root: appRoot,
     appType: 'custom',
     clearScreen: false,
+    html: { cspNonce },
     logLevel: 'silent',
     server: { middlewareMode: true, hmr: false },
   });
@@ -235,9 +238,10 @@ const sendPublicError = (
 const sendHtml = (
   response: ServerResponse,
   html: string,
+  runtimeSecurity: RuntimeSecurity,
 ): void => {
   response.writeHead(200, {
-    ...createHttpSecurityHeaders('html'),
+    ...createHttpSecurityHeaders('html', runtimeSecurity),
     'content-type': 'text/html; charset=utf-8',
   });
   response.end(html);
@@ -290,7 +294,11 @@ const createBrowserHandler = (options: {
         url.pathname,
         options.indexHtml,
       );
-      sendHtml(response, injectCsrfMeta(transformed, options.runtimeSecurity));
+      sendHtml(
+        response,
+        injectCsrfMeta(transformed, options.runtimeSecurity),
+        options.runtimeSecurity,
+      );
       return;
     }
 
@@ -537,7 +545,7 @@ export const startWebConsoleServer = async (
       workspace,
     });
     vite = await raceWithAbort(
-      dependencies.createViteServer(),
+      dependencies.createViteServer(runtimeSecurity.cspNonce),
       startupAbort.signal,
       async (lateVite) => await lateVite.close(),
     );

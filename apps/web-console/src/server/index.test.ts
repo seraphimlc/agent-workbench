@@ -57,7 +57,7 @@ type ServerModule = {
         send(request: RpcRequest): Promise<unknown>;
         close(): Promise<void>;
       }>;
-      createViteServer(): Promise<{
+      createViteServer(cspNonce: string): Promise<{
         middlewares(
           request: IncomingMessage,
           response: ServerResponse,
@@ -122,6 +122,7 @@ describe('web console server', () => {
     const bootstrapSecret = Buffer.alloc(32, 7);
     let requestSequence = 0;
     let serverUrl = '';
+    let viteCspNonce = '';
     const server = await startWebConsoleServer({
       cwd: process.cwd(),
       environment,
@@ -193,8 +194,9 @@ describe('web console server', () => {
             },
           };
         },
-        createViteServer: async () => {
+        createViteServer: async (cspNonce) => {
           lifecycle.push('vite');
+          viteCspNonce = cspNonce ?? '';
           return {
             middlewares: (request, response, next) => {
               if (request.url === '/asset.js') {
@@ -205,7 +207,10 @@ describe('web console server', () => {
               next();
             },
             transformIndexHtml: async (_url, html) =>
-              html.replace('<title>', '<meta name="vite-test" content="ok"><title>'),
+              html.replace(
+                '<title>',
+                `<meta property="csp-nonce" nonce="${viteCspNonce}"><meta name="vite-test" content="ok"><title>`,
+              ),
             close: async () => {
               lifecycle.push('vite.close');
             },
@@ -251,9 +256,13 @@ describe('web console server', () => {
     expect(html.status).toBe(200);
     expect(html.headers.get('cache-control')).toBe('no-store');
     expect(html.headers.get('content-security-policy')).toBe(
-      "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'",
+      `default-src 'self'; connect-src 'self'; style-src 'self' 'nonce-${viteCspNonce}'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'`,
     );
+    expect(viteCspNonce).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(htmlBody).toContain('<meta name="agent-workbench-csrf" content="csrf-token">');
+    expect(htmlBody).toContain(
+      `<meta property="csp-nonce" nonce="${viteCspNonce}">`,
+    );
     expect(htmlBody).toContain('<meta name="vite-test" content="ok">');
 
     const asset = await fetch(`${server.url}asset.js`);
