@@ -120,8 +120,10 @@ const ensurePrivateDirectory = (path: string): string => {
   }
 };
 
-const createRuntimeDirectory = (): string => {
-  const runtimeRoot = realpathSync(tmpdir());
+const createRuntimeDirectory = (runtimeRootInput?: string): string => {
+  const runtimeRoot = runtimeRootInput
+    ? ensurePrivateDirectory(runtimeRootInput)
+    : realpathSync(tmpdir());
   const runtimeDir = mkdtempSync(join(runtimeRoot, 'awb-d-'));
   try {
     return ensurePrivateDirectory(runtimeDir);
@@ -131,34 +133,27 @@ const createRuntimeDirectory = (): string => {
   }
 };
 
-const isBootstrapSecretEnvironmentKey = (key: string): boolean => {
-  const normalizedKey = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  const bootstrapIndex = normalizedKey.indexOf('bootstrap');
-  return (
-    bootstrapIndex >= 0 &&
-    normalizedKey.indexOf('secret', bootstrapIndex + 'bootstrap'.length) >= 0
-  );
-};
+const inheritedEnvironmentKeys = new Set([
+  'PATH',
+  'HOME',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'LANG',
+  'TZ',
+]);
 
-const controlledEnvironmentKeys = new Set(
-  [
-    'AGENT_WORKBENCH_PROVIDER_BASE_URL',
-    'AGENT_WORKBENCH_PROVIDER_API_KEY',
-    'AGENT_WORKBENCH_PROVIDER_MODEL',
-    'AGENT_WORKBENCH_DEMO_WORKSPACE',
-  ].map((key) => key.replace(/[^a-z0-9]/gi, '').toLowerCase()),
-);
+const isAllowedInheritedEnvironmentKey = (key: string): boolean =>
+  inheritedEnvironmentKeys.has(key) || key.startsWith('LC_');
 
 const controlledEnvironment = (
   provider: ResolvedProviderConfig,
   workspacePath: string,
 ): NodeJS.ProcessEnv => {
   const environment = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => {
-      if (isBootstrapSecretEnvironmentKey(key)) return false;
-      const normalizedKey = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
-      return !controlledEnvironmentKeys.has(normalizedKey);
-    }),
+    Object.entries(process.env).filter(([key]) =>
+      isAllowedInheritedEnvironmentKey(key),
+    ),
   );
   return {
     ...environment,
@@ -288,9 +283,7 @@ export class DaemonProcessManager {
     }
     validateProvider(options.provider);
     const dataDir = ensurePrivateDirectory(options.dataDir);
-    const runtimeDir = options.runtimeDir
-      ? ensurePrivateDirectory(options.runtimeDir)
-      : createRuntimeDirectory();
+    const runtimeDir = createRuntimeDirectory(options.runtimeDir);
     const socketPath = join(runtimeDir, 'd.sock');
     if (Buffer.byteLength(socketPath) > MAX_UNIX_SOCKET_PATH_BYTES) {
       rmSync(runtimeDir, { force: true, recursive: true });
@@ -343,6 +336,7 @@ export class DaemonProcessManager {
     let lifecycle: LifecycleState = 'starting';
     let runtimeCleaned = false;
     const cleanupRuntime = (): void => {
+      handleSecret.fill(0);
       if (runtimeCleaned) return;
       runtimeCleaned = true;
       rmSync(runtimeDir, { force: true, recursive: true });
@@ -410,8 +404,10 @@ export class DaemonProcessManager {
       }
       if (lifecycle !== 'running') return;
       lifecycle = 'failed';
-      resolveFailure(error);
-      void beginShutdown();
+      void beginShutdown().then(
+        () => resolveFailure(error),
+        () => resolveFailure(error),
+      );
     };
     const maybeCompleteStartup = (): void => {
       if (

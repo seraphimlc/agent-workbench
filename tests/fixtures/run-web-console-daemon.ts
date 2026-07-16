@@ -13,7 +13,11 @@ const optionValue = (name: '--data-dir' | '--socket'): string => {
 };
 
 const dataDir = optionValue('--data-dir');
-const mode = process.env.AGENT_WORKBENCH_TEST_DAEMON_MODE ?? 'ready';
+const fixtureModePrefix = 'fixture-mode-';
+const configuredModel = process.env.AGENT_WORKBENCH_PROVIDER_MODEL ?? '';
+const mode = configuredModel.startsWith(fixtureModePrefix)
+  ? configuredModel.slice(fixtureModePrefix.length)
+  : 'ready';
 writeFileSync(
   join(dataDir, 'web-console-daemon-launch.json'),
   JSON.stringify({
@@ -44,6 +48,9 @@ if (mode === 'hang') {
         `${JSON.stringify({ event: 'ready', protocolVersion: 1, pid: process.pid })}\n`,
       );
     }, 150);
+  }
+  if (mode === 'late-exit') {
+    setTimeout(() => process.exit(23), 150);
   }
   if (mode === 'ignore-sigterm') {
     process.removeAllListeners('SIGTERM');
