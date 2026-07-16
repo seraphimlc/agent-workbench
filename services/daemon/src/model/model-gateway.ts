@@ -104,6 +104,14 @@ const DEFAULT_BUILTIN_TOOLS = Object.freeze(
   selectBuiltinToolDefinitions(Object.keys(BUILTIN_TOOL_DEFINITIONS)),
 );
 
+const toolDefinitionId = (definition: unknown): string | undefined => {
+  if (typeof definition !== 'object' || definition === null || Array.isArray(definition)) {
+    return undefined;
+  }
+  const toolId = (definition as Record<string, unknown>).toolId;
+  return typeof toolId === 'string' && toolId.length > 0 ? toolId : undefined;
+};
+
 const sha256 = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
 
@@ -154,7 +162,10 @@ const validateArguments = (toolId: string, argumentsJson: string): void => {
   throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id is not allowlisted');
 };
 
-const validateProviderResult = (result: ProviderResult): ValidatedToolCall[] => {
+const validateProviderResult = (
+  result: ProviderResult,
+  authorizedToolIds: ReadonlySet<string>,
+): ValidatedToolCall[] => {
   if (result.finishReason === 'stop') {
     if (
       result.content === null ||
@@ -177,6 +188,9 @@ const validateProviderResult = (result: ProviderResult): ValidatedToolCall[] => 
     ) {
       throw new ModelGatewayError('MODEL_RESPONSE_INVALID', 'Tool Call identity is invalid');
     }
+    if (!authorizedToolIds.has(toolCall.toolId)) {
+      throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id was not advertised');
+    }
     logicalIds.add(toolCall.logicalCallId);
     validateArguments(toolCall.toolId, toolCall.argumentsJson);
     return {
@@ -197,6 +211,7 @@ export class ModelGateway {
     readonly apiKey: string;
   };
   private readonly tools: readonly unknown[];
+  private readonly authorizedToolIds: ReadonlySet<string>;
   private readonly now: () => Date;
   private readonly createId: () => string;
 
@@ -217,6 +232,11 @@ export class ModelGateway {
     this.adapter = options.adapter;
     this.provider = { ...options.provider };
     this.tools = Object.freeze([...(options.tools ?? DEFAULT_BUILTIN_TOOLS)]);
+    this.authorizedToolIds = new Set(
+      this.tools
+        .map((tool) => toolDefinitionId(tool))
+        .filter((toolId): toolId is string => toolId !== undefined),
+    );
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? uuidv7;
     this.repository = new ExecutionRepository(database);
@@ -352,7 +372,7 @@ export class ModelGateway {
 
     let toolCalls: ValidatedToolCall[];
     try {
-      toolCalls = validateProviderResult(providerResult);
+      toolCalls = validateProviderResult(providerResult, this.authorizedToolIds);
     } catch (error) {
       const code = errorCode(error) ?? 'MODEL_RESPONSE_INVALID';
       this.commitFailure(input.binding, modelCallId, modelAttemptId, operationKey, code);

@@ -74,6 +74,7 @@ type ModelGatewayModule = {
         readonly modelId: string;
         readonly apiKey: string;
       };
+      readonly tools?: readonly unknown[];
       readonly now: () => Date;
       readonly createId: () => string;
     },
@@ -485,6 +486,46 @@ describe('ModelAttempt and ToolCall authorization', () => {
         },
       }),
     ).toThrow(expect.objectContaining({ code: 'MODEL_TOOL_UNAUTHORIZED' }));
+  });
+
+  it('rejects an unadvertised builtin Tool Call before persistence', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const adapter = new ControlledAdapter();
+    const { ModelGateway } = await loadModelGateway();
+    const gateway = new ModelGateway(fixture.database, {
+      adapter,
+      provider: {
+        endpoint: PROVIDER_ENDPOINT,
+        modelId: PROVIDER_MODEL,
+        apiKey: PROVIDER_API_KEY,
+      },
+      tools: [{ toolId: 'fs.read_text', ...providerTools[0] }],
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('unadvertised-tool'),
+    });
+
+    try {
+      const call = gateway.call({ binding: fixture.claim, messages: modelMessages() });
+      const request = await adapter.started.promise;
+      expect(
+        request.tools.map((tool) => (tool as { readonly toolId: string }).toolId),
+      ).toEqual(['fs.read_text']);
+      adapter.result.resolve(
+        successfulToolResult({
+          toolId: 'fs.write_text',
+          argumentsJson: '{"path":"notes.md","content":"unauthorized"}',
+        }),
+      );
+
+      await expect(call).rejects.toMatchObject({ code: 'MODEL_TOOL_UNAUTHORIZED' });
+      expect(authorizationCounts(fixture.database)).toEqual({
+        modelToolCalls: 0,
+        toolRuns: 0,
+      });
+    } finally {
+      fixture.database.close();
+    }
   });
 
   it('commits running Model facts, start Events, and a redacted audit intent before adapter fetch', async () => {
