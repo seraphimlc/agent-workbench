@@ -33,6 +33,7 @@ const MODEL_ID = 'web-console-runtime-model';
 const PROMPT = 'Read README.md and summarize it.';
 const README_CONTENT = '# Runtime E2E\n\nThe real Web Console executed this turn.\n';
 const FINAL_SUMMARY = 'README.md confirms the real Web Console executed this turn.';
+const PROVIDER_READ_TOOL_NAME = 'fs_read_text';
 const TOOL_CALL = {
   logicalCallId: 'call-runtime-readme',
   toolId: 'fs.read_text',
@@ -41,7 +42,7 @@ const TOOL_CALL = {
 const PROVIDER_READ_TOOL = {
   type: 'function',
   function: {
-    name: 'fs.read_text',
+    name: PROVIDER_READ_TOOL_NAME,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -81,7 +82,7 @@ const toolResponse = (requestId: string, logicalCallId: string): Uint8Array =>
                 id: logicalCallId,
                 type: 'function',
                 function: {
-                  name: 'fs.read_text',
+                  name: PROVIDER_READ_TOOL.function.name,
                   arguments: '{"path":"README.md"}',
                 },
               },

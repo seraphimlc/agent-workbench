@@ -31,10 +31,11 @@ const encoder = new TextEncoder();
 const PROVIDER_API_KEY = 'web-console-shutdown-secret-key';
 const MODEL_ID = 'web-console-shutdown-model';
 const PROMPT = 'Keep this model request active until shutdown.';
+const PROVIDER_READ_TOOL_NAME = 'fs_read_text';
 const PROVIDER_READ_TOOL = {
   type: 'function',
   function: {
-    name: 'fs.read_text',
+    name: PROVIDER_READ_TOOL_NAME,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -92,7 +93,7 @@ const toolResponse = (requestId: string): Uint8Array =>
                 id: 'call-probe-readme',
                 type: 'function',
                 function: {
-                  name: 'fs.read_text',
+                  name: PROVIDER_READ_TOOL.function.name,
                   arguments: '{"path":"README.md"}',
                 },
               },
