@@ -11,12 +11,15 @@ type WorkspaceReadHandler = (input: {
 }) => Promise<{ readonly content: string }>;
 
 type WorkspaceReadToolModule = {
+  parseLsofDescriptorPath(output: Uint8Array): string;
   createWorkspaceReadHandler(options: {
     readonly workspacePath: string;
     readonly controlPlanePaths: readonly string[];
+    readonly descriptorPathResolver?: (fd: number) => unknown | Promise<unknown>;
     readonly hooks?: {
       readonly afterOpen?: () => void | Promise<void>;
       readonly afterRealpath?: () => void | Promise<void>;
+      readonly afterLstat?: () => void | Promise<void>;
     };
   }): WorkspaceReadHandler;
 };
@@ -80,6 +83,22 @@ describe('createWorkspaceReadHandler', () => {
   it('reads a valid UTF-8 file from the workspace', async () => {
     const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
     const fixture = await createFixture();
+    const filePath = join(fixture.workspacePath, 'README.md');
+    await writeFile(filePath, '# Workspace\n');
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => filePath,
+    });
+
+    await expect(executeRead(handler, { path: 'README.md' })).resolves.toEqual({
+      content: '# Workspace\n',
+    });
+  });
+
+  it.runIf(process.platform === 'darwin')('uses the Darwin descriptor resolver by default', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
     await writeFile(join(fixture.workspacePath, 'README.md'), '# Workspace\n');
     const handler = createWorkspaceReadHandler({
       workspacePath: fixture.workspacePath,
@@ -89,6 +108,25 @@ describe('createWorkspaceReadHandler', () => {
     await expect(executeRead(handler, { path: 'README.md' })).resolves.toEqual({
       content: '# Workspace\n',
     });
+  });
+
+  it.runIf(process.platform !== 'darwin')('fails closed without an injected resolver outside Darwin', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    await writeFile(join(fixture.workspacePath, 'README.md'), '# Workspace\n');
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+    });
+
+    await expectCode(executeRead(handler, { path: 'README.md' }), 'WORKSPACE_FILE_CHANGED');
+  });
+
+  it('parses exactly one NUL-delimited lsof name field', async () => {
+    const { parseLsofDescriptorPath } = await loadWorkspaceReadTool();
+    const output = new TextEncoder().encode('p123\0\nf9\0n/workspace/README.md\0\n');
+
+    expect(parseLsofDescriptorPath(output)).toBe('/workspace/README.md');
   });
 
   it.each(['/etc/passwd', String.raw`C:\Windows\system.ini`])(
@@ -198,32 +236,86 @@ describe('createWorkspaceReadHandler', () => {
     expect(error.message).not.toContain(fixture.controlPlanePath);
   });
 
-  it('rejects an intermediate symlink switched between realpath and lstat', async () => {
+  it('rejects an intermediate symlink switched inside to outside to inside', async () => {
     const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
     const fixture = await createFixture();
     const workspaceDirectory = join(fixture.workspacePath, 'workspace-files');
+    const workspaceFile = join(workspaceDirectory, 'README.md');
     const linkedDirectory = join(fixture.workspacePath, 'linked-directory');
-    const replacementLink = join(fixture.workspacePath, 'replacement-link');
+    const outsideReplacementLink = join(fixture.workspacePath, 'outside-replacement-link');
+    const insideReplacementLink = join(fixture.workspacePath, 'inside-replacement-link');
+    const outsideFile = join(fixture.controlPlanePath, 'README.md');
+    let resolvedDescriptor: number | undefined;
     await mkdir(workspaceDirectory);
-    await writeFile(join(workspaceDirectory, 'README.md'), 'workspace file');
+    await writeFile(workspaceFile, 'workspace file');
     await symlink(workspaceDirectory, linkedDirectory);
-    await symlink(fixture.controlPlanePath, replacementLink);
+    await symlink(fixture.controlPlanePath, outsideReplacementLink);
+    await symlink(workspaceDirectory, insideReplacementLink);
     const handler = createWorkspaceReadHandler({
       workspacePath: fixture.workspacePath,
       controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async (fd) => {
+        resolvedDescriptor = fd;
+        return outsideFile;
+      },
       hooks: {
         afterRealpath: async () => {
-          await rename(
-            join(workspaceDirectory, 'README.md'),
-            join(fixture.controlPlanePath, 'README.md'),
-          );
-          await rename(replacementLink, linkedDirectory);
+          await rename(workspaceFile, outsideFile);
+          await rename(outsideReplacementLink, linkedDirectory);
+        },
+        afterLstat: async () => {
+          await rename(outsideFile, workspaceFile);
+          await writeFile(outsideFile, 'outside resolver file');
+          await rename(insideReplacementLink, linkedDirectory);
         },
       },
     });
 
     const error = await expectCode(
       executeRead(handler, { path: 'linked-directory/README.md' }),
+      'WORKSPACE_FILE_CHANGED',
+    );
+    expect(resolvedDescriptor).toEqual(expect.any(Number));
+    expect(error.message).not.toContain(fixture.controlPlanePath);
+  });
+
+  it('fails closed when descriptor resolution throws', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    const filePath = join(fixture.workspacePath, 'README.md');
+    await writeFile(filePath, 'workspace file');
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => {
+        throw new Error(`resolver exposed ${fixture.controlPlanePath}`);
+      },
+    });
+
+    const error = await expectCode(
+      executeRead(handler, { path: 'README.md' }),
+      'WORKSPACE_FILE_CHANGED',
+    );
+    expect(error.message).not.toContain(fixture.controlPlanePath);
+  });
+
+  it('fails closed when lsof reports multiple descriptor paths', async () => {
+    const { createWorkspaceReadHandler, parseLsofDescriptorPath } =
+      await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    const filePath = join(fixture.workspacePath, 'README.md');
+    await writeFile(filePath, 'workspace file');
+    const output = new TextEncoder().encode(
+      `n${filePath}\0n${join(fixture.controlPlanePath, 'README.md')}\0`,
+    );
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => parseLsofDescriptorPath(output),
+    });
+
+    const error = await expectCode(
+      executeRead(handler, { path: 'README.md' }),
       'WORKSPACE_FILE_CHANGED',
     );
     expect(error.message).not.toContain(fixture.controlPlanePath);
@@ -262,10 +354,12 @@ describe('createWorkspaceReadHandler', () => {
   it('rejects files larger than 256 KiB', async () => {
     const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
     const fixture = await createFixture();
-    await writeFile(join(fixture.workspacePath, 'large.txt'), Buffer.alloc(MAX_BYTES + 1, 0x61));
+    const filePath = join(fixture.workspacePath, 'large.txt');
+    await writeFile(filePath, Buffer.alloc(MAX_BYTES + 1, 0x61));
     const handler = createWorkspaceReadHandler({
       workspacePath: fixture.workspacePath,
       controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => filePath,
     });
 
     await expectCode(executeRead(handler, { path: 'large.txt' }), 'WORKSPACE_FILE_TOO_LARGE');
@@ -274,10 +368,12 @@ describe('createWorkspaceReadHandler', () => {
   it('rejects malformed UTF-8', async () => {
     const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
     const fixture = await createFixture();
-    await writeFile(join(fixture.workspacePath, 'invalid.txt'), Buffer.from([0xc3, 0x28]));
+    const filePath = join(fixture.workspacePath, 'invalid.txt');
+    await writeFile(filePath, Buffer.from([0xc3, 0x28]));
     const handler = createWorkspaceReadHandler({
       workspacePath: fixture.workspacePath,
       controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => filePath,
     });
 
     await expectCode(executeRead(handler, { path: 'invalid.txt' }), 'WORKSPACE_FILE_NOT_UTF8');

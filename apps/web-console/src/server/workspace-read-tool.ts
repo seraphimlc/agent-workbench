@@ -1,9 +1,12 @@
+import { execFile } from 'node:child_process';
 import { constants, realpathSync, statSync } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { isAbsolute, posix, relative, resolve, sep, win32 } from 'node:path';
 
 const MAX_BYTES = 256 * 1024;
+const LSOF_PATH = '/usr/sbin/lsof';
+const LSOF_MAX_OUTPUT_BYTES = 64 * 1024;
 
 export type WorkspaceReadErrorCode =
   | 'WORKSPACE_PATH_INVALID'
@@ -28,12 +31,16 @@ export type WorkspaceReadHandler = (input: {
   readonly input: unknown;
 }) => Promise<{ readonly content: string }>;
 
+export type DescriptorPathResolver = (fd: number) => unknown | Promise<unknown>;
+
 export type WorkspaceReadBoundary = {
   readonly workspacePath: string;
   readonly controlPlanePaths: readonly string[];
+  readonly descriptorPathResolver?: DescriptorPathResolver;
   readonly hooks?: {
     readonly afterOpen?: () => void | Promise<void>;
     readonly afterRealpath?: () => void | Promise<void>;
+    readonly afterLstat?: () => void | Promise<void>;
   };
 };
 
@@ -67,6 +74,9 @@ const isWithin = (parentPath: string, candidatePath: string): boolean => {
     (!isAbsolute(relativePath) && relativePath !== '..' && !relativePath.startsWith(`..${sep}`))
   );
 };
+
+const isStrictlyWithin = (parentPath: string, candidatePath: string): boolean =>
+  parentPath !== candidatePath && isWithin(parentPath, candidatePath);
 
 const pathsOverlap = (firstPath: string, secondPath: string): boolean =>
   isWithin(firstPath, secondPath) || isWithin(secondPath, firstPath);
@@ -125,8 +135,58 @@ const openNoFollow = async (candidatePath: string): Promise<FileHandle> => {
   }
 };
 
+const descriptorResolutionError = (): Error => new Error('Descriptor path resolution failed');
+
+export const parseLsofDescriptorPath = (output: Uint8Array): string => {
+  let decoded: string;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(output);
+  } catch {
+    throw descriptorResolutionError();
+  }
+
+  const paths = decoded
+    .split('\0')
+    .filter((field) => field.startsWith('n'))
+    .map((field) => field.slice(1));
+  const [descriptorPath] = paths;
+  if (paths.length !== 1 || descriptorPath === undefined || descriptorPath.length === 0) {
+    throw descriptorResolutionError();
+  }
+  return descriptorPath;
+};
+
+const runLsofForDescriptor = async (fd: number): Promise<Uint8Array> =>
+  new Promise((resolvePromise, rejectPromise) => {
+    execFile(
+      LSOF_PATH,
+      ['-a', '-p', String(process.pid), '-d', String(fd), '-F0n'],
+      {
+        encoding: 'buffer',
+        maxBuffer: LSOF_MAX_OUTPUT_BYTES,
+        shell: false,
+      },
+      (error, stdout) => {
+        if (error || !Buffer.isBuffer(stdout)) {
+          rejectPromise(descriptorResolutionError());
+          return;
+        }
+        resolvePromise(stdout);
+      },
+    );
+  });
+
+const resolveDarwinDescriptorPath = async (fd: number): Promise<string> => {
+  if (process.platform !== 'darwin') {
+    throw descriptorResolutionError();
+  }
+  return parseLsofDescriptorPath(await runLsofForDescriptor(fd));
+};
+
 export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): WorkspaceReadHandler => {
   const workspacePath = canonicalizeStartupPath(boundary.workspacePath);
+  const descriptorPathResolver =
+    boundary.descriptorPathResolver ?? resolveDarwinDescriptorPath;
   try {
     if (!statSync(workspacePath).isDirectory()) {
       throw codedError('WORKSPACE_PATH_INVALID');
@@ -194,6 +254,12 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
 
+      try {
+        await boundary.hooks?.afterLstat?.();
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
       let verifiedCanonicalPath: string;
       try {
         verifiedCanonicalPath = await realpath(candidatePath);
@@ -201,6 +267,34 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
       if (verifiedCanonicalPath !== canonicalPath || !isWithin(workspacePath, verifiedCanonicalPath)) {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
+      let descriptorPath: unknown;
+      try {
+        descriptorPath = await descriptorPathResolver(descriptor.fd);
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+      if (
+        typeof descriptorPath !== 'string' ||
+        descriptorPath.length === 0 ||
+        descriptorPath.includes('\0') ||
+        !isAbsolute(descriptorPath)
+      ) {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
+      let canonicalDescriptorPath: string;
+      try {
+        canonicalDescriptorPath = await realpath(descriptorPath);
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+      if (
+        !isStrictlyWithin(workspacePath, canonicalDescriptorPath) ||
+        canonicalDescriptorPath !== verifiedCanonicalPath
+      ) {
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
 
