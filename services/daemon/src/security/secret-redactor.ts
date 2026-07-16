@@ -17,12 +17,7 @@ export const redactAndLimit = (
   value: string,
   secrets: readonly string[],
   maxBytes: number,
-): string => {
-  const redacted = redactSecrets(value, secrets);
-  const bytes = Buffer.from(redacted, 'utf8');
-  if (bytes.byteLength <= maxBytes) return redacted;
-
-  let end = Math.max(0, Math.floor(maxBytes));
-  while (end > 0 && ((bytes[end] as number) & 0xc0) === 0x80) end -= 1;
-  return bytes.subarray(0, end).toString('utf8');
-};
+): string =>
+  Buffer.from(redactSecrets(value, secrets), 'utf8')
+    .subarray(0, maxBytes)
+    .toString('utf8');

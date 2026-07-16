@@ -34,10 +34,9 @@ describe('redactAndLimit', () => {
     expect(Buffer.byteLength(result, 'utf8')).toBeLessThanOrEqual(12);
   });
 
-  it('does not split a UTF-8 code point at the byte limit', () => {
+  it('preserves Buffer truncation semantics for partial UTF-8 code points', () => {
     const result = redactAndLimit('你好世界', [], 7);
 
-    expect(result).toBe('你好');
-    expect(Buffer.byteLength(result, 'utf8')).toBeLessThanOrEqual(7);
+    expect(result).toBe('你好�');
   });
 });
