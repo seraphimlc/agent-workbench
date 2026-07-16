@@ -24,6 +24,15 @@ describe('redactSecrets', () => {
       'before [REDACTED] after',
     );
   });
+
+  it('chooses a placeholder that does not collide with any secret', () => {
+    const secrets = ['token', '[REDACTED]', 'REDACTED', '['];
+    const result = redactSecrets('token', secrets);
+
+    expect(result).not.toBe('');
+    expect(result).not.toBe('[REDACTED]');
+    for (const secret of secrets) expect(result).not.toContain(secret);
+  });
 });
 
 describe('redactAndLimit', () => {
