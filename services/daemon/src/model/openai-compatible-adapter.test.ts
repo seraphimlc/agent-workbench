@@ -32,6 +32,84 @@ const FAKE_SERVER_MODULE_PATH = '../../../../packages/testkit/src/fake-openai-se
 const encoder = new TextEncoder();
 const event = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`;
 
+const toolDefinition = (toolId: string): unknown => ({
+  toolId,
+  type: 'function',
+  function: { name: toolId, parameters: { type: 'object' } },
+});
+
+const providerToolDefinition = (name: string): unknown => ({
+  type: 'function',
+  function: { name, parameters: { type: 'object' } },
+});
+
+const toolCallResponse = (
+  requestId: string,
+  toolCalls: readonly {
+    readonly logicalCallId: string;
+    readonly providerName: string;
+    readonly argumentsJson: string;
+  }[],
+): Uint8Array =>
+  encoder.encode(
+    event({
+      id: requestId,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              id: toolCall.logicalCallId,
+              type: 'function',
+              function: {
+                name: toolCall.providerName,
+                arguments: toolCall.argumentsJson,
+              },
+            })),
+          },
+        },
+      ],
+    }) +
+      event({
+        id: requestId,
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      }) +
+      'data: [DONE]\n\n',
+  );
+
+const startAdapterServer = async (input: {
+  readonly messages: readonly unknown[];
+  readonly expectedTools: readonly unknown[];
+  readonly response: Uint8Array;
+}): Promise<FakeOpenAiServer> => {
+  const { startFakeOpenAiServer } = await loadFakeServer();
+  return await startFakeOpenAiServer({
+    scripts: [
+      {
+        expectedRequest: {
+          method: 'POST',
+          path: '/v1/chat/completions',
+          headers: {
+            authorization: 'Bearer adapter-test-key',
+            'content-type': 'application/json',
+          },
+          jsonBody: {
+            model: 'adapter-test-model',
+            stream: true,
+            messages: input.messages,
+            tools: input.expectedTools,
+          },
+        },
+        response: {
+          headers: { 'content-type': 'text/event-stream' },
+          chunks: [input.response],
+        },
+      },
+    ],
+  });
+};
+
 const loadFakeServer = async (): Promise<FakeServerModule> =>
   (await import(FAKE_SERVER_MODULE_PATH)) as unknown as FakeServerModule;
 
@@ -132,9 +210,10 @@ describe('OpenAiCompatibleAdapter', () => {
     }
   });
 
-  it('uses the endpoint, model, and credential supplied for the audited call', async () => {
+  it('uses the audited request inputs and leaves a text-only response unchanged', async () => {
     const { startFakeOpenAiServer } = await loadFakeServer();
     const messages = [{ role: 'user', content: 'Say complete.' }] as const;
+    const tools = [toolDefinition('fs.read_text')] as const;
     const server = await startFakeOpenAiServer({
       scripts: [
         {
@@ -149,7 +228,7 @@ describe('OpenAiCompatibleAdapter', () => {
               model: 'audited-call-model',
               stream: true,
               messages,
-              tools: [],
+              tools: [providerToolDefinition('fs_read_text')],
             },
           },
           response: {
@@ -180,12 +259,111 @@ describe('OpenAiCompatibleAdapter', () => {
           modelId: 'audited-call-model',
           apiKey: 'audited-call-key',
           messages,
-          tools: [],
+          tools,
         }),
-      ).resolves.toMatchObject({
+      ).resolves.toEqual({
         finishReason: 'stop',
         content: 'Complete',
+        toolCalls: [],
         providerRequestId: 'response-audited-call',
+        usage: null,
+      });
+      await server.completed;
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('uses a provider-safe function name and restores the internal tool id', async () => {
+    const messages = [{ role: 'user', content: 'Read README.md.' }] as const;
+    const tools = [toolDefinition('fs.read_text')] as const;
+    const server = await startAdapterServer({
+      messages,
+      expectedTools: [providerToolDefinition('fs_read_text')],
+      response: toolCallResponse('response-adapter-tool', [
+        {
+          logicalCallId: 'call-readme',
+          providerName: 'fs_read_text',
+          argumentsJson: '{"path":"README.md"}',
+        },
+      ]),
+    });
+    const adapter = new OpenAiCompatibleAdapter({ timeoutMs: 5_000 });
+
+    try {
+      await expect(
+        adapter.call({
+          endpoint: new URL('/v1/chat/completions', server.baseUrl).toString(),
+          modelId: 'adapter-test-model',
+          apiKey: 'adapter-test-key',
+          messages,
+          tools,
+        }),
+      ).resolves.toMatchObject({
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            logicalCallId: 'call-readme',
+            toolId: 'fs.read_text',
+            argumentsJson: '{"path":"README.md"}',
+          },
+        ],
+      });
+      await server.completed;
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('assigns deterministic aliases when sanitized function names collide', async () => {
+    const messages = [{ role: 'user', content: 'Call every tool.' }] as const;
+    const tools = [
+      toolDefinition('fs/read_text'),
+      toolDefinition('fs_read_text'),
+      toolDefinition('fs.read_text'),
+    ] as const;
+    const server = await startAdapterServer({
+      messages,
+      expectedTools: [
+        providerToolDefinition('fs_read_text_3'),
+        providerToolDefinition('fs_read_text'),
+        providerToolDefinition('fs_read_text_2'),
+      ],
+      response: toolCallResponse('response-adapter-collisions', [
+        {
+          logicalCallId: 'call-slash',
+          providerName: 'fs_read_text_3',
+          argumentsJson: '{"source":"slash"}',
+        },
+        {
+          logicalCallId: 'call-safe',
+          providerName: 'fs_read_text',
+          argumentsJson: '{"source":"safe"}',
+        },
+        {
+          logicalCallId: 'call-dot',
+          providerName: 'fs_read_text_2',
+          argumentsJson: '{"source":"dot"}',
+        },
+      ]),
+    });
+    const adapter = new OpenAiCompatibleAdapter({ timeoutMs: 5_000 });
+
+    try {
+      await expect(
+        adapter.call({
+          endpoint: new URL('/v1/chat/completions', server.baseUrl).toString(),
+          modelId: 'adapter-test-model',
+          apiKey: 'adapter-test-key',
+          messages,
+          tools,
+        }),
+      ).resolves.toMatchObject({
+        toolCalls: [
+          { logicalCallId: 'call-slash', toolId: 'fs/read_text' },
+          { logicalCallId: 'call-safe', toolId: 'fs_read_text' },
+          { logicalCallId: 'call-dot', toolId: 'fs.read_text' },
+        ],
       });
       await server.completed;
     } finally {
@@ -224,7 +402,7 @@ describe('OpenAiCompatibleAdapter', () => {
                 {
                   type: 'function',
                   function: {
-                    name: 'fs.read_text',
+                    name: 'fs_read_text',
                     parameters: { type: 'object' },
                   },
                 },
