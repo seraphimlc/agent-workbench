@@ -18,7 +18,8 @@
     "test:watch": "vitest",
     "lint": "eslint . --max-warnings=0",
     "demo:web": "pnpm --filter @agent-workbench/web-console dev",
-    "smoke:runtime": "node --conditions=development --import tsx scripts/runtime-smoke.ts"
+    "smoke:runtime": "node --conditions=development --import tsx scripts/runtime-smoke.ts",
+    "smoke:web-real": "node --conditions=development --import tsx scripts/web-console-real-smoke.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
