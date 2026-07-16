@@ -41,6 +41,7 @@ export type WorkspaceReadBoundary = {
     readonly afterOpen?: () => void | Promise<void>;
     readonly afterRealpath?: () => void | Promise<void>;
     readonly afterLstat?: () => void | Promise<void>;
+    readonly afterDescriptorLstat?: () => void | Promise<void>;
   };
 };
 
@@ -285,10 +286,46 @@ export const createWorkspaceReadHandler = (boundary: WorkspaceReadBoundary): Wor
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
 
+      let descriptorIdentity;
+      try {
+        descriptorIdentity = await lstat(descriptorPath, { bigint: true });
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+      if (
+        !descriptorIdentity.isFile() ||
+        descriptorIdentity.nlink !== 1n ||
+        descriptorIdentity.dev !== opened.dev ||
+        descriptorIdentity.ino !== opened.ino
+      ) {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
+      try {
+        await boundary.hooks?.afterDescriptorLstat?.();
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
       let canonicalDescriptorPath: string;
       try {
         canonicalDescriptorPath = await realpath(descriptorPath);
       } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+
+      let verifiedDescriptorIdentity;
+      try {
+        verifiedDescriptorIdentity = await lstat(descriptorPath, { bigint: true });
+      } catch {
+        throw codedError('WORKSPACE_FILE_CHANGED');
+      }
+      if (
+        !verifiedDescriptorIdentity.isFile() ||
+        verifiedDescriptorIdentity.nlink !== 1n ||
+        verifiedDescriptorIdentity.dev !== opened.dev ||
+        verifiedDescriptorIdentity.ino !== opened.ino
+      ) {
         throw codedError('WORKSPACE_FILE_CHANGED');
       }
       if (

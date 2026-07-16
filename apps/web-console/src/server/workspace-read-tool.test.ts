@@ -20,6 +20,7 @@ type WorkspaceReadToolModule = {
       readonly afterOpen?: () => void | Promise<void>;
       readonly afterRealpath?: () => void | Promise<void>;
       readonly afterLstat?: () => void | Promise<void>;
+      readonly afterDescriptorLstat?: () => void | Promise<void>;
     };
   }): WorkspaceReadHandler;
 };
@@ -276,6 +277,51 @@ describe('createWorkspaceReadHandler', () => {
       'WORKSPACE_FILE_CHANGED',
     );
     expect(resolvedDescriptor).toEqual(expect.any(Number));
+    expect(error.message).not.toContain(fixture.controlPlanePath);
+  });
+
+  it('rejects a descriptor path replaced with a workspace symlink before realpath', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    const workspaceDirectory = join(fixture.workspacePath, 'workspace-files');
+    const workspaceFile = join(workspaceDirectory, 'README.md');
+    const linkedDirectory = join(fixture.workspacePath, 'linked-directory');
+    const outsideReplacementLink = join(fixture.workspacePath, 'outside-replacement-link');
+    const insideReplacementLink = join(fixture.workspacePath, 'inside-replacement-link');
+    const outsideFile = join(fixture.controlPlanePath, 'README.md');
+    const outsideBackup = join(fixture.controlPlanePath, 'opened-backup.md');
+    let hookCalls = 0;
+    await mkdir(workspaceDirectory);
+    await writeFile(workspaceFile, 'opened file');
+    await symlink(workspaceDirectory, linkedDirectory);
+    await symlink(fixture.controlPlanePath, outsideReplacementLink);
+    await symlink(workspaceDirectory, insideReplacementLink);
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+      descriptorPathResolver: async () => outsideFile,
+      hooks: {
+        afterRealpath: async () => {
+          await rename(workspaceFile, outsideFile);
+          await rename(outsideReplacementLink, linkedDirectory);
+        },
+        afterLstat: async () => {
+          await writeFile(workspaceFile, 'workspace replacement');
+          await rename(insideReplacementLink, linkedDirectory);
+        },
+        afterDescriptorLstat: async () => {
+          hookCalls += 1;
+          await rename(outsideFile, outsideBackup);
+          await symlink(workspaceFile, outsideFile);
+        },
+      },
+    });
+
+    const error = await expectCode(
+      executeRead(handler, { path: 'linked-directory/README.md' }),
+      'WORKSPACE_FILE_CHANGED',
+    );
+    expect(hookCalls).toBe(1);
     expect(error.message).not.toContain(fixture.controlPlanePath);
   });
 
