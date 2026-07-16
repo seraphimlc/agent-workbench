@@ -413,9 +413,14 @@ const assertRequiredLifecycle = (
 
   const firstModelCallId = payloadString(firstModelStarted, 'modelCallId');
   const secondModelCallId = payloadString(secondModelStarted, 'modelCallId');
+  const secondModelAttemptId = payloadString(
+    secondModelCompleted,
+    'modelAttemptId',
+  );
   if (
     firstModelCallId === null ||
     secondModelCallId === null ||
+    secondModelAttemptId === null ||
     firstModelCallId === secondModelCallId ||
     payloadString(firstModelCompleted, 'modelCallId') !== firstModelCallId ||
     payloadString(secondModelCompleted, 'modelCallId') !== secondModelCallId
@@ -444,7 +449,11 @@ const assertRequiredLifecycle = (
       payloadRecord(event)?.toolRunId === readToolRunId,
   );
   const turnSucceeded = events.find((event) => event.type === 'turn.succeeded');
-  if (readSucceeded === undefined || turnSucceeded === undefined) {
+  if (
+    readSucceeded === undefined ||
+    turnSucceeded === undefined ||
+    payloadString(turnSucceeded, 'modelAttemptId') !== secondModelAttemptId
+  ) {
     lifecycleFailure();
   }
 

@@ -107,6 +107,7 @@ type SucceededSnapshotOptions = {
   readonly inputSummary?: string;
   readonly postToolModelBeforeTool?: boolean;
   readonly assistantContent?: string;
+  readonly turnSucceededModelAttemptId?: string;
 };
 
 const succeededSnapshot = (
@@ -176,7 +177,9 @@ const succeededSnapshot = (
   appendEvent('turn.succeeded', {
     turnId: 'turn-1',
     payload: {
-      modelAttemptId: includePostToolModelCall ? 'attempt-2' : 'attempt-1',
+      modelAttemptId:
+        options.turnSucceededModelAttemptId ??
+        (includePostToolModelCall ? 'attempt-2' : 'attempt-1'),
     },
   });
 
@@ -395,6 +398,10 @@ describe('web-console-real-smoke', () => {
     [
       'persisting an empty assistant final',
       succeededSnapshot('safe', { assistantContent: '   ' }),
+    ],
+    [
+      'pointing terminal success at the pre-tool model attempt',
+      succeededSnapshot('safe', { turnSucceededModelAttemptId: 'attempt-1' }),
     ],
   ])('rejects a terminal snapshot %s', async (_name, snapshot) => {
     await expect(
