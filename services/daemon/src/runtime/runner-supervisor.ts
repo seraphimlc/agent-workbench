@@ -558,6 +558,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
   private readonly supervisor: RunnerSupervisor;
   private readonly hooks: DriverHooks;
   private readonly modelTools: readonly unknown[];
+  private readonly secrets: readonly string[];
   private databasePromise: Promise<Database.Database> | undefined;
   private database: Database.Database | undefined;
   private pendingStart: DriverPendingStart | undefined;
@@ -585,18 +586,22 @@ class RunnerExecutionDriver implements ExecutionDriver {
           }) => Promise<{ readonly content: string }>
         >
       >;
+      readonly secrets: readonly string[];
       readonly hooks: DriverHooks;
     },
   ) {
     this.hooks = options.hooks;
     this.modelTools = selectBuiltinToolDefinitions(Object.keys(options.toolHandlers));
+    this.secrets = Object.freeze([
+      ...new Set([options.provider.apiKey, ...options.secrets].filter((secret) => secret.length > 0)),
+    ]);
     this.supervisor = new RunnerSupervisor({
       runnerEntryPoint: options.runnerEntryPoint,
       readyTimeoutMs: 5_000,
       heartbeatIntervalMs: 5_000,
       heartbeatExpiryMs: 20_000,
       maxCycles: 64,
-      secrets: [options.provider.apiKey],
+      secrets: this.secrets,
       onHeartbeat: (binding) => this.persistHeartbeat(binding),
       beforeBind: async (binding, identity) => {
         await this.persistExecutorIdentity(binding, identity);
@@ -738,6 +743,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
           const database = await this.getDatabase();
           const gateway = new ToolGateway(database, {
             handlers: this.options.toolHandlers,
+            secrets: this.secrets,
           });
           const result = await gateway.execute({
             binding: active.claim,
@@ -964,6 +970,7 @@ export const createRunnerExecutionDriver = (options: {
       }) => Promise<{ readonly content: string }>
     >
   >;
+  readonly secrets?: readonly string[];
   readonly hooks?: DriverHooks;
 }): ExecutionDriver =>
   new RunnerExecutionDriver({
@@ -972,5 +979,6 @@ export const createRunnerExecutionDriver = (options: {
     modelAdapter: options.modelAdapter,
     provider: options.provider,
     toolHandlers: options.toolHandlers ?? {},
+    secrets: options.secrets ?? [],
     hooks: options.hooks ?? {},
   });

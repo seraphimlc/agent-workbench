@@ -106,6 +106,8 @@ type ToolGatewayModule = {
       >;
       readonly now: () => Date;
       readonly createId: () => string;
+      readonly secrets?: readonly string[];
+      readonly beforeTerminalEvent?: (type: 'tool.succeeded' | 'tool.failed') => void;
     },
   ) => ToolGateway;
 };
@@ -128,6 +130,7 @@ type RunnerSupervisorModule = {
     readonly toolHandlers: Readonly<
       Record<string, (input: ToolHandlerInput) => Promise<{ readonly content: string }>>
     >;
+    readonly secrets?: readonly string[];
   }): RunnerExecutionDriver;
 };
 
@@ -419,6 +422,39 @@ const insertSucceededToolCall = (
   transaction.immediate();
   return { attemptId, logicalCallId };
 };
+
+const readToolEvents = (
+  database: Database.Database,
+  turnId: string,
+): Array<{
+  readonly seq: number;
+  readonly type: string;
+  readonly actor: string;
+  readonly audience: string;
+  readonly toolRunId: string | null;
+  readonly payload: Record<string, unknown>;
+}> =>
+  (
+    database
+      .prepare(
+        `SELECT seq, type, actor, audience, tool_run_id AS toolRunId,
+                payload_json AS payloadJson
+         FROM session_events
+         WHERE turn_id = ? AND type LIKE 'tool.%'
+         ORDER BY seq`,
+      )
+      .all(turnId) as Array<{
+      readonly seq: number;
+      readonly type: string;
+      readonly actor: string;
+      readonly audience: string;
+      readonly toolRunId: string | null;
+      readonly payloadJson: string;
+    }>
+  ).map(({ payloadJson, ...event }) => ({
+    ...event,
+    payload: JSON.parse(payloadJson) as Record<string, unknown>,
+  }));
 
 describe('ModelAttempt and ToolCall authorization', () => {
   let runtime: TempRuntime | undefined;
@@ -1045,6 +1081,354 @@ describe('ModelAttempt and ToolCall authorization', () => {
       });
     } finally {
       fixture.database.close();
+    }
+  });
+
+  it('commits ordered Tool success Events and redacts handler content before persistence and return', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: 'success-events',
+    });
+    const registeredSecret = 'registered-tool-secret';
+    const handlerContent = `${registeredSecret}:${'x'.repeat(2_048)}`;
+    const redactedContent = `[REDACTED]:${'x'.repeat(2_048)}`;
+    let handlerObservedCommittedStart = false;
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: {
+        'fs.read_text': async (input) => {
+          const running = fixture.database
+            .prepare('SELECT status FROM tool_runs WHERE id = ?')
+            .get(input.toolRunId);
+          const started = fixture.database
+            .prepare(
+              "SELECT type FROM session_events WHERE tool_run_id = ? AND type = 'tool.started'",
+            )
+            .get(input.toolRunId);
+          handlerObservedCommittedStart =
+            !fixture.database.inTransaction &&
+            JSON.stringify(running) === JSON.stringify({ status: 'running' }) &&
+            JSON.stringify(started) === JSON.stringify({ type: 'tool.started' });
+          return { content: handlerContent };
+        },
+      },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('success-event-tool'),
+      secrets: [registeredSecret],
+    });
+
+    try {
+      const result = await gateway.execute({
+        binding: fixture.claim,
+        modelAttemptId: source.attemptId,
+        logicalCallId: source.logicalCallId,
+      });
+
+      expect(handlerObservedCommittedStart).toBe(true);
+      expect(result.content).toBe(redactedContent);
+      const toolRun = fixture.database
+        .prepare(
+          `SELECT id, status, result_json AS resultJson
+           FROM tool_runs WHERE id = ?`,
+        )
+        .get(result.toolRunId) as {
+        readonly id: string;
+        readonly status: string;
+        readonly resultJson: string;
+      };
+      expect(toolRun).toEqual({
+        id: result.toolRunId,
+        status: 'succeeded',
+        resultJson: JSON.stringify({ content: redactedContent }),
+      });
+      const events = readToolEvents(fixture.database, fixture.turnId);
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual({
+        seq: expect.any(Number),
+        type: 'tool.started',
+        actor: 'tool',
+        audience: 'both',
+        toolRunId: result.toolRunId,
+        payload: {
+          toolRunId: result.toolRunId,
+          toolId: 'fs.read_text',
+          inputSummary: '{"path":"notes.md"}',
+        },
+      });
+      expect(events[1]).toEqual({
+        seq: (events[0]?.seq ?? 0) + 1,
+        type: 'tool.succeeded',
+        actor: 'tool',
+        audience: 'both',
+        toolRunId: result.toolRunId,
+        payload: {
+          toolRunId: result.toolRunId,
+          outputBytes: Buffer.byteLength(redactedContent, 'utf8'),
+          outputSummary: expect.any(String),
+        },
+      });
+      expect(Buffer.byteLength(String(events[1]?.payload.outputSummary), 'utf8')).toBeLessThanOrEqual(
+        1_024,
+      );
+      const sessionSequences = (
+        fixture.database
+          .prepare('SELECT seq FROM session_events WHERE session_id = ? ORDER BY seq')
+          .all(fixture.sessionId) as Array<{ readonly seq: number }>
+      ).map((event) => event.seq);
+      expect(sessionSequences).toEqual(
+        Array.from({ length: sessionSequences.length }, (_, index) => index + 1),
+      );
+      expect(JSON.stringify({ toolRun, events, result })).not.toContain(registeredSecret);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rolls back the running ToolRun when tool.started cannot commit', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: 'started-rollback',
+    });
+    fixture.database.exec(`
+      CREATE TRIGGER reject_tool_started
+      BEFORE INSERT ON session_events
+      WHEN NEW.type = 'tool.started'
+      BEGIN SELECT RAISE(FAIL, 'tool.started unavailable'); END;
+    `);
+    const before = captureAuthorizationFacts(fixture.database);
+    let handlerCalls = 0;
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: {
+        'fs.read_text': async () => {
+          handlerCalls += 1;
+          return { content: 'must not run' };
+        },
+      },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('started-rollback-tool'),
+    });
+
+    try {
+      await expect(
+        gateway.execute({
+          binding: fixture.claim,
+          modelAttemptId: source.attemptId,
+          logicalCallId: source.logicalCallId,
+        }),
+      ).rejects.toMatchObject({ code: 'TOOL_EXECUTION_REJECTED' });
+      expect(handlerCalls).toBe(0);
+      expect(captureAuthorizationFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('commits failed Tool status and Event with one stable error code', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: 'failed-event',
+    });
+    const registeredSecret = 'failed-handler-secret';
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: {
+        'fs.read_text': async () => {
+          throw new Error(`handler failed with ${registeredSecret}`);
+        },
+      },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('failed-event-tool'),
+      secrets: [registeredSecret],
+    });
+
+    try {
+      await expect(
+        gateway.execute({
+          binding: fixture.claim,
+          modelAttemptId: source.attemptId,
+          logicalCallId: source.logicalCallId,
+        }),
+      ).rejects.toThrow();
+      const toolRun = fixture.database
+        .prepare(
+          `SELECT id, status, result_json AS resultJson, error_code AS errorCode,
+                  error_message AS errorMessage
+           FROM tool_runs`,
+        )
+        .get() as Record<string, unknown>;
+      expect(toolRun).toMatchObject({
+        status: 'failed',
+        resultJson: null,
+        errorCode: 'TOOL_EXECUTION_FAILED',
+        errorMessage: 'Tool execution failed',
+      });
+      expect(readToolEvents(fixture.database, fixture.turnId)).toEqual([
+        {
+          seq: expect.any(Number),
+          type: 'tool.started',
+          actor: 'tool',
+          audience: 'both',
+          toolRunId: toolRun.id,
+          payload: {
+            toolRunId: toolRun.id,
+            toolId: 'fs.read_text',
+            inputSummary: '{"path":"notes.md"}',
+          },
+        },
+        {
+          seq: expect.any(Number),
+          type: 'tool.failed',
+          actor: 'tool',
+          audience: 'both',
+          toolRunId: toolRun.id,
+          payload: {
+            toolRunId: toolRun.id,
+            errorCode: 'TOOL_EXECUTION_FAILED',
+          },
+        },
+      ]);
+      expect(JSON.stringify({ toolRun, events: readToolEvents(fixture.database, fixture.turnId) }))
+        .not.toContain(registeredSecret);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'succeeded',
+      handler: async () => ({ content: 'terminal result' }),
+    },
+    {
+      name: 'failed',
+      handler: async () => {
+        throw new Error('terminal failure');
+      },
+    },
+  ])('rolls back the $name Tool terminal update when its Event hook fails', async ({ name, handler }) => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: `terminal-rollback-${handler.name || 'case'}`,
+    });
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: { 'fs.read_text': handler },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('terminal-rollback-tool'),
+      beforeTerminalEvent: (type) => {
+        if (type === `tool.${name}`) throw new Error('terminal Event unavailable');
+      },
+    });
+
+    try {
+      await expect(
+        gateway.execute({
+          binding: fixture.claim,
+          modelAttemptId: source.attemptId,
+          logicalCallId: source.logicalCallId,
+        }),
+      ).rejects.toThrow();
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT status, result_json AS resultJson, error_code AS errorCode,
+                    error_message AS errorMessage, finished_at AS finishedAt
+             FROM tool_runs`,
+          )
+          .get(),
+      ).toEqual({
+        status: 'running',
+        resultJson: null,
+        errorCode: null,
+        errorMessage: null,
+        finishedAt: null,
+      });
+      expect(readToolEvents(fixture.database, fixture.turnId).map((event) => event.type)).toEqual([
+        'tool.started',
+      ]);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('passes Provider and registered secrets from RunnerExecutionDriver into ToolGateway', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const providerSecret = 'driver-provider-secret';
+    const bootstrapSecret = Buffer.alloc(32, 0x7a);
+    const bootstrapHex = bootstrapSecret.toString('hex');
+    const bootstrapBase64 = bootstrapSecret.toString('base64');
+    const returnedContent = `${providerSecret}:${bootstrapHex}:${bootstrapBase64}:visible`;
+    const redactedContent = '[REDACTED]:[REDACTED]:[REDACTED]:visible';
+    let callIndex = 0;
+    let toolMessageContent: string | undefined;
+    const adapter: ModelAdapter = {
+      call: async (input) => {
+        callIndex += 1;
+        if (callIndex === 1) return successfulToolResult();
+        toolMessageContent = (
+          input.messages as unknown as Array<{ readonly role: string; readonly content: string }>
+        ).find((message) => message.role === 'tool')?.content;
+        return {
+          finishReason: 'stop',
+          content: 'Done',
+          toolCalls: [],
+          providerRequestId: 'provider-driver-stop',
+          usage: null,
+        };
+      },
+    };
+    const { createRunnerExecutionDriver } = await loadRunnerSupervisor();
+    const driver = createRunnerExecutionDriver({
+      dataDir: runtime.dataDir,
+      runnerEntryPoint,
+      modelAdapter: adapter,
+      provider: {
+        endpoint: PROVIDER_ENDPOINT,
+        modelId: PROVIDER_MODEL,
+        apiKey: providerSecret,
+      },
+      secrets: [bootstrapHex, bootstrapBase64],
+      toolHandlers: {
+        'fs.read_text': async () => ({ content: returnedContent }),
+      },
+    });
+
+    try {
+      const execution = await driver.start(fixture.claim);
+      await execution.completion;
+
+      expect(callIndex).toBe(2);
+      expect(toolMessageContent).toBe(redactedContent);
+      const persisted = JSON.stringify({
+        toolRuns: fixture.database.prepare('SELECT * FROM tool_runs').all(),
+        events: fixture.database.prepare('SELECT * FROM session_events').all(),
+        modelCalls: fixture.database.prepare('SELECT * FROM model_calls').all(),
+        messages: fixture.database.prepare('SELECT * FROM messages').all(),
+      });
+      expect(persisted).not.toContain(providerSecret);
+      expect(persisted).not.toContain(bootstrapHex);
+      expect(persisted).not.toContain(bootstrapBase64);
+      expect(
+        fixture.database.prepare('SELECT result_json AS resultJson FROM tool_runs').get(),
+      ).toEqual({ resultJson: JSON.stringify({ content: redactedContent }) });
+    } finally {
+      await driver.shutdown();
+      fixture.database.close();
+      bootstrapSecret.fill(0);
     }
   });
 

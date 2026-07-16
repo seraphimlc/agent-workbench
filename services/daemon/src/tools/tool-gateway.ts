@@ -2,7 +2,12 @@ import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
 import { ExecutionRepository } from '../db/execution-repository.js';
+import { SessionEventWriter } from '../db/session-event-writer.js';
 import type { Claim } from '../runtime/scheduler.js';
+import { redactAndLimit, redactSecrets } from '../security/secret-redactor.js';
+
+const TOOL_EVENT_SUMMARY_MAX_BYTES = 1_024;
+const TOOL_EXECUTION_FAILED = 'TOOL_EXECUTION_FAILED';
 
 export class ToolGatewayError extends Error {
   readonly code: string;
@@ -44,8 +49,11 @@ const parseInput = (json: string): Record<string, unknown> => {
 
 export class ToolGateway {
   private readonly repository: ExecutionRepository;
+  private readonly events: SessionEventWriter;
   private readonly now: () => Date;
   private readonly createId: () => string;
+  private readonly secrets: readonly string[];
+  private readonly beforeTerminalEvent: (type: 'tool.succeeded' | 'tool.failed') => void;
 
   constructor(
     private readonly database: Database.Database,
@@ -62,11 +70,16 @@ export class ToolGateway {
       >;
       readonly now?: () => Date;
       readonly createId?: () => string;
+      readonly secrets?: readonly string[];
+      readonly beforeTerminalEvent?: (type: 'tool.succeeded' | 'tool.failed') => void;
     },
   ) {
     this.repository = new ExecutionRepository(database);
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? uuidv7;
+    this.secrets = Object.freeze([...(options.secrets ?? [])]);
+    this.beforeTerminalEvent = options.beforeTerminalEvent ?? (() => undefined);
+    this.events = new SessionEventWriter(database, { createId: this.createId });
   }
 
   async execute(input: {
@@ -191,6 +204,28 @@ export class ToolGateway {
             startedAt,
             startedAt,
           );
+        this.events.append({
+          sessionId: input.binding.sessionId,
+          now: startedAt,
+          events: [
+            {
+              turnId: input.binding.turnId,
+              toolRunId,
+              type: 'tool.started',
+              actor: 'tool',
+              audience: 'both',
+              payload: {
+                toolRunId,
+                toolId: candidate.toolId,
+                inputSummary: redactAndLimit(
+                  candidate.argumentsJson,
+                  this.secrets,
+                  TOOL_EVENT_SUMMARY_MAX_BYTES,
+                ),
+              },
+            },
+          ],
+        });
       }).immediate();
     } catch (error) {
       if (error instanceof ToolGatewayError) throw error;
@@ -200,35 +235,83 @@ export class ToolGateway {
     const handler = this.options.handlers[source.toolId];
     if (!handler) throw new ToolGatewayError('MODEL_TOOL_UNAUTHORIZED', 'No Tool handler is installed');
     const parsedInput = parseInput(source.argumentsJson);
+    let result: { readonly content: string };
     try {
-      const result = await handler({
+      result = await handler({
         toolRunId,
         toolId: source.toolId,
         input: parsedInput,
       });
+    } catch (error) {
       const finishedAt = this.now().toISOString();
+      this.database.transaction(() => {
+        const completion = this.database
+          .prepare(
+            `UPDATE tool_runs
+             SET status = 'failed', error_code = ?,
+                 error_message = 'Tool execution failed', finished_at = ?
+             WHERE id = ? AND status = 'running' AND finished_at IS NULL`,
+          )
+          .run(TOOL_EXECUTION_FAILED, finishedAt, toolRunId);
+        if (completion.changes !== 1) {
+          throw new ToolGatewayError('TOOL_EXECUTION_REJECTED', 'Tool completion state changed');
+        }
+        this.beforeTerminalEvent('tool.failed');
+        this.events.append({
+          sessionId: input.binding.sessionId,
+          now: finishedAt,
+          events: [
+            {
+              turnId: input.binding.turnId,
+              toolRunId,
+              type: 'tool.failed',
+              actor: 'tool',
+              audience: 'both',
+              payload: { toolRunId, errorCode: TOOL_EXECUTION_FAILED },
+            },
+          ],
+        });
+      }).immediate();
+      throw error;
+    }
+
+    const content = redactSecrets(result.content, this.secrets);
+    const finishedAt = this.now().toISOString();
+    this.database.transaction(() => {
       const completion = this.database
         .prepare(
           `UPDATE tool_runs
            SET status = 'succeeded', result_json = ?, finished_at = ?
            WHERE id = ? AND status = 'running' AND finished_at IS NULL`,
         )
-        .run(JSON.stringify({ content: result.content }), finishedAt, toolRunId);
+        .run(JSON.stringify({ content }), finishedAt, toolRunId);
       if (completion.changes !== 1) {
         throw new ToolGatewayError('TOOL_EXECUTION_REJECTED', 'Tool completion state changed');
       }
-      return { toolRunId, content: result.content };
-    } catch (error) {
-      const finishedAt = this.now().toISOString();
-      this.database
-        .prepare(
-          `UPDATE tool_runs
-           SET status = 'failed', error_code = 'TOOL_EXECUTION_FAILED',
-               error_message = 'Tool execution failed', finished_at = ?
-           WHERE id = ? AND status = 'running' AND finished_at IS NULL`,
-        )
-        .run(finishedAt, toolRunId);
-      throw error;
-    }
+      this.beforeTerminalEvent('tool.succeeded');
+      this.events.append({
+        sessionId: input.binding.sessionId,
+        now: finishedAt,
+        events: [
+          {
+            turnId: input.binding.turnId,
+            toolRunId,
+            type: 'tool.succeeded',
+            actor: 'tool',
+            audience: 'both',
+            payload: {
+              toolRunId,
+              outputBytes: Buffer.byteLength(content, 'utf8'),
+              outputSummary: redactAndLimit(
+                content,
+                this.secrets,
+                TOOL_EVENT_SUMMARY_MAX_BYTES,
+              ),
+            },
+          },
+        ],
+      });
+    }).immediate();
+    return { toolRunId, content };
   }
 }
