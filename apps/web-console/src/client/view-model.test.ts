@@ -23,6 +23,7 @@ const visibleEvent = (
   options: {
     readonly turnId?: string | null;
     readonly toolRunId?: string | null;
+    readonly actor?: RendererSessionEventEnvelope['actor'];
     readonly payload?: unknown;
   } = {},
 ): RendererSessionEventEnvelope => ({
@@ -31,7 +32,7 @@ const visibleEvent = (
   turnId: options.turnId ?? null,
   toolRunId: options.toolRunId ?? null,
   seq,
-  actor: options.toolRunId ? 'tool' : 'daemon',
+  actor: options.actor ?? (options.toolRunId ? 'tool' : 'daemon'),
   audience: 'ui',
   createdAt: timestamp(seq),
   type,
@@ -231,6 +232,7 @@ describe('authoritative timeline projection', () => {
     const timeline = projectTimeline(snapshot, events);
 
     expect(timeline.map(({ id }) => id)).toEqual([
+      'event:event-1',
       'message:message-user-1',
       'event:event-2',
       'event:event-3',
@@ -251,6 +253,7 @@ describe('authoritative timeline projection', () => {
       'event:event-15',
     ]);
     expect(timeline.map(({ kind, status }) => `${kind}:${status}`)).toEqual([
+      'generic-event:observed',
       'message:completed',
       'turn:queued',
       'model:started',
@@ -309,6 +312,75 @@ describe('authoritative timeline projection', () => {
     expect(Object.isFrozen(timeline)).toBe(true);
     expect(timeline.every(Object.isFrozen)).toBe(true);
     expect(timeline.every(({ detail }) => Object.isFrozen(detail))).toBe(true);
+  });
+
+  it('projects every unmapped visible event as an immutable generic item', () => {
+    const genericEvents = [
+      visibleEvent(1, 'session.created', {
+        payload: { workspaceId: 'workspace-1' },
+      }),
+      visibleEvent(2, 'turn.started', {
+        turnId: 'turn-1',
+        actor: 'runner',
+        payload: { executionFence: 1 },
+      }),
+      visibleEvent(3, 'future.renderer_event', {
+        turnId: 'turn-1',
+        actor: 'user',
+        payload: { summary: 'safe payload', nested: { count: 1 } },
+      }),
+    ];
+    const timeline = projectTimeline(
+      { ...snapshot, messages: [], turns: [], events: genericEvents, highWaterSeq: 3 },
+      genericEvents,
+    );
+
+    expect(timeline.map(({ id, kind, status, title, summary }) => ({
+      id,
+      kind,
+      status,
+      title,
+      summary,
+    }))).toEqual([
+      {
+        id: 'event:event-1',
+        kind: 'generic-event',
+        status: 'observed',
+        title: 'session.created',
+        summary: 'daemon',
+      },
+      {
+        id: 'event:event-2',
+        kind: 'generic-event',
+        status: 'observed',
+        title: 'turn.started',
+        summary: 'runner',
+      },
+      {
+        id: 'event:event-3',
+        kind: 'generic-event',
+        status: 'observed',
+        title: 'future.renderer_event',
+        summary: 'user',
+      },
+    ]);
+    expect(timeline[2]?.detail).toMatchObject({
+      source: 'event',
+      event: {
+        type: 'future.renderer_event',
+        actor: 'user',
+        createdAt: timestamp(3),
+        payload: { summary: 'safe payload', nested: { count: 1 } },
+      },
+    });
+    expect(Object.isFrozen(timeline)).toBe(true);
+    expect(timeline.every(Object.isFrozen)).toBe(true);
+    const detail = timeline[2]?.detail;
+    expect(Object.isFrozen(detail)).toBe(true);
+    expect(detail?.source).toBe('event');
+    if (!detail || detail.source !== 'event') throw new Error('Expected event detail');
+    expect(Object.isFrozen(detail.event)).toBe(true);
+    expect(Object.isFrozen(detail.event.payload)).toBe(true);
   });
 });
 

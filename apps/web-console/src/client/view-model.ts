@@ -22,6 +22,7 @@ export type TimelineItemKind =
   | 'turn'
   | 'model'
   | 'tool'
+  | 'generic-event'
   | 'hidden';
 
 export type TimelineItemStatus =
@@ -30,6 +31,7 @@ export type TimelineItemStatus =
   | 'started'
   | 'succeeded'
   | 'failed'
+  | 'observed'
   | 'redacted';
 
 export type TimelineItemDetail =
@@ -166,7 +168,7 @@ const itemFromMessage = (message: MessageRow, turn: TurnRow): TimelineItem =>
 
 const itemFromEvent = (
   event: RendererSessionEventEnvelope,
-): TimelineItem | null => {
+): TimelineItem => {
   if (event.redacted) {
     return Object.freeze({
       id: `event:${event.id}`,
@@ -195,7 +197,20 @@ const itemFromEvent = (
     'tool.failed': ['tool', 'failed', 'Tool failed'],
   } as const;
   const selected = display[event.type as keyof typeof display];
-  if (!selected) return null;
+  if (!selected) {
+    return Object.freeze({
+      id: `event:${event.id}`,
+      kind: 'generic-event',
+      status: 'observed',
+      role: null,
+      title: event.type,
+      summary: event.actor,
+      createdAt: event.createdAt,
+      turnId: event.turnId,
+      seq: event.seq,
+      detail: cloneAndFreeze({ source: 'event', event } as const),
+    });
+  }
   const [kind, status, title] = selected;
 
   return Object.freeze({
@@ -251,8 +266,7 @@ export const projectTimeline = (
     const turn = event.turnId ? turns.get(event.turnId) : undefined;
     if (event.type === 'turn.queued') appendMessage(turn?.inputMessageId);
 
-    const eventItem = itemFromEvent(event);
-    if (eventItem) items.push(eventItem);
+    items.push(itemFromEvent(event));
 
     if (terminalTurnEvents.has(event.type)) {
       appendMessage(turn?.resultMessageId);
