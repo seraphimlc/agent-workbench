@@ -1,5 +1,13 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +24,128 @@ const temporaryRoots: string[] = [];
 let activeHandle: DaemonProcessHandle | undefined;
 
 const modeBits = (path: string): number => lstatSync(path).mode & 0o777;
+const provider = {
+  baseUrl: 'https://provider.example.test/v1',
+  apiKey: 'controlled-provider-key',
+  modelId: 'controlled-provider-model',
+} as const;
+
+type LaunchSnapshot = {
+  readonly pid: number;
+  readonly argv: readonly string[];
+  readonly environment: Readonly<Record<string, string>>;
+};
+
+const createPaths = (): {
+  readonly rootPath: string;
+  readonly dataDir: string;
+  readonly runtimeDir: string;
+  readonly workspacePath: string;
+} => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'awb-web-daemon-'));
+  temporaryRoots.push(rootPath);
+  const workspacePath = join(rootPath, 'workspace');
+  mkdirSync(workspacePath, { mode: 0o700 });
+  return {
+    rootPath,
+    dataDir: join(rootPath, 'data'),
+    runtimeDir: join(rootPath, 'runtime'),
+    workspacePath,
+  };
+};
+
+const withEnvironment = async <Value>(
+  values: Readonly<Record<string, string | undefined>>,
+  operation: () => Promise<Value>,
+): Promise<Value> => {
+  const previous = new Map(
+    Object.keys(values).map((key) => [key, process.env[key]] as const),
+  );
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await operation();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+};
+
+const readLaunchSnapshot = (dataDir: string): LaunchSnapshot =>
+  JSON.parse(
+    readFileSync(join(dataDir, 'web-console-daemon-launch.json'), 'utf8'),
+  ) as LaunchSnapshot;
+
+const snapshotOption = (
+  snapshot: LaunchSnapshot,
+  name: '--socket' | '--data-dir',
+): string => {
+  const index = snapshot.argv.indexOf(name);
+  const value = index >= 0 ? snapshot.argv[index + 1] : undefined;
+  if (value === undefined) throw new Error(`Snapshot option ${name} is missing`);
+  return value;
+};
+
+const waitFor = async (
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 2_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 20));
+  }
+};
+
+const processExited = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    throw error;
+  }
+};
+
+const expectFixtureCleanup = async (snapshot: LaunchSnapshot): Promise<void> => {
+  const socketPath = snapshotOption(snapshot, '--socket');
+  const runtimeDir = dirname(socketPath);
+  await waitFor(() => processExited(snapshot.pid), 'daemon process exit');
+  await waitFor(() => !existsSync(runtimeDir), 'runtime directory cleanup');
+  expect(existsSync(socketPath)).toBe(false);
+};
+
+const expectCode = async (
+  operation: Promise<unknown>,
+  code: string,
+): Promise<Error> => {
+  try {
+    await operation;
+  } catch (error) {
+    expect(error).toMatchObject({ code });
+    return error as Error;
+  }
+  throw new Error(`Expected operation to reject with ${code}`);
+};
+
+const waitForFailure = async (
+  handle: DaemonProcessHandle,
+): Promise<Error> =>
+  await new Promise<Error>((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(
+      () => rejectPromise(new Error('Timed out waiting for daemon failure')),
+      2_000,
+    );
+    handle.failure.then((error) => {
+      clearTimeout(timer);
+      resolvePromise(error);
+    });
+  });
 
 afterEach(async () => {
   await activeHandle?.stop().catch(() => undefined);
@@ -67,34 +197,17 @@ describe('daemon process package wiring', () => {
 
 describe('DaemonProcessManager', () => {
   it('returns ready with fd 3 secret transport and reaps the daemon on stop', async () => {
-    const rootPath = mkdtempSync(join(tmpdir(), 'awb-web-daemon-'));
-    temporaryRoots.push(rootPath);
-    const dataDir = join(rootPath, 'data');
-    const workspacePath = join(rootPath, 'workspace');
-    mkdirSync(workspacePath, { mode: 0o700 });
+    const { dataDir, workspacePath } = createPaths();
     const inheritedSecretKey = 'AGENT_WORKBENCH_TEST_BOOTSTRAP_SECRET';
-    const previousInheritedSecret = process.env[inheritedSecretKey];
-    process.env[inheritedSecretKey] = 'forbidden-inherited-bootstrap-secret';
-
-    try {
-      activeHandle = await new DaemonProcessManager({
-        entryPoint: fixtureEntryPoint,
-      }).start({
-        dataDir,
-        workspacePath,
-        provider: {
-          baseUrl: 'https://provider.example.test/v1',
-          apiKey: 'controlled-provider-key',
-          modelId: 'controlled-provider-model',
-        },
-      });
-    } finally {
-      if (previousInheritedSecret === undefined) {
-        delete process.env[inheritedSecretKey];
-      } else {
-        process.env[inheritedSecretKey] = previousInheritedSecret;
-      }
-    }
+    activeHandle = await withEnvironment(
+      { [inheritedSecretKey]: 'forbidden-inherited-bootstrap-secret' },
+      async () =>
+        await new DaemonProcessManager({ entryPoint: fixtureEntryPoint }).start({
+          dataDir,
+          workspacePath,
+          provider,
+        }),
+    );
 
     const handle = activeHandle;
     const runtimeDir = dirname(handle.socketPath);
@@ -102,11 +215,7 @@ describe('DaemonProcessManager', () => {
       join(dataDir, 'web-console-daemon-launch.json'),
       'utf8',
     );
-    const launchSnapshot = JSON.parse(launchSnapshotText) as {
-      readonly pid: number;
-      readonly argv: readonly string[];
-      readonly environment: Readonly<Record<string, string>>;
-    };
+    const launchSnapshot = JSON.parse(launchSnapshotText) as LaunchSnapshot;
 
     expect(handle.bootstrapSecret).toHaveLength(32);
     expect(handle.pid).toBe(launchSnapshot.pid);
@@ -142,5 +251,120 @@ describe('DaemonProcessManager', () => {
     } catch (error) {
       expect(error).toMatchObject({ code: 'ESRCH' });
     }
+  });
+
+  it('times out a daemon that never emits ready and cleans its child and runtime', async () => {
+    const { dataDir, workspacePath } = createPaths();
+    const operation = withEnvironment(
+      { AGENT_WORKBENCH_TEST_DAEMON_MODE: 'hang' },
+      async () =>
+        await new DaemonProcessManager({
+          entryPoint: fixtureEntryPoint,
+          startupTimeoutMs: 1_000,
+          stopTimeoutMs: 150,
+        }).start({ dataDir, workspacePath, provider }),
+    );
+
+    await expectCode(operation, 'DAEMON_STARTUP_TIMEOUT');
+    await expectFixtureCleanup(readLaunchSnapshot(dataDir));
+  });
+
+  it('reports an early exit with bounded redacted stderr and cleans runtime state', async () => {
+    const { dataDir, workspacePath } = createPaths();
+    const operation = withEnvironment(
+      { AGENT_WORKBENCH_TEST_DAEMON_MODE: 'early-exit' },
+      async () =>
+        await new DaemonProcessManager({
+          entryPoint: fixtureEntryPoint,
+          stopTimeoutMs: 150,
+        }).start({ dataDir, workspacePath, provider }),
+    );
+
+    const error = await expectCode(operation, 'DAEMON_EXITED_BEFORE_READY');
+    expect(error.message).toContain('[REDACTED]');
+    expect(error.message).not.toContain(provider.apiKey);
+    expect(Buffer.byteLength(error.message)).toBeLessThan(66 * 1024);
+    await expectFixtureCleanup(readLaunchSnapshot(dataDir));
+  });
+
+  it('rejects duplicate ready emitted inside the startup stability window', async () => {
+    const { dataDir, workspacePath } = createPaths();
+    const operation = withEnvironment(
+      { AGENT_WORKBENCH_TEST_DAEMON_MODE: 'duplicate-ready' },
+      async () =>
+        await new DaemonProcessManager({
+          entryPoint: fixtureEntryPoint,
+          stopTimeoutMs: 150,
+        }).start({ dataDir, workspacePath, provider }),
+    );
+
+    await expectCode(operation, 'DAEMON_READY_INVALID');
+    await expectFixtureCleanup(readLaunchSnapshot(dataDir));
+  });
+
+  it('marks a duplicate ready after handle return fatal and terminates the daemon', async () => {
+    const { dataDir, workspacePath } = createPaths();
+    activeHandle = await withEnvironment(
+      { AGENT_WORKBENCH_TEST_DAEMON_MODE: 'late-duplicate-ready' },
+      async () =>
+        await new DaemonProcessManager({
+          entryPoint: fixtureEntryPoint,
+          stopTimeoutMs: 150,
+        }).start({ dataDir, workspacePath, provider }),
+    );
+    const snapshot = readLaunchSnapshot(dataDir);
+
+    await expect(waitForFailure(activeHandle)).resolves.toMatchObject({
+      code: 'DAEMON_READY_INVALID',
+    });
+    await expectFixtureCleanup(snapshot);
+    await activeHandle.stop();
+    activeHandle = undefined;
+  });
+
+  it('escalates an ignored SIGTERM to SIGKILL and cleans the socket and child', async () => {
+    const { dataDir, workspacePath } = createPaths();
+    activeHandle = await withEnvironment(
+      { AGENT_WORKBENCH_TEST_DAEMON_MODE: 'ignore-sigterm' },
+      async () =>
+        await new DaemonProcessManager({
+          entryPoint: fixtureEntryPoint,
+          stopTimeoutMs: 150,
+        }).start({ dataDir, workspacePath, provider }),
+    );
+    const handle = activeHandle;
+    const runtimeDir = dirname(handle.socketPath);
+    const pid = handle.pid;
+
+    await handle.stop();
+    activeHandle = undefined;
+
+    expect(readFileSync(join(dataDir, 'sigterm-observed'), 'utf8')).toBe('ignored');
+    expect(processExited(pid)).toBe(true);
+    expect(existsSync(handle.socketPath)).toBe(false);
+    expect(existsSync(runtimeDir)).toBe(false);
+  });
+
+  it('starts the real configured daemon entry with Provider, Runner, and Tool composition', async () => {
+    const { dataDir, runtimeDir, workspacePath } = createPaths();
+    activeHandle = await new DaemonProcessManager().start({
+      dataDir,
+      runtimeDir,
+      workspacePath,
+      provider,
+    });
+    const handle = activeHandle;
+    const canonicalRuntimeDir = realpathSync(runtimeDir);
+
+    expect(dirname(handle.socketPath)).toBe(canonicalRuntimeDir);
+    expect(existsSync(handle.socketPath)).toBe(true);
+    expect(handle.bootstrapSecret).toHaveLength(32);
+
+    await handle.stop();
+    activeHandle = undefined;
+
+    expect(existsSync(handle.socketPath)).toBe(false);
+    expect(existsSync(runtimeDir)).toBe(false);
+    expect(processExited(handle.pid)).toBe(true);
   });
 });

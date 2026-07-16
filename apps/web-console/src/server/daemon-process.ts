@@ -18,6 +18,7 @@ const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const MAX_CAPTURED_STDERR_BYTES = 64 * 1024;
 const MAX_READY_LINE_BYTES = 64 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+const READY_STABILITY_WINDOW_MS = 50;
 
 export type DaemonProcessErrorCode =
   | 'DAEMON_DIRECTORY_INVALID'
@@ -26,6 +27,7 @@ export type DaemonProcessErrorCode =
   | 'DAEMON_READY_INVALID'
   | 'DAEMON_STARTUP_TIMEOUT'
   | 'DAEMON_EXITED_BEFORE_READY'
+  | 'DAEMON_EXITED_AFTER_READY'
   | 'DAEMON_STOP_FAILED';
 
 export class DaemonProcessError extends Error {
@@ -46,6 +48,7 @@ export type ResolvedProviderConfig = {
 
 export type DaemonProcessStartOptions = {
   readonly dataDir: string;
+  readonly runtimeDir?: string;
   readonly workspacePath: string;
   readonly provider: ResolvedProviderConfig;
 };
@@ -54,6 +57,7 @@ export type DaemonProcessHandle = {
   readonly pid: number;
   readonly socketPath: string;
   readonly bootstrapSecret: Buffer;
+  readonly failure: Promise<DaemonProcessError>;
   stop(): Promise<void>;
 };
 
@@ -284,7 +288,9 @@ export class DaemonProcessManager {
     }
     validateProvider(options.provider);
     const dataDir = ensurePrivateDirectory(options.dataDir);
-    const runtimeDir = createRuntimeDirectory();
+    const runtimeDir = options.runtimeDir
+      ? ensurePrivateDirectory(options.runtimeDir)
+      : createRuntimeDirectory();
     const socketPath = join(runtimeDir, 'd.sock');
     if (Buffer.byteLength(socketPath) > MAX_UNIX_SOCKET_PATH_BYTES) {
       rmSync(runtimeDir, { force: true, recursive: true });
@@ -328,22 +334,47 @@ export class DaemonProcessManager {
       appendBounded(stderrChunks, chunk, stderrState);
     });
 
+    type LifecycleState =
+      | 'starting'
+      | 'running'
+      | 'stopping'
+      | 'failed'
+      | 'stopped';
+    let lifecycle: LifecycleState = 'starting';
+    let runtimeCleaned = false;
+    const cleanupRuntime = (): void => {
+      if (runtimeCleaned) return;
+      runtimeCleaned = true;
+      rmSync(runtimeDir, { force: true, recursive: true });
+    };
+    const clearActiveHandle = (): void => {
+      if (this.activeHandle?.pid === child.pid) this.activeHandle = undefined;
+    };
+
     let resolveCompletion!: (exit: ProcessExit) => void;
     const completion = new Promise<ProcessExit>((resolvePromise) => {
       resolveCompletion = resolvePromise;
     });
-    child.once('close', (code, signal) => resolveCompletion({ code, signal }));
+    let resolveFailure!: (error: DaemonProcessError) => void;
+    const failure = new Promise<DaemonProcessError>((resolvePromise) => {
+      resolveFailure = resolvePromise;
+    });
+    let resolveStartup!: () => void;
+    let rejectStartup!: (error: DaemonProcessError) => void;
+    const startup = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolveStartup = resolvePromise;
+      rejectStartup = rejectPromise;
+    });
+    void startup.catch(() => undefined);
 
-    let rejectReady!: (error: DaemonProcessError) => void;
-    let resolveReady!: () => void;
-    let readySettled = false;
+    let startupFailure: DaemonProcessError | undefined;
+    let firstReadySeen = false;
+    let readyStabilityElapsed = false;
+    let secretTransportComplete = false;
     let readyCount = 0;
     let stdoutBuffer = '';
-    const ready = new Promise<void>((resolvePromise, rejectPromise) => {
-      resolveReady = resolvePromise;
-      rejectReady = rejectPromise;
-    });
-    void ready.catch(() => undefined);
+    let stabilityTimer: NodeJS.Timeout | undefined;
+    let shutdownPromise: Promise<void> | undefined;
 
     const startupError = (
       code: DaemonProcessErrorCode,
@@ -355,27 +386,81 @@ export class DaemonProcessManager {
         stderr.length > 0 ? `${message}. stderr=${JSON.stringify(stderr)}` : message,
       );
     };
-    const failReady = (code: DaemonProcessErrorCode, message: string): void => {
-      if (readySettled) return;
-      readySettled = true;
-      rejectReady(startupError(code, message));
+    const beginShutdown = (): Promise<void> => {
+      shutdownPromise ??= (async () => {
+        try {
+          await terminateAndReap(child, completion, this.stopTimeoutMs);
+        } finally {
+          cleanupRuntime();
+          clearActiveHandle();
+        }
+      })();
+      void shutdownPromise.catch(() => undefined);
+      return shutdownPromise;
+    };
+    const failStartup = (error: DaemonProcessError): void => {
+      if (lifecycle !== 'starting' || startupFailure !== undefined) return;
+      startupFailure = error;
+      rejectStartup(error);
+    };
+    const failLifecycle = (error: DaemonProcessError): void => {
+      if (lifecycle === 'starting') {
+        failStartup(error);
+        return;
+      }
+      if (lifecycle !== 'running') return;
+      lifecycle = 'failed';
+      resolveFailure(error);
+      void beginShutdown();
+    };
+    const maybeCompleteStartup = (): void => {
+      if (
+        lifecycle === 'starting' &&
+        startupFailure === undefined &&
+        firstReadySeen &&
+        readyStabilityElapsed &&
+        secretTransportComplete
+      ) {
+        resolveStartup();
+      }
     };
 
     child.once('error', () => {
-      failReady('DAEMON_SPAWN_FAILED', 'Daemon process could not be spawned');
+      failLifecycle(
+        startupError('DAEMON_SPAWN_FAILED', 'Daemon process could not be spawned'),
+      );
     });
     child.once('close', (code, signal) => {
-      failReady(
-        'DAEMON_EXITED_BEFORE_READY',
-        `Daemon exited before ready (code=${String(code)}, signal=${String(signal)})`,
-      );
+      resolveCompletion({ code, signal });
+      if (lifecycle === 'starting') {
+        failLifecycle(
+          startupError(
+            'DAEMON_EXITED_BEFORE_READY',
+            `Daemon exited before ready (code=${String(code)}, signal=${String(signal)})`,
+          ),
+        );
+      } else if (lifecycle === 'running') {
+        failLifecycle(
+          startupError(
+            'DAEMON_EXITED_AFTER_READY',
+            `Daemon exited after ready (code=${String(code)}, signal=${String(signal)})`,
+          ),
+        );
+      } else {
+        cleanupRuntime();
+        clearActiveHandle();
+      }
     });
     child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => {
-      if (readySettled) return;
       stdoutBuffer += chunk;
       if (Buffer.byteLength(stdoutBuffer) > MAX_READY_LINE_BYTES) {
-        failReady('DAEMON_READY_INVALID', 'Daemon ready output exceeded its bound');
+        failLifecycle(
+          startupError(
+            'DAEMON_READY_INVALID',
+            'Daemon ready output exceeded its bound',
+          ),
+        );
         return;
       }
       while (stdoutBuffer.includes('\n')) {
@@ -386,7 +471,9 @@ export class DaemonProcessManager {
         try {
           event = JSON.parse(line);
         } catch {
-          failReady('DAEMON_READY_INVALID', 'Daemon ready output is invalid');
+          failLifecycle(
+            startupError('DAEMON_READY_INVALID', 'Daemon ready output is invalid'),
+          );
           return;
         }
         const keys =
@@ -402,42 +489,63 @@ export class DaemonProcessManager {
           !('pid' in event) ||
           event.pid !== child.pid
         ) {
-          failReady('DAEMON_READY_INVALID', 'Daemon ready event is invalid');
+          failLifecycle(
+            startupError('DAEMON_READY_INVALID', 'Daemon ready event is invalid'),
+          );
           return;
         }
         readyCount += 1;
         if (readyCount !== 1) {
-          failReady('DAEMON_READY_INVALID', 'Daemon emitted multiple ready events');
+          failLifecycle(
+            startupError(
+              'DAEMON_READY_INVALID',
+              'Daemon emitted multiple ready events',
+            ),
+          );
           return;
         }
-        setImmediate(() => {
-          if (readySettled || readyCount !== 1) return;
-          readySettled = true;
-          resolveReady();
-        });
+        firstReadySeen = true;
+        stabilityTimer = setTimeout(() => {
+          readyStabilityElapsed = true;
+          maybeCompleteStartup();
+        }, READY_STABILITY_WINDOW_MS);
       }
     });
 
     const secretPipe = child.stdio[3] as Writable | null;
-    const secretTransport = new Promise<void>((resolvePromise, rejectPromise) => {
-      if (secretPipe === null || typeof secretPipe.end !== 'function') {
-        rejectPromise(
-          new DaemonProcessError(
+    if (secretPipe === null || typeof secretPipe.end !== 'function') {
+      failLifecycle(
+        new DaemonProcessError(
+          'DAEMON_SPAWN_FAILED',
+          'Daemon bootstrap secret pipe is unavailable',
+        ),
+      );
+    } else {
+      secretPipe.once('error', () => {
+        failLifecycle(
+          startupError(
             'DAEMON_SPAWN_FAILED',
-            'Daemon bootstrap secret pipe is unavailable',
+            'Daemon bootstrap secret transport failed',
           ),
         );
-        return;
-      }
-      secretPipe.once('error', rejectPromise);
-      secretPipe.end(bootstrapSecret, resolvePromise);
-    });
+      });
+      secretPipe.end(bootstrapSecret, () => {
+        secretTransportComplete = true;
+        maybeCompleteStartup();
+      });
+    }
     const startupTimer = setTimeout(() => {
-      failReady('DAEMON_STARTUP_TIMEOUT', 'Timed out waiting for daemon readiness');
+      failLifecycle(
+        startupError(
+          'DAEMON_STARTUP_TIMEOUT',
+          'Timed out waiting for daemon readiness',
+        ),
+      );
     }, this.startupTimeoutMs);
 
     try {
-      await Promise.all([ready, secretTransport]);
+      await startup;
+      if (startupFailure !== undefined) throw startupFailure;
       if (child.pid === undefined || !processIsRunning(child)) {
         throw startupError(
           'DAEMON_EXITED_BEFORE_READY',
@@ -445,13 +553,14 @@ export class DaemonProcessManager {
         );
       }
     } catch (error) {
-      await terminateAndReap(child, completion, this.stopTimeoutMs).catch(() => undefined);
-      rmSync(runtimeDir, { force: true, recursive: true });
+      lifecycle = 'failed';
+      await beginShutdown().catch(() => undefined);
       handleSecret.fill(0);
       if (error instanceof DaemonProcessError) throw error;
       throw startupError('DAEMON_SPAWN_FAILED', 'Daemon startup failed');
     } finally {
       clearTimeout(startupTimer);
+      if (stabilityTimer) clearTimeout(stabilityTimer);
       bootstrapSecret.fill(0);
     }
 
@@ -459,10 +568,12 @@ export class DaemonProcessManager {
     const stop = async (): Promise<void> => {
       stopPromise ??= (async () => {
         try {
-          await terminateAndReap(child, completion, this.stopTimeoutMs);
+          if (lifecycle === 'running') lifecycle = 'stopping';
+          await beginShutdown();
+          if (lifecycle !== 'failed') lifecycle = 'stopped';
         } finally {
-          rmSync(runtimeDir, { force: true, recursive: true });
-          if (this.activeHandle === handle) this.activeHandle = undefined;
+          cleanupRuntime();
+          clearActiveHandle();
         }
       })();
       await stopPromise;
@@ -471,13 +582,11 @@ export class DaemonProcessManager {
       pid: child.pid,
       socketPath,
       bootstrapSecret: handleSecret,
+      failure,
       stop,
     });
     this.activeHandle = handle;
-    void completion.then(() => {
-      rmSync(runtimeDir, { force: true, recursive: true });
-      if (this.activeHandle === handle) this.activeHandle = undefined;
-    });
+    lifecycle = 'running';
     return handle;
   }
 }

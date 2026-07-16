@@ -38,4 +38,17 @@ if (mode === 'hang') {
       `${JSON.stringify({ event: 'ready', protocolVersion: 1, pid: process.pid })}\n`,
     );
   }
+  if (mode === 'late-duplicate-ready') {
+    setTimeout(() => {
+      process.stdout.write(
+        `${JSON.stringify({ event: 'ready', protocolVersion: 1, pid: process.pid })}\n`,
+      );
+    }, 150);
+  }
+  if (mode === 'ignore-sigterm') {
+    process.removeAllListeners('SIGTERM');
+    process.on('SIGTERM', () => {
+      writeFileSync(join(dataDir, 'sigterm-observed'), 'ignored', { mode: 0o600 });
+    });
+  }
 }
