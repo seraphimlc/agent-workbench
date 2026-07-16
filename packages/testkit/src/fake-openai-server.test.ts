@@ -289,4 +289,36 @@ describe('Fake OpenAI Server', () => {
       await server.close();
     }
   });
+
+  it('rejects close when an unexpected request arrives after completion', async () => {
+    const { startFakeOpenAiServer } = await loadFakeServer();
+    const server = await startFakeOpenAiServer({
+      scripts: [
+        {
+          expectedRequest: {
+            method: 'GET',
+            path: '/expected',
+            headers: {},
+          },
+          response: { chunks: [encoder.encode('expected')] },
+        },
+      ],
+    });
+
+    try {
+      expect(await (await fetch(new URL('/expected', server.baseUrl))).text()).toBe(
+        'expected',
+      );
+      await server.completed;
+
+      const unexpected = await fetch(new URL('/late-unexpected', server.baseUrl));
+      expect(unexpected.status).toBe(500);
+      expect(await unexpected.text()).toContain('unexpected request');
+      await expect(server.close()).rejects.toThrow(
+        'Fake OpenAI Server received an unexpected request',
+      );
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
 });

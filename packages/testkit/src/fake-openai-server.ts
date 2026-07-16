@@ -61,6 +61,7 @@ export const startFakeOpenAiServer = async (input: {
   let resolveCompleted!: () => void;
   let rejectCompleted!: (error: unknown) => void;
   let completionSettled = false;
+  let unexpectedRequestError: Error | undefined;
   const completed = new Promise<void>((resolve, reject) => {
     resolveCompleted = resolve;
     rejectCompleted = reject;
@@ -84,6 +85,7 @@ export const startFakeOpenAiServer = async (input: {
     const script = scripts.shift();
     if (!script) {
       const error = new Error('Fake OpenAI Server received an unexpected request');
+      unexpectedRequestError ??= error;
       fail(error);
       response.writeHead(500).end(error.message);
       return;
@@ -187,6 +189,9 @@ export const startFakeOpenAiServer = async (input: {
         }
       });
       await closePromise;
+      if (unexpectedRequestError !== undefined) {
+        throw unexpectedRequestError;
+      }
     },
   };
 };

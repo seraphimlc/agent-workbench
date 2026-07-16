@@ -181,6 +181,73 @@ const processIdentityIsLive = (identity: ProcessIdentity): boolean => {
   );
 };
 
+const captureProcessTreeIdentities = (
+  parentIdentity: ProcessIdentity,
+): ProcessIdentity[] => {
+  const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart='], {
+    encoding: 'utf8',
+    shell: false,
+  });
+  if (result.status !== 0) {
+    throw new Error('Unable to inspect the owned process tree');
+  }
+  const processes = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+      if (!match?.[1] || !match[2] || !match[3]) {
+        throw new Error('Unable to parse an owned process identity');
+      }
+      return {
+        pid: Number(match[1]),
+        parentPid: Number(match[2]),
+        processStartIdentity: normalizeProcessStartIdentity(match[3]),
+      };
+    });
+  const descendants: ProcessIdentity[] = [];
+  const pendingParents = [parentIdentity.pid];
+  while (pendingParents.length > 0) {
+    const parentPid = pendingParents.shift() as number;
+    for (const processEntry of processes) {
+      if (processEntry.parentPid !== parentPid) continue;
+      descendants.push({
+        pid: processEntry.pid,
+        processStartIdentity: processEntry.processStartIdentity,
+      });
+      pendingParents.push(processEntry.pid);
+    }
+  }
+  return [...descendants.reverse(), parentIdentity];
+};
+
+const forceKillProcesses = async (
+  identities: readonly ProcessIdentity[],
+): Promise<void> => {
+  const uniqueIdentities = [
+    ...new Map(
+      identities.map((identity) => [
+        `${String(identity.pid)}\0${identity.processStartIdentity}`,
+        identity,
+      ]),
+    ).values(),
+  ];
+  for (const identity of uniqueIdentities) {
+    if (!processIdentityIsLive(identity)) continue;
+    try {
+      process.kill(identity.pid, 'SIGKILL');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    }
+  }
+  await waitFor(
+    () => uniqueIdentities.every((identity) => !processIdentityIsLive(identity)),
+    'forced owned process cleanup',
+    2_000,
+  );
+};
+
 const csrfTokenFrom = (html: string): string => {
   const match =
     /<meta name="agent-workbench-csrf" content="([^"]+)">/.exec(html);
@@ -217,18 +284,64 @@ describe('Web Console shutdown with an active Runner', () => {
   let provider: FakeOpenAiServer | undefined;
   let server: WebConsoleServerHandle | undefined;
   let releaseHangingResponse: Deferred | undefined;
+  let daemonHandle: DaemonProcessHandle | undefined;
+  let daemonIdentity: ProcessIdentity | undefined;
+  let runnerIdentity: ProcessIdentity | undefined;
 
   afterEach(async () => {
-    await server?.stop().catch(() => undefined);
-    server = undefined;
+    const failures: unknown[] = [];
     releaseHangingResponse?.resolve();
+    const activeServer = server;
+    server = undefined;
+    if (activeServer !== undefined) {
+      try {
+        await within(activeServer.stop(), 'Web Console test cleanup', 8_000);
+      } catch (error) {
+        failures.push(error);
+        try {
+          const identities = [
+            ...(daemonIdentity
+              ? captureProcessTreeIdentities(daemonIdentity)
+              : []),
+            ...(runnerIdentity ? [runnerIdentity] : []),
+          ];
+          await forceKillProcesses(identities);
+          if (daemonHandle !== undefined) {
+            rmSync(dirname(daemonHandle.socketPath), {
+              force: true,
+              recursive: true,
+            });
+          }
+        } catch (fallbackError) {
+          failures.push(fallbackError);
+        }
+      }
+    }
     releaseHangingResponse = undefined;
-    await provider?.close().catch(() => undefined);
+    if (provider !== undefined) {
+      try {
+        await within(provider.close(), 'Fake Provider cleanup', 2_000);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     provider = undefined;
+    daemonHandle = undefined;
+    daemonIdentity = undefined;
+    runnerIdentity = undefined;
     if (rootDir !== undefined) {
       rmSync(rootDir, { force: true, recursive: true });
       rootDir = undefined;
     }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Web Console shutdown test cleanup failed');
+    }
+  });
+
+  it('normalizes persisted and live ps identities with repeated date whitespace', () => {
+    expect(
+      normalizeProcessStartIdentity('Mon Jul  7 09:08:06 2026\n'),
+    ).toBe('Mon Jul 7 09:08:06 2026');
   });
 
   it('aborts a hanging model call and reaps daemon and Runner resources idempotently', async () => {
@@ -334,7 +447,6 @@ describe('Web Console shutdown with an active Runner', () => {
       ],
     });
 
-    let daemon: DaemonProcessHandle | undefined;
     const daemonManager = new DaemonProcessManager({ stopTimeoutMs: 5_000 });
     server = await startWebConsoleServer({
       cwd: workspacePath,
@@ -345,12 +457,16 @@ describe('Web Console shutdown with an active Runner', () => {
       dependencies: {
         createDaemonManager: () => ({
           start: async (options) => {
-            daemon = await daemonManager.start({
+            daemonHandle = await daemonManager.start({
               ...options,
               dataDir,
               runtimeDir: runtimeRoot,
             });
-            return daemon;
+            daemonIdentity = {
+              pid: daemonHandle.pid,
+              processStartIdentity: readProcessStartIdentity(daemonHandle.pid),
+            };
+            return daemonHandle;
           },
         }),
         writeReady: () => undefined,
@@ -372,13 +488,12 @@ describe('Web Console shutdown with an active Runner', () => {
     );
 
     await within(requestMatched.promise, 'the hanging Provider request', 10_000);
-    if (daemon === undefined) throw new Error('The real daemon handle was not captured');
-    const daemonIdentity: ProcessIdentity = {
-      pid: daemon.pid,
-      processStartIdentity: readProcessStartIdentity(daemon.pid),
-    };
+    if (daemonHandle === undefined || daemonIdentity === undefined) {
+      throw new Error('The real daemon identity was not captured');
+    }
+    const capturedDaemonHandle = daemonHandle;
+    const capturedDaemonIdentity = daemonIdentity;
     const inspection = await openRuntimeDatabase({ dataDir });
-    let runnerIdentity: ProcessIdentity;
     try {
       const lease = inspection
         .prepare(
@@ -394,11 +509,17 @@ describe('Web Console shutdown with an active Runner', () => {
       }
       runnerIdentity = {
         pid: lease.pid,
-        processStartIdentity: lease.processStartIdentity,
+        processStartIdentity: normalizeProcessStartIdentity(
+          lease.processStartIdentity,
+        ),
       };
     } finally {
       inspection.close();
     }
+    if (runnerIdentity === undefined) {
+      throw new Error('The real Runner identity was not captured');
+    }
+    const capturedRunnerIdentity = runnerIdentity;
 
     const stoppedServer = server;
     await within(stoppedServer.stop(), 'Web Console shutdown', 8_000);
@@ -408,14 +529,14 @@ describe('Web Console shutdown with an active Runner', () => {
 
     await waitFor(
       () =>
-        !processIdentityIsLive(daemonIdentity) &&
-        !processIdentityIsLive(runnerIdentity),
+        !processIdentityIsLive(capturedDaemonIdentity) &&
+        !processIdentityIsLive(capturedRunnerIdentity),
       'daemon and Runner process exit',
     );
-    expect(existsSync(daemon.socketPath)).toBe(false);
-    expect(existsSync(dirname(daemon.socketPath))).toBe(false);
+    expect(existsSync(capturedDaemonHandle.socketPath)).toBe(false);
+    expect(existsSync(dirname(capturedDaemonHandle.socketPath))).toBe(false);
     expect(readdirSync(runtimeRoot)).toEqual([]);
-    await expectSocketRefused(daemon.socketPath);
+    await expectSocketRefused(capturedDaemonHandle.socketPath);
 
     releaseHangingResponse.resolve();
     await within(provider.completed, 'the Fake Provider request drain', 1_000);
