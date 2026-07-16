@@ -165,6 +165,8 @@ const PROVIDER_MODEL = 'craft-test-model';
 const PROVIDER_API_KEY = 'provider-secret-key';
 const SECRET_PROMPT = 'Read notes.md and keep prompt-secret out of audit';
 const encoder = new TextEncoder();
+const PROVIDER_READ_TOOL_NAME = 'fs_read_text';
+const PROVIDER_WRITE_TOOL_NAME = 'fs_write_text';
 
 const providerEvent = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`;
 
@@ -195,6 +197,17 @@ const providerTools = [
         },
       },
     },
+  },
+] as const;
+
+const advertisedProviderTools = [
+  {
+    ...providerTools[0],
+    function: { ...providerTools[0].function, name: PROVIDER_READ_TOOL_NAME },
+  },
+  {
+    ...providerTools[1],
+    function: { ...providerTools[1].function, name: PROVIDER_WRITE_TOOL_NAME },
   },
 ] as const;
 
@@ -861,7 +874,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
               model: PROVIDER_MODEL,
               stream: true,
               messages: modelMessages(),
-              tools: providerTools,
+              tools: advertisedProviderTools,
             },
           },
           response: {
@@ -957,7 +970,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
               model: 'immutable-provider-model',
               stream: true,
               messages: modelMessages(),
-              tools: providerTools,
+              tools: advertisedProviderTools,
             },
           },
           response: {

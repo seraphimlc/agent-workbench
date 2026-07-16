@@ -88,10 +88,11 @@ const TOOL_MESSAGES = [
     content: 'Call fs.read_text with {"path":"README.md"}. Do not answer with text.',
   },
 ] as const;
+const PROVIDER_READ_TOOL_NAME = 'fs_read_text';
 const PROVIDER_READ_TOOL = {
   type: 'function',
   function: {
-    name: 'fs.read_text',
+    name: PROVIDER_READ_TOOL_NAME,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -136,7 +137,7 @@ const toolSse = (requestId: string): Uint8Array =>
                 id: 'call-readme',
                 type: 'function',
                 function: {
-                  name: 'fs.read_text',
+                  name: PROVIDER_READ_TOOL.function.name,
                   arguments: '{"path":"README.md"}',
                 },
               },
