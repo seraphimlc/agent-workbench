@@ -1,0 +1,17 @@
+{
+  "name": "@agent-workbench/web-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
+    "typecheck": "pnpm typecheck:server",
+    "test": "vitest run src/server"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

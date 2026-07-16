@@ -1,6 +1,9 @@
 node_modules/
 dist/
 coverage/
+.superpowers/
+.DS_Store
+.agent-workbench-preview/
 
 # Runtime sockets
 *.sock
