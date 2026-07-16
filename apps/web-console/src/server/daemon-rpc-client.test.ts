@@ -78,6 +78,79 @@ class ControlledCloseSocket extends EventEmitter {
   }
 }
 
+class ControlledRpcSocket extends EventEmitter {
+  destroyed = false;
+  backpressured = false;
+
+  private readonly decoder = new FrameDecoder();
+  private closed = false;
+
+  sendChallenge(): void {
+    queueMicrotask(() => {
+      this.emit(
+        'data',
+        encodeFrame({
+          kind: 'notification',
+          protocolVersion: 1,
+          traceId: 'controlled-challenge-trace',
+          method: 'auth.challenge',
+          payload: { nonce: fixtureNonce },
+        }),
+      );
+    });
+  }
+
+  write(bytes: Uint8Array): boolean {
+    if (this.backpressured) return false;
+
+    for (const value of this.decoder.push(bytes)) {
+      const request = RpcRequestSchema.parse(value);
+      const response =
+        request.method === 'auth.respond'
+          ? {
+              kind: 'response',
+              protocolVersion: 1,
+              requestId: request.requestId,
+              traceId: request.traceId,
+              ok: true,
+              result: { authenticated: true },
+            }
+          : {
+              kind: 'response',
+              protocolVersion: 1,
+              requestId: request.requestId,
+              traceId: request.traceId,
+              ok: true,
+              result: {
+                status: 'ready',
+                protocolVersion: 1,
+                pid: process.pid,
+              },
+            };
+      queueMicrotask(() => this.emit('data', encodeFrame(response)));
+    }
+
+    return true;
+  }
+
+  end(): this {
+    queueMicrotask(() => this.finishClose());
+    return this;
+  }
+
+  destroy(): this {
+    queueMicrotask(() => this.finishClose());
+    return this;
+  }
+
+  private finishClose(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.destroyed = true;
+    this.emit('close');
+  }
+}
+
 const loadRpcClient = async (): Promise<RpcClientModule> =>
   (await import('./daemon-rpc-client.js')) as unknown as RpcClientModule;
 
@@ -337,6 +410,69 @@ describe('production daemon RPC client', () => {
     await expect(
       client.send(client.createRequest('app.health', {})),
     ).resolves.toMatchObject({ ok: true });
+  });
+
+  it('bounds write backpressure by the request deadline and cleans temporary listeners', async () => {
+    const socket = new ControlledRpcSocket();
+    const { DaemonRpcClient } = await loadRpcClient();
+    const controlledClient = new DaemonRpcClient(socket as unknown as Socket);
+    socket.sendChallenge();
+    await controlledClient.authenticate(fixtureSecret);
+    socket.backpressured = true;
+    const baselineListeners = {
+      drain: socket.listenerCount('drain'),
+      error: socket.listenerCount('error'),
+      close: socket.listenerCount('close'),
+    };
+    const request = controlledClient.createRequest('app.health', {});
+    const sendResult = controlledClient.send(request, 50).then(
+      (response) => ({ response, error: undefined }),
+      (error: unknown) => ({ response: undefined, error }),
+    );
+    const guard = Symbol('send guard');
+    let guardTimer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const outcome = await Promise.race([
+        sendResult,
+        new Promise<typeof guard>((resolvePromise) => {
+          guardTimer = setTimeout(() => resolvePromise(guard), 250);
+        }),
+      ]);
+
+      expect(outcome).not.toBe(guard);
+      if (outcome === guard) return;
+      expect(outcome.error).toMatchObject({ code: 'RPC_REQUEST_TIMEOUT' });
+      expect(socket.listenerCount('drain')).toBe(baselineListeners.drain);
+      expect(socket.listenerCount('error')).toBe(baselineListeners.error);
+      expect(socket.listenerCount('close')).toBe(baselineListeners.close);
+
+      socket.backpressured = false;
+      await expect(controlledClient.send(request, 200)).resolves.toMatchObject({
+        ok: true,
+      });
+    } finally {
+      if (guardTimer) clearTimeout(guardTimer);
+      if (socket.backpressured) {
+        socket.backpressured = false;
+        socket.emit('drain');
+        await sendResult;
+      }
+      await controlledClient.close();
+    }
+  });
+
+  it('rejects authentication after an authenticated client is closed', async () => {
+    const socket = new ControlledRpcSocket();
+    const { DaemonRpcClient } = await loadRpcClient();
+    const controlledClient = new DaemonRpcClient(socket as unknown as Socket);
+    socket.sendChallenge();
+    await controlledClient.authenticate(fixtureSecret);
+    await controlledClient.close();
+
+    await expect(controlledClient.authenticate(fixtureSecret)).rejects.toMatchObject({
+      code: 'RPC_CLIENT_CLOSED',
+    });
   });
 
   it('rejects pending and future requests with the same failure when the connection closes', async () => {

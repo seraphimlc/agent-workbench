@@ -66,17 +66,18 @@ const timeoutError = (
   message: string,
 ): DaemonRpcClientError => new DaemonRpcClientError(code, message);
 
-const waitWithTimeout = async <Value>(
+const waitUntilDeadline = async <Value>(
   promise: Promise<Value>,
-  timeoutMs: number,
+  deadline: number,
   error: DaemonRpcClientError,
 ): Promise<Value> => {
-  if (!isPositiveTimeout(timeoutMs)) {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
     throw error;
   }
 
   return await new Promise<Value>((resolvePromise, rejectPromise) => {
-    const timer = setTimeout(() => rejectPromise(error), timeoutMs);
+    const timer = setTimeout(() => rejectPromise(error), remainingMs);
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -89,6 +90,13 @@ const waitWithTimeout = async <Value>(
     );
   });
 };
+
+const waitWithTimeout = async <Value>(
+  promise: Promise<Value>,
+  timeoutMs: number,
+  error: DaemonRpcClientError,
+): Promise<Value> =>
+  await waitUntilDeadline(promise, Date.now() + timeoutMs, error);
 
 const payloadSessionId = (payload: unknown): string | null => {
   if (
@@ -172,6 +180,25 @@ export class DaemonRpcClient {
   }
 
   authenticate(secret: Uint8Array): Promise<void> {
+    if (this.failed) {
+      return Promise.reject(this.failed);
+    }
+    if (this.closeStarted) {
+      const failure = new DaemonRpcClientError(
+        'RPC_CLIENT_CLOSED',
+        'Daemon RPC client is closed',
+      );
+      this.fail(failure);
+      return Promise.reject(failure);
+    }
+    if (this.socket.destroyed) {
+      const failure = new DaemonRpcClientError(
+        'RPC_CONNECTION_CLOSED',
+        'Daemon RPC connection closed',
+      );
+      this.fail(failure);
+      return Promise.reject(failure);
+    }
     if (this.authenticated) {
       return Promise.resolve();
     }
@@ -225,6 +252,11 @@ export class DaemonRpcClient {
         'Timed out waiting for the daemon RPC response',
       );
     }
+    const deadline = Date.now() + timeoutMs;
+    const requestTimeoutError = timeoutError(
+      'RPC_REQUEST_TIMEOUT',
+      'Timed out waiting for the daemon RPC response',
+    );
 
     let requestFrame: Buffer;
     try {
@@ -248,19 +280,16 @@ export class DaemonRpcClient {
     );
     void responsePromise.catch(() => undefined);
     this.pendingResponses.set(request.requestId, pending);
-    const requestTimeout = setTimeout(() => {
-      pending.reject(
-        timeoutError(
-          'RPC_REQUEST_TIMEOUT',
-          'Timed out waiting for the daemon RPC response',
-        ),
-      );
-    }, timeoutMs);
-
     try {
       try {
-        await this.writeBytes(requestFrame);
-      } catch {
+        await this.writeBytes(requestFrame, deadline, requestTimeoutError);
+      } catch (error) {
+        if (
+          error instanceof DaemonRpcClientError &&
+          error.code === 'RPC_REQUEST_TIMEOUT'
+        ) {
+          throw error;
+        }
         const failure =
           this.failed ??
           new DaemonRpcClientError(
@@ -268,10 +297,14 @@ export class DaemonRpcClient {
             'Daemon RPC connection closed during request write',
           );
         this.fail(failure);
+        throw failure;
       }
-      return await responsePromise;
+      return await waitUntilDeadline(
+        responsePromise,
+        deadline,
+        requestTimeoutError,
+      );
     } finally {
-      clearTimeout(requestTimeout);
       if (this.pendingResponses.get(request.requestId) === pending) {
         this.pendingResponses.delete(request.requestId);
       }
@@ -420,16 +453,27 @@ export class DaemonRpcClient {
     }
   }
 
-  private async writeBytes(bytes: Uint8Array): Promise<void> {
+  private async writeBytes(
+    bytes: Uint8Array,
+    deadline: number,
+    requestTimeoutError: DaemonRpcClientError,
+  ): Promise<void> {
     if (this.socket.write(bytes)) {
       return;
     }
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
-      const finish = (action: () => void): void => {
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
         this.socket.off('drain', handleDrain);
         this.socket.off('close', handleClose);
         this.socket.off('error', handleError);
+      };
+      const finish = (action: () => void): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         action();
       };
       const handleDrain = (): void => finish(resolvePromise);
@@ -444,7 +488,16 @@ export class DaemonRpcClient {
           ),
         );
       const handleError = (): void => handleClose();
+      const handleTimeout = (): void =>
+        finish(() => rejectPromise(requestTimeoutError));
+      const remainingMs = deadline - Date.now();
 
+      if (remainingMs <= 0) {
+        rejectPromise(requestTimeoutError);
+        return;
+      }
+
+      const timer = setTimeout(handleTimeout, remainingMs);
       this.socket.once('drain', handleDrain);
       this.socket.once('close', handleClose);
       this.socket.once('error', handleError);
