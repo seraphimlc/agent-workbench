@@ -1279,6 +1279,44 @@ describe('ModelAttempt and ToolCall authorization', () => {
     }
   });
 
+  it('rejects invalid persisted Tool arguments before writing ToolRun or Event state', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const source = insertSucceededToolCall(fixture.database, {
+      sessionId: fixture.sessionId,
+      turnId: fixture.turnId,
+      suffix: 'invalid-persisted-arguments',
+      argumentsJson: '{"path":',
+    });
+    const before = captureAuthorizationFacts(fixture.database);
+    let handlerCalls = 0;
+    const { ToolGateway } = await loadToolGateway();
+    const gateway = new ToolGateway(fixture.database, {
+      handlers: {
+        'fs.read_text': async () => {
+          handlerCalls += 1;
+          return { content: 'must not run' };
+        },
+      },
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('invalid-persisted-arguments-tool'),
+    });
+
+    try {
+      await expect(
+        gateway.execute({
+          binding: fixture.claim,
+          modelAttemptId: source.attemptId,
+          logicalCallId: source.logicalCallId,
+        }),
+      ).rejects.toMatchObject({ code: 'MODEL_TOOL_INPUT_INVALID' });
+      expect(handlerCalls).toBe(0);
+      expect(captureAuthorizationFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it('commits failed Tool status and Event with one stable error code', async () => {
     runtime = createTempRuntime();
     const fixture = await createFixture(runtime);
@@ -1356,62 +1394,70 @@ describe('ModelAttempt and ToolCall authorization', () => {
   it.each([
     {
       name: 'succeeded',
+      eventType: 'tool.succeeded',
       handler: async () => ({ content: 'terminal result' }),
     },
     {
       name: 'failed',
+      eventType: 'tool.failed',
       handler: async () => {
         throw new Error('terminal failure');
       },
     },
-  ])('rolls back the $name Tool terminal update when its Event hook fails', async ({ name, handler }) => {
-    runtime = createTempRuntime();
-    const fixture = await createFixture(runtime);
-    const source = insertSucceededToolCall(fixture.database, {
-      sessionId: fixture.sessionId,
-      turnId: fixture.turnId,
-      suffix: `terminal-rollback-${handler.name || 'case'}`,
-    });
-    const { ToolGateway } = await loadToolGateway();
-    const gateway = new ToolGateway(fixture.database, {
-      handlers: { 'fs.read_text': handler },
-      now: () => new Date(FINISH_TIME),
-      createId: createIdFactory('terminal-rollback-tool'),
-      beforeTerminalEvent: (type) => {
-        if (type === `tool.${name}`) throw new Error('terminal Event unavailable');
-      },
-    });
-
-    try {
-      await expect(
-        gateway.execute({
-          binding: fixture.claim,
-          modelAttemptId: source.attemptId,
-          logicalCallId: source.logicalCallId,
-        }),
-      ).rejects.toThrow();
-      expect(
-        fixture.database
-          .prepare(
-            `SELECT status, result_json AS resultJson, error_code AS errorCode,
-                    error_message AS errorMessage, finished_at AS finishedAt
-             FROM tool_runs`,
-          )
-          .get(),
-      ).toEqual({
-        status: 'running',
-        resultJson: null,
-        errorCode: null,
-        errorMessage: null,
-        finishedAt: null,
+  ] as const)(
+    'rolls back the $name Tool terminal update when its Event insert fails',
+    async ({ name, eventType, handler }) => {
+      runtime = createTempRuntime();
+      const fixture = await createFixture(runtime);
+      const source = insertSucceededToolCall(fixture.database, {
+        sessionId: fixture.sessionId,
+        turnId: fixture.turnId,
+        suffix: `terminal-rollback-${name}`,
       });
-      expect(readToolEvents(fixture.database, fixture.turnId).map((event) => event.type)).toEqual([
-        'tool.started',
-      ]);
-    } finally {
-      fixture.database.close();
-    }
-  });
+      fixture.database.exec(`
+        CREATE TRIGGER reject_tool_terminal_event
+        BEFORE INSERT ON session_events
+        WHEN NEW.type = '${eventType}'
+        BEGIN SELECT RAISE(FAIL, 'terminal Event unavailable'); END;
+      `);
+      const { ToolGateway } = await loadToolGateway();
+      const gateway = new ToolGateway(fixture.database, {
+        handlers: { 'fs.read_text': handler },
+        now: () => new Date(FINISH_TIME),
+        createId: createIdFactory('terminal-rollback-tool'),
+      });
+
+      try {
+        await expect(
+          gateway.execute({
+            binding: fixture.claim,
+            modelAttemptId: source.attemptId,
+            logicalCallId: source.logicalCallId,
+          }),
+        ).rejects.toThrow();
+        expect(
+          fixture.database
+            .prepare(
+              `SELECT status, result_json AS resultJson, error_code AS errorCode,
+                      error_message AS errorMessage, finished_at AS finishedAt
+               FROM tool_runs`,
+            )
+            .get(),
+        ).toEqual({
+          status: 'running',
+          resultJson: null,
+          errorCode: null,
+          errorMessage: null,
+          finishedAt: null,
+        });
+        expect(readToolEvents(fixture.database, fixture.turnId).map((event) => event.type)).toEqual([
+          'tool.started',
+        ]);
+      } finally {
+        fixture.database.close();
+      }
+    },
+  );
 
   it('passes Provider and registered secrets from RunnerExecutionDriver into ToolGateway', async () => {
     runtime = createTempRuntime();

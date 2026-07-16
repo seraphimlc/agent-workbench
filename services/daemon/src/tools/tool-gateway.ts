@@ -129,6 +129,7 @@ export class ToolGateway {
     readonly logicalCallId: string;
   }): Promise<{ readonly toolRunId: string; readonly content: string }> {
     let source!: ToolSourceRow;
+    let parsedInput!: Record<string, unknown>;
     let toolRunId = '';
     const startedAt = this.now().toISOString();
     try {
@@ -206,6 +207,7 @@ export class ToolGateway {
         if (!this.options.handlers[candidate.toolId]) {
           throw new ToolGatewayError('MODEL_TOOL_UNAUTHORIZED', 'No Tool handler is installed');
         }
+        parsedInput = parseInput(candidate.argumentsJson);
         const ordinal = (
           this.database
             .prepare(
@@ -275,7 +277,6 @@ export class ToolGateway {
 
     const handler = this.options.handlers[source.toolId];
     if (!handler) throw new ToolGatewayError('MODEL_TOOL_UNAUTHORIZED', 'No Tool handler is installed');
-    const parsedInput = parseInput(source.argumentsJson);
     let result: { readonly content: string };
     try {
       result = await handler({
