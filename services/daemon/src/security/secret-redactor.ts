@@ -5,23 +5,28 @@ const normalizedSecrets = (secrets: readonly string[]): readonly string[] =>
     (left, right) => right.length - left.length,
   );
 
-const redactionPlaceholder = (secrets: readonly string[]): string => {
-  if (secrets.every((secret) => !REDACTION.includes(secret))) return REDACTION;
-  for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint += 1) {
-    const candidate = String.fromCodePoint(codePoint);
-    if (secrets.every((secret) => !candidate.includes(secret))) return candidate;
+const redactIfSafe = (
+  value: string,
+  secrets: readonly string[],
+  placeholder: string,
+): string | undefined => {
+  let redacted = value;
+  for (const secret of secrets) {
+    redacted = redacted.split(secret).join(placeholder);
   }
-  return '';
+  return secrets.some((secret) => redacted.includes(secret)) ? undefined : redacted;
 };
 
 export const redactSecrets = (value: string, secrets: readonly string[]): string => {
   const normalized = normalizedSecrets(secrets);
-  const placeholder = redactionPlaceholder(normalized);
-  let redacted = value;
-  for (const secret of normalized) {
-    redacted = redacted.split(secret).join(placeholder);
+  const defaultRedaction = redactIfSafe(value, normalized, REDACTION);
+  if (defaultRedaction !== undefined) return defaultRedaction;
+
+  for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint += 1) {
+    const redacted = redactIfSafe(value, normalized, String.fromCodePoint(codePoint));
+    if (redacted !== undefined) return redacted;
   }
-  return redacted;
+  return '';
 };
 
 export const redactAndLimit = (

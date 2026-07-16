@@ -33,6 +33,14 @@ describe('redactSecrets', () => {
     expect(result).not.toBe('[REDACTED]');
     for (const secret of secrets) expect(result).not.toContain(secret);
   });
+
+  it('retries when replacement creates a registered secret', () => {
+    const secrets = ['a[REDACTED]b', 'x'];
+    const result = redactSecrets('axb', secrets);
+
+    expect(result).not.toBe('');
+    for (const secret of secrets) expect(result).not.toContain(secret);
+  });
 });
 
 describe('redactAndLimit', () => {
