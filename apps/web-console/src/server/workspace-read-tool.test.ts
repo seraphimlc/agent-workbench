@@ -131,6 +131,22 @@ describe('createWorkspaceReadHandler', () => {
     await expectCode(executeRead(handler, { path: '../outside.md' }), 'WORKSPACE_PATH_ESCAPE');
   });
 
+  it('rejects any parent path segment even when normalization stays in the workspace', async () => {
+    const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
+    const fixture = await createFixture();
+    await mkdir(join(fixture.workspacePath, 'dir'));
+    await writeFile(join(fixture.workspacePath, 'README.md'), '# Workspace\n');
+    const handler = createWorkspaceReadHandler({
+      workspacePath: fixture.workspacePath,
+      controlPlanePaths: [fixture.controlPlanePath],
+    });
+
+    await expectCode(
+      executeRead(handler, { path: 'dir/../README.md' }),
+      'WORKSPACE_PATH_ESCAPE',
+    );
+  });
+
   it('rejects a final-component symlink', async () => {
     const { createWorkspaceReadHandler } = await loadWorkspaceReadTool();
     const fixture = await createFixture();

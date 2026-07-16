@@ -70,19 +70,7 @@ const isWithin = (parentPath: string, candidatePath: string): boolean => {
 const pathsOverlap = (firstPath: string, secondPath: string): boolean =>
   isWithin(firstPath, secondPath) || isWithin(secondPath, firstPath);
 
-const escapesWithParentTraversal = (path: string): boolean => {
-  let depth = 0;
-  for (const part of path.split(/[\\/]+/)) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
-      if (depth === 0) return true;
-      depth -= 1;
-      continue;
-    }
-    depth += 1;
-  }
-  return false;
-};
+const containsParentSegment = (path: string): boolean => path.split(/[\\/]+/).includes('..');
 
 const parseCandidatePath = (input: unknown, workspacePath: string): string => {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
@@ -103,7 +91,7 @@ const parseCandidatePath = (input: unknown, workspacePath: string): string => {
   ) {
     throw codedError('WORKSPACE_PATH_INVALID');
   }
-  if (escapesWithParentTraversal(path)) {
+  if (containsParentSegment(path)) {
     throw codedError('WORKSPACE_PATH_ESCAPE');
   }
 
