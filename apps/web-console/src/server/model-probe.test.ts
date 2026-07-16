@@ -181,7 +181,7 @@ const chatScript = (modelId: string, response: Uint8Array | { readonly status: n
       : { status: response.status, chunks: [encoder.encode('provider raw failure')] },
 });
 
-const toolScript = (modelId: string, response: Uint8Array) => ({
+const toolScript = (modelId: string, response: Uint8Array | { readonly status: number }) => ({
   expectedRequest: {
     method: 'POST' as const,
     path: '/v1/chat/completions',
@@ -196,10 +196,13 @@ const toolScript = (modelId: string, response: Uint8Array) => ({
       tools: [PROVIDER_READ_TOOL],
     },
   },
-  response: {
-    headers: { 'content-type': 'text/event-stream' },
-    chunks: [response],
-  },
+  response:
+    response instanceof Uint8Array
+      ? {
+          headers: { 'content-type': 'text/event-stream' },
+          chunks: [response],
+        }
+      : { status: response.status, chunks: [encoder.encode('provider raw failure')] },
 });
 
 const expectProbeFailure = async (operation: Promise<unknown>): Promise<Error & { code: string }> => {
@@ -283,6 +286,89 @@ describe('probeProviderModel', () => {
     } finally {
       await server.close();
     }
+  });
+
+  it('continues to the next candidate when the first candidate passes chat but fails Tool probing', async () => {
+    const { probeProviderModel } = await loadProbe();
+    const { startFakeOpenAiServer } = await loadFakeServer();
+    const server = await startFakeOpenAiServer({
+      scripts: [
+        {
+          expectedRequest: {
+            method: 'GET',
+            path: '/v1/models',
+            headers: { authorization: 'Bearer probe-secret-key' },
+          },
+          response: {
+            headers: { 'content-type': 'application/json' },
+            chunks: [
+              encoder.encode(JSON.stringify({ data: [{ id: 'beta-chat' }, { id: 'alpha-chat' }] })),
+            ],
+          },
+        },
+        chatScript('alpha-chat', chatSse('chat-alpha')),
+        toolScript('alpha-chat', { status: 400 }),
+        chatScript('beta-chat', chatSse('chat-beta')),
+        toolScript('beta-chat', toolSse('tool-beta')),
+      ],
+    });
+
+    try {
+      await expect(probeProviderModel(providerConfig(server.baseUrl, null))).resolves.toBe(
+        'beta-chat',
+      );
+      await server.completed;
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('continues to the next candidate when the first candidate Tool probe times out', async () => {
+    vi.useFakeTimers();
+    const { probeProviderModel } = await loadProbe();
+    const calls: string[] = [];
+    const operation = probeProviderModel(providerConfig('https://provider.example.test', null), {
+      fetch: async () =>
+        new Response(JSON.stringify({ data: [{ id: 'beta-chat' }, { id: 'alpha-chat' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      adapter: {
+        call: async (input) => {
+          const stage = input.tools.length === 0 ? 'chat' : 'tool';
+          calls.push(`${input.modelId}:${stage}`);
+          if (input.modelId === 'alpha-chat' && stage === 'tool') {
+            return await new Promise<never>(() => undefined);
+          }
+          if (stage === 'chat') {
+            return { finishReason: 'stop', content: 'OK', toolCalls: [] };
+          }
+          return {
+            finishReason: 'tool_calls',
+            content: null,
+            toolCalls: [
+              {
+                logicalCallId: 'call-readme',
+                toolId: 'fs.read_text',
+                argumentsJson: '{"path":"README.md"}',
+              },
+            ],
+          };
+        },
+      },
+      requestTimeoutMs: 25,
+      totalTimeoutMs: 1_000,
+    });
+    const result = expect(operation).resolves.toBe('beta-chat');
+
+    await vi.advanceTimersByTimeAsync(25);
+    await result;
+    expect(calls).toEqual([
+      'alpha-chat:chat',
+      'alpha-chat:tool',
+      'beta-chat:chat',
+      'beta-chat:tool',
+    ]);
   });
 
   it('filters non-chat models, sorts deterministically, and probes at most three candidates', async () => {
