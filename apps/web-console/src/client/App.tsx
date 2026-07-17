@@ -265,12 +265,37 @@ export function App({
 
     const heartbeat = async (): Promise<void> => {
       let nextRuntime: Awaited<ReturnType<ApiClient['getRuntime']>> | null = null;
+      let recoveryFailed = false;
       try {
         nextRuntime = await api.getRuntime();
       } catch {
         nextRuntime = null;
       }
       if (canceled) return;
+
+      if (nextRuntime?.daemon.status === 'ready' && snapshotRef.current === null) {
+        const storedSessionId = readStoredSessionId(storage);
+        if (storedSessionId !== null) {
+          const recoveryGeneration = stateGenerationRef.current;
+          const recoveryIsCurrent = (): boolean =>
+            stateGenerationRef.current === recoveryGeneration &&
+            snapshotRef.current === null &&
+            readStoredSessionId(storage) === storedSessionId;
+          try {
+            const restoredSnapshot = await api.getSnapshot(storedSessionId);
+            if (canceled) return;
+            if (recoveryIsCurrent()) adoptSnapshot(restoredSnapshot);
+          } catch (error) {
+            if (canceled) return;
+            if (recoveryIsCurrent()) {
+              if (isMissingSession(error)) clearStoredSessionId(storage);
+              else recoveryFailed = true;
+            }
+          }
+        }
+      }
+      if (canceled) return;
+      if (recoveryFailed) nextRuntime = null;
 
       setBootstrap((current) => {
         if (current.status !== 'ready') return current;
@@ -292,7 +317,7 @@ export function App({
       canceled = true;
       if (timer !== null) clearTimeout(timer);
     };
-  }, [api, bootstrap.status, pollIntervals.runtimeMs]);
+  }, [adoptSnapshot, api, bootstrap.status, pollIntervals.runtimeMs, storage]);
 
   const sessionId = snapshot?.session.id ?? null;
 

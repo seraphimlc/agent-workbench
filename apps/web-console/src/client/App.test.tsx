@@ -23,9 +23,10 @@ import {
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type {
-  ApiClient,
-  MutationOperation,
+import {
+  ApiPublicError,
+  type ApiClient,
+  type MutationOperation,
 } from './api.js';
 import {
   App,
@@ -288,6 +289,181 @@ describe('professional web workbench', () => {
       (screen.getByLabelText('Task prompt') as HTMLTextAreaElement)
         .disabled,
     ).toBe(false);
+  });
+
+  it('restores a saved Session before marking a recovered Runtime ready', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const restored = deferred<SessionSnapshot>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValue(runtime);
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockImplementation(() => restored.promise);
+
+    render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledWith('session-1'));
+    await act(async () => {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    });
+    expect(getRuntime).toHaveBeenCalledTimes(2);
+    expect(
+      (screen.getByLabelText('Task prompt') as HTMLTextAreaElement).disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      restored.resolve(snapshot({ title: 'Recovered saved task' }));
+      await restored.promise;
+    });
+
+    expect(await screen.findByText('Recovered saved task')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+  });
+
+  it('clears a missing saved Session and recovers to an empty ready workbench', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValueOnce(runtime)
+      .mockImplementation(() => new Promise(() => undefined));
+    const getSnapshot = vi.fn<ApiClient['getSnapshot']>().mockRejectedValue(
+      new ApiPublicError(404, {
+        code: 'SESSION_NOT_FOUND',
+        message: 'Session was not found',
+        retryable: false,
+        userAction: null,
+      }),
+    );
+
+    render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledWith('session-1'));
+    await waitFor(() =>
+      expect(window.localStorage.getItem(CURRENT_SESSION_STORAGE_KEY)).toBeNull(),
+    );
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+    expect(screen.getByText('Describe the task you want to run.')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('Task prompt') as HTMLTextAreaElement).disabled,
+    ).toBe(false);
+  });
+
+  it('keeps submission disabled and retries a non-missing saved Session recovery error', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const firstRecovery = deferred<SessionSnapshot>();
+    const secondRecovery = deferred<SessionSnapshot>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValue(runtime);
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockImplementationOnce(() => firstRecovery.promise)
+      .mockImplementationOnce(() => secondRecovery.promise);
+
+    render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      firstRecovery.reject(new Error('Snapshot recovery unavailable'));
+      await firstRecovery.promise.catch(() => undefined);
+    });
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Runtime unavailable')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('Task prompt') as HTMLTextAreaElement).disabled,
+    ).toBe(true);
+    expect(window.localStorage.getItem(CURRENT_SESSION_STORAGE_KEY)).toBe('session-1');
+
+    await act(async () => {
+      secondRecovery.resolve(snapshot({ title: 'Recovered after retry' }));
+      await secondRecovery.promise;
+    });
+    expect(await screen.findByText('Recovered after retry')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+  });
+
+  it('does not adopt a saved Session recovery after a newer empty state wins', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const restored = deferred<SessionSnapshot>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValueOnce(runtime)
+      .mockImplementation(() => new Promise(() => undefined));
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockImplementation(() => restored.promise);
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledWith('session-1'));
+    await user.click(screen.getByRole('button', { name: 'New task' }));
+    expect(window.localStorage.getItem(CURRENT_SESSION_STORAGE_KEY)).toBeNull();
+
+    await act(async () => {
+      restored.resolve(snapshot({ title: 'Stale recovered task' }));
+      await restored.promise;
+    });
+
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+    expect(screen.queryByText('Stale recovered task')).toBeNull();
+    expect(screen.getByText('Describe the task you want to run.')).toBeTruthy();
+  });
+
+  it('stops a pending saved Session recovery after unmount', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const restored = deferred<SessionSnapshot>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValue(runtime);
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockImplementation(() => restored.promise);
+    const rendered = render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledWith('session-1'));
+    rendered.unmount();
+    await act(async () => {
+      restored.resolve(snapshot({ title: 'Unmounted stale task' }));
+      await restored.promise;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    });
+
+    expect(getRuntime).toHaveBeenCalledTimes(2);
   });
 
   it('recovers from a bootstrap error without reloading the page', async () => {
