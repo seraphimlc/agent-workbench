@@ -4,7 +4,14 @@ The Web Console demo starts the real local HTTP console, Daemon, Session Runners
 
 ## Prerequisites
 
-Run from the repository root on macOS with a compatible local provider configuration already available to the demo process. This guide intentionally contains no provider configuration commands or credential material.
+Run from the repository root on macOS. The demo process requires these environment variables:
+
+```bash
+export AGENT_WORKBENCH_PROVIDER_BASE_URL="https://provider.example.test/v1"
+export AGENT_WORKBENCH_PROVIDER_API_KEY="replace-with-provider-api-key"
+```
+
+Use the OpenAI-compatible `/v1` base URL and API key supplied by your provider. The values above are safe placeholders, not working credentials. The workspace continues to default to the repository root, and provider model selection continues to use the existing automatic behavior.
 
 ## Start
 

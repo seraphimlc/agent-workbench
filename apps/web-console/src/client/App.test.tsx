@@ -517,6 +517,53 @@ describe('professional web workbench', () => {
     expect(createCancelTurnOperation).toHaveBeenCalledWith('session-1', 'turn-1');
   });
 
+  it('keeps a cancel conflict blocked when the authoritative Snapshot refresh fails', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const queuedSnapshot = snapshot({
+      events: [event(1, 'turn.queued', { payload: { ordinal: 1 } })],
+      runtimeStatus: 'queued',
+      turns: [turn('queued')],
+    });
+    const execute = vi.fn(async () => {
+      throw new ApiPublicError(409, {
+        code: 'TURN_NOT_CANCELLABLE',
+        message: 'Turn is not cancellable',
+        retryable: false,
+        userAction: null,
+      });
+    });
+    const retry = vi.fn(async () => ({ turnId: 'turn-1', status: 'canceled' as const }));
+    const createCancelTurnOperation = vi.fn<ApiClient['createCancelTurnOperation']>(
+      () => operation(execute, retry),
+    );
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockResolvedValueOnce(queuedSnapshot)
+      .mockRejectedValueOnce(new Error('Snapshot unavailable'));
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({ createCancelTurnOperation, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000 }}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Cancel queued Turn 1' }),
+    );
+
+    expect(
+      await screen.findByText('This turn started before it could be canceled.'),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole('button', { name: 'Cancel queued Turn 1' }),
+    ).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(retry).not.toHaveBeenCalled();
+  });
+
   it('disables queued cancellation after an Event poll failure until polling recovers', async () => {
     window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
     const queuedSnapshot = snapshot({

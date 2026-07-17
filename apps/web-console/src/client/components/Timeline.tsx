@@ -322,8 +322,7 @@ function TimelineCard({
         <div className="timeline-card-actions">
           {cancelState?.status === 'conflict' ? (
             <p role="status">This turn started before it could be canceled.</p>
-          ) : null}
-          {queuedTurn === null ? null : cancelState?.status === 'error' ? (
+          ) : queuedTurn === null ? null : cancelState?.status === 'error' ? (
             <>
               <p role="alert">Couldn’t cancel this queued turn.</p>
               <button type="button" onClick={() => onCancel(item.turnId as string)}>
