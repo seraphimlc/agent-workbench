@@ -51,7 +51,11 @@ const waitForCondition = async (
 
 const mutationRequest = (
   client: RpcClient,
-  method: 'workspace.register' | 'session.create' | 'turn.enqueue',
+  method:
+    | 'workspace.register'
+    | 'session.create'
+    | 'turn.enqueue'
+    | 'turn.cancel',
   payload: unknown,
   clientRequestId: string,
   sessionId: string | null = null,
@@ -319,6 +323,179 @@ describe('craft session persistence', () => {
     expect(snapshot.turns.map((turn) => turn.id)).toEqual([created.turnId]);
     expect(snapshot.events.map((event) => event.seq)).toEqual([1, 2]);
   });
+
+  it('preserves queued multi-session facts and queued cancellation across SIGKILL restarts', async () => {
+    runtime = createTempRuntime();
+    const workspacePath = join(runtime.rootDir, 'concurrent-workspace');
+    mkdirSync(workspacePath);
+
+    const captureFacts = async (sessionId: string) => {
+      if (client === undefined) {
+        throw new Error('Authenticated client was not available');
+      }
+      const response = await client.sendRequest({
+        ...client.createRequest('session.getSnapshot', { sessionId }),
+        sessionId,
+      });
+      if (!response.ok) {
+        throw new Error('session.getSnapshot failed');
+      }
+      const snapshot = SessionSnapshotSchema.parse(response.result);
+      return {
+        session: snapshot.session,
+        messages: snapshot.messages,
+        turns: snapshot.turns,
+        events: snapshot.events,
+      };
+    };
+
+    const firstDaemon = runtime.spawnDaemon();
+    await firstDaemon.waitForReady();
+    client = await authenticatedClient(runtime.socketPath, firstDaemon);
+    const workspaceResponse = await client.sendRequest(
+      mutationRequest(
+        client,
+        'workspace.register',
+        { path: workspacePath },
+        'concurrent-workspace',
+      ),
+    );
+    if (!workspaceResponse.ok) {
+      throw new Error('workspace.register failed');
+    }
+    const workspace = WorkspaceRegisterResultSchema.parse(workspaceResponse.result);
+
+    const createSession = async (title: string, prompt: string, requestId: string) => {
+      if (client === undefined) {
+        throw new Error('Authenticated client was not available');
+      }
+      const response = await client.sendRequest(
+        mutationRequest(
+          client,
+          'session.create',
+          { workspaceId: workspace.workspaceId, title, prompt },
+          requestId,
+        ),
+      );
+      if (!response.ok) {
+        throw new Error('session.create failed');
+      }
+      return SessionCreateResultSchema.parse(response.result);
+    };
+
+    const enqueue = async (sessionId: string, prompt: string, requestId: string) => {
+      if (client === undefined) {
+        throw new Error('Authenticated client was not available');
+      }
+      const response = await client.sendRequest(
+        mutationRequest(
+          client,
+          'turn.enqueue',
+          { sessionId, prompt },
+          requestId,
+          sessionId,
+        ),
+      );
+      if (!response.ok) {
+        throw new Error('turn.enqueue failed');
+      }
+      return response.result as { readonly turnId: string };
+    };
+
+    const sessionA = await createSession('Session A', 'A1', 'session-a-1');
+    const sessionB = await createSession('Session B', 'B1', 'session-b-1');
+    const sessionC = await createSession('Session C', 'C1', 'session-c-1');
+    const turnA2 = await enqueue(sessionA.sessionId, 'A2', 'session-a-2');
+    const turnA3 = await enqueue(sessionA.sessionId, 'A3', 'session-a-3');
+
+    const beforeRestart = await Promise.all([
+      captureFacts(sessionA.sessionId),
+      captureFacts(sessionB.sessionId),
+      captureFacts(sessionC.sessionId),
+    ]);
+    expect(beforeRestart.map((facts) => facts.turns.map((turn) => turn.ordinal))).toEqual([
+      [1, 2, 3],
+      [1],
+      [1],
+    ]);
+    expect(beforeRestart[0]?.turns.map((turn) => turn.id)).toEqual([
+      sessionA.turnId,
+      turnA2.turnId,
+      turnA3.turnId,
+    ]);
+    expect(beforeRestart.flatMap((facts) => facts.turns).every((turn) =>
+      turn.status === 'queued' &&
+      turn.executionFence === 0 &&
+      turn.startedAt === null,
+    )).toBe(true);
+
+    await client.close();
+    client = undefined;
+    expect((await firstDaemon.stop('SIGKILL')).signal).toBe('SIGKILL');
+
+    const replacement = runtime.spawnDaemon();
+    await replacement.waitForReady();
+    client = await authenticatedClient(runtime.socketPath, replacement);
+    expect(await Promise.all([
+      captureFacts(sessionA.sessionId),
+      captureFacts(sessionB.sessionId),
+      captureFacts(sessionC.sessionId),
+    ])).toEqual(beforeRestart);
+
+    const cancelResponse = await client.sendRequest(
+      mutationRequest(
+        client,
+        'turn.cancel',
+        { sessionId: sessionC.sessionId, turnId: sessionC.turnId },
+        'session-c-cancel',
+        sessionC.sessionId,
+      ),
+    );
+    expect(cancelResponse.ok).toBe(true);
+    if (!cancelResponse.ok) {
+      throw new Error('turn.cancel failed');
+    }
+    expect(cancelResponse.result).toEqual({ turnId: sessionC.turnId, status: 'canceled' });
+
+    const inspection = new Database(join(runtime.dataDir, 'runtime.sqlite3'), {
+      readonly: true,
+    });
+    try {
+      expect(
+        inspection
+          .prepare(
+            `SELECT status, execution_fence AS executionFence, started_at AS startedAt
+             FROM turns WHERE id = ?`,
+          )
+          .get(sessionC.turnId),
+      ).toEqual({ status: 'canceled', executionFence: 0, startedAt: null });
+      expect(
+        inspection
+          .prepare('SELECT COUNT(*) AS count FROM runner_leases WHERE current_turn_id = ?')
+          .get(sessionC.turnId),
+      ).toEqual({ count: 0 });
+      expect(
+        inspection
+          .prepare(
+            `SELECT COUNT(*) AS count FROM session_events
+             WHERE turn_id = ? AND type = 'turn.started'`,
+          )
+          .get(sessionC.turnId),
+      ).toEqual({ count: 0 });
+    } finally {
+      inspection.close();
+    }
+    const canceledFacts = await captureFacts(sessionC.sessionId);
+
+    await client.close();
+    client = undefined;
+    expect((await replacement.stop('SIGKILL')).signal).toBe('SIGKILL');
+
+    const finalDaemon = runtime.spawnDaemon();
+    await finalDaemon.waitForReady();
+    client = await authenticatedClient(runtime.socketPath, finalDaemon);
+    expect(await captureFacts(sessionC.sessionId)).toEqual(canceledFacts);
+  }, 20_000);
 
   it('reuses one canonical workspace for fresh keys without creating Session Events', async () => {
     runtime = createTempRuntime();

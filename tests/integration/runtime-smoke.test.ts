@@ -304,6 +304,7 @@ describe('runtime smoke command', () => {
           { version: 2 },
           { version: 3 },
           { version: 4 },
+          { version: 5 },
         ]);
         expect(database.pragma('foreign_key_check')).toEqual([]);
         expect(database.pragma('integrity_check', { simple: true })).toBe('ok');
@@ -345,6 +346,12 @@ describe('runtime smoke command', () => {
         expect(database.prepare('SELECT * FROM scheduler_slots').all()).toEqual([
           {
             slot_no: 1,
+            state: 'free',
+            owner_turn_id: null,
+            updated_at: expect.any(String),
+          },
+          {
+            slot_no: 2,
             state: 'free',
             owner_turn_id: null,
             updated_at: expect.any(String),

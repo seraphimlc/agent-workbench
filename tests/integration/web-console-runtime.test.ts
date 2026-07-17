@@ -6,6 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -27,10 +28,16 @@ import type {
   SessionSnapshot,
 } from '../../packages/protocol/src/index.js';
 
+const requireFromDaemon = createRequire(
+  new URL('../../services/daemon/package.json', import.meta.url),
+);
+const Database = requireFromDaemon('better-sqlite3') as typeof import('better-sqlite3');
+
 const encoder = new TextEncoder();
 const PROVIDER_API_KEY = 'web-console-runtime-secret-key';
 const MODEL_ID = 'web-console-runtime-model';
 const PROMPT = 'Read README.md and summarize it.';
+const CONCURRENT_PROMPT = 'Keep this concurrent Session running.';
 const README_CONTENT = '# Runtime E2E\n\nThe real Web Console executed this turn.\n';
 const FINAL_SUMMARY = 'README.md confirms the real Web Console executed this turn.';
 const PROVIDER_READ_TOOL_NAME = 'fs_read_text';
@@ -443,4 +450,253 @@ describe('Web Console real execution lifecycle', () => {
       expect(browserVisible).not.toContain(privateValue);
     }
   });
+
+  it('runs two Sessions while a third Turn remains queued and cancelable', async () => {
+    rootDir = mkdtempSync(join(realpathSync('/tmp'), 'awr-'));
+    const workspacePath = join(rootDir, 'workspace');
+    const dataDir = join(rootDir, 'data');
+    const runtimeRoot = join(rootDir, 'runtime');
+    mkdirSync(workspacePath, { mode: 0o700 });
+    let matchedConcurrentRequests = 0;
+    const unresolvedResponse = new Promise<void>(() => undefined);
+
+    provider = await startFakeOpenAiServer({
+      scripts: [
+        {
+          expectedRequest: {
+            method: 'GET',
+            path: '/v1/models',
+            headers: { authorization: `Bearer ${PROVIDER_API_KEY}` },
+          },
+          response: {
+            headers: { 'content-type': 'application/json' },
+            chunks: [
+              encoder.encode(JSON.stringify({ data: [{ id: MODEL_ID }] })),
+            ],
+          },
+        },
+        {
+          expectedRequest: {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: {
+              authorization: `Bearer ${PROVIDER_API_KEY}`,
+              'content-type': 'application/json',
+            },
+            jsonBody: {
+              model: MODEL_ID,
+              stream: true,
+              messages: [
+                { role: 'user', content: 'Reply with the single word OK.' },
+              ],
+              tools: [],
+            },
+          },
+          response: {
+            headers: { 'content-type': 'text/event-stream' },
+            chunks: [stopResponse('probe-chat', 'OK')],
+          },
+        },
+        {
+          expectedRequest: {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: {
+              authorization: `Bearer ${PROVIDER_API_KEY}`,
+              'content-type': 'application/json',
+            },
+            jsonBody: {
+              model: MODEL_ID,
+              stream: true,
+              messages: [
+                {
+                  role: 'user',
+                  content:
+                    'Call fs.read_text with {"path":"README.md"}. Do not answer with text.',
+                },
+              ],
+              tools: [PROVIDER_READ_TOOL],
+            },
+          },
+          response: {
+            headers: { 'content-type': 'text/event-stream' },
+            chunks: [toolResponse('probe-tool', 'call-probe-readme')],
+          },
+        },
+        ...Array.from({ length: 2 }, () => ({
+          expectedRequest: {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: {
+              authorization: `Bearer ${PROVIDER_API_KEY}`,
+              'content-type': 'application/json',
+            },
+            jsonBody: {
+              model: MODEL_ID,
+              stream: true,
+              messages: [{ role: 'user', content: CONCURRENT_PROMPT }],
+              tools: [PROVIDER_READ_TOOL],
+            },
+          },
+          onRequestMatched: () => {
+            matchedConcurrentRequests += 1;
+          },
+          response: {
+            headers: { 'content-type': 'text/event-stream' },
+            chunks: [
+              {
+                bytes: new Uint8Array(),
+                waitFor: unresolvedResponse,
+              },
+            ],
+          },
+        })),
+      ],
+    });
+
+    const daemonManager = new DaemonProcessManager({ stopTimeoutMs: 5_000 });
+    server = await startWebConsoleServer({
+      cwd: workspacePath,
+      environment: {
+        AGENT_WORKBENCH_PROVIDER_BASE_URL: provider.baseUrl,
+        AGENT_WORKBENCH_PROVIDER_API_KEY: PROVIDER_API_KEY,
+      },
+      dependencies: {
+        createDaemonManager: () => ({
+          start: async (options) =>
+            await daemonManager.start({
+              ...options,
+              dataDir,
+              runtimeDir: runtimeRoot,
+            }),
+        }),
+        writeReady: () => undefined,
+      },
+    });
+
+    const origin = new URL(server.url).origin;
+    const csrfToken = csrfTokenFrom(await (await fetch(server.url)).text());
+    const createSession = async () =>
+      await readJson<{ readonly sessionId: string; readonly turnId: string }>(
+        await fetch(`${origin}/api/sessions`, {
+          method: 'POST',
+          headers: {
+            origin,
+            'content-type': 'application/json',
+            'x-agent-workbench-csrf': csrfToken,
+          },
+          body: JSON.stringify({
+            submissionId: randomUUID(),
+            prompt: CONCURRENT_PROMPT,
+          }),
+        }),
+      );
+
+    const first = await createSession();
+    const second = await createSession();
+    const third = await createSession();
+    await waitFor(
+      async () => matchedConcurrentRequests,
+      (count) => count === 2,
+      'two concurrent Runner Provider requests',
+    );
+
+    const inspection = new Database(join(dataDir, 'runtime.sqlite3'), {
+      readonly: true,
+    });
+    try {
+      expect(
+        inspection
+          .prepare(
+            `SELECT id, status, execution_fence AS executionFence,
+                    started_at AS startedAt
+             FROM turns
+             WHERE id IN (?, ?, ?)
+             ORDER BY id`,
+          )
+          .all(first.turnId, second.turnId, third.turnId),
+      ).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: first.turnId, status: 'running', executionFence: 1 }),
+        expect.objectContaining({ id: second.turnId, status: 'running', executionFence: 1 }),
+        {
+          id: third.turnId,
+          status: 'queued',
+          executionFence: 0,
+          startedAt: null,
+        },
+      ]));
+      expect(
+        inspection
+          .prepare(
+            `SELECT COUNT(*) AS count FROM runner_leases
+             WHERE status = 'active' AND current_turn_id IN (?, ?, ?)`,
+          )
+          .get(first.turnId, second.turnId, third.turnId),
+      ).toEqual({ count: 2 });
+      expect(
+        inspection
+          .prepare(
+            `SELECT COUNT(*) AS count FROM session_events
+             WHERE turn_id = ? AND type = 'turn.started'`,
+          )
+          .get(third.turnId),
+      ).toEqual({ count: 0 });
+    } finally {
+      inspection.close();
+    }
+
+    expect(
+      await readJson<{ readonly turnId: string; readonly status: string }>(
+        await fetch(
+          `${origin}/api/sessions/${encodeURIComponent(third.sessionId)}/turns/${encodeURIComponent(third.turnId)}/cancel`,
+          {
+            method: 'POST',
+            headers: {
+              origin,
+              'content-type': 'application/json',
+              'x-agent-workbench-csrf': csrfToken,
+            },
+            body: JSON.stringify({ submissionId: randomUUID() }),
+          },
+        ),
+      ),
+    ).toEqual({ turnId: third.turnId, status: 'canceled' });
+
+    const canceled = await readJson<{ readonly snapshot: SessionSnapshot }>(
+      await fetch(
+        `${origin}/api/sessions/${encodeURIComponent(third.sessionId)}/snapshot`,
+      ),
+    );
+    expect(canceled.snapshot.turns).toContainEqual(
+      expect.objectContaining({
+        id: third.turnId,
+        status: 'canceled',
+        executionFence: 0,
+        startedAt: null,
+      }),
+    );
+    const canceledInspection = new Database(join(dataDir, 'runtime.sqlite3'), {
+      readonly: true,
+    });
+    try {
+      expect(
+        canceledInspection
+          .prepare(
+            `SELECT COUNT(*) AS count FROM runner_leases
+             WHERE current_turn_id = ?`,
+          )
+          .get(third.turnId),
+      ).toEqual({ count: 0 });
+      expect(
+        canceledInspection
+          .prepare(
+            `SELECT COUNT(*) AS count FROM session_events
+             WHERE turn_id = ? AND type = 'turn.started'`,
+          )
+          .get(third.turnId),
+      ).toEqual({ count: 0 });
+    } finally {
+      canceledInspection.close();
+    }
+  }, 20_000);
 });

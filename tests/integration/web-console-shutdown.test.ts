@@ -287,7 +287,7 @@ describe('Web Console shutdown with an active Runner', () => {
   let releaseHangingResponse: Deferred | undefined;
   let daemonHandle: DaemonProcessHandle | undefined;
   let daemonIdentity: ProcessIdentity | undefined;
-  let runnerIdentity: ProcessIdentity | undefined;
+  let runnerIdentities: ProcessIdentity[] = [];
 
   afterEach(async () => {
     const failures: unknown[] = [];
@@ -304,7 +304,7 @@ describe('Web Console shutdown with an active Runner', () => {
             ...(daemonIdentity
               ? captureProcessTreeIdentities(daemonIdentity)
               : []),
-            ...(runnerIdentity ? [runnerIdentity] : []),
+            ...runnerIdentities,
           ];
           await forceKillProcesses(identities);
           if (daemonHandle !== undefined) {
@@ -329,7 +329,7 @@ describe('Web Console shutdown with an active Runner', () => {
     provider = undefined;
     daemonHandle = undefined;
     daemonIdentity = undefined;
-    runnerIdentity = undefined;
+    runnerIdentities = [];
     if (rootDir !== undefined) {
       rmSync(rootDir, { force: true, recursive: true });
       rootDir = undefined;
@@ -345,14 +345,14 @@ describe('Web Console shutdown with an active Runner', () => {
     ).toBe('Mon Jul 7 09:08:06 2026');
   });
 
-  it('aborts a hanging model call and reaps daemon and Runner resources idempotently', async () => {
+  it('reaps two concurrent hanging Runners before releasing runtime resources', async () => {
     rootDir = mkdtempSync(join(realpathSync('/tmp'), 'aws-'));
     const workspacePath = join(rootDir, 'workspace');
     const dataDir = join(rootDir, 'data');
     const runtimeRoot = join(rootDir, 'runtime');
     mkdirSync(workspacePath, { mode: 0o700 });
-    const requestMatched = deferred();
-    const requestAborted = deferred();
+    let matchedRequests = 0;
+    let abortedRequests = 0;
     releaseHangingResponse = deferred();
 
     provider = await startFakeOpenAiServer({
@@ -418,7 +418,7 @@ describe('Web Console shutdown with an active Runner', () => {
             chunks: [toolResponse('probe-tool')],
           },
         },
-        {
+        ...Array.from({ length: 2 }, () => ({
           expectedRequest: {
             method: 'POST',
             path: '/v1/chat/completions',
@@ -433,8 +433,12 @@ describe('Web Console shutdown with an active Runner', () => {
               tools: [PROVIDER_READ_TOOL],
             },
           },
-          onRequestMatched: requestMatched.resolve,
-          onRequestAborted: requestAborted.resolve,
+          onRequestMatched: () => {
+            matchedRequests += 1;
+          },
+          onRequestAborted: () => {
+            abortedRequests += 1;
+          },
           response: {
             headers: { 'content-type': 'text/event-stream' },
             chunks: [
@@ -444,7 +448,7 @@ describe('Web Console shutdown with an active Runner', () => {
               },
             ],
           },
-        },
+        })),
       ],
     });
 
@@ -476,19 +480,26 @@ describe('Web Console shutdown with an active Runner', () => {
 
     const origin = new URL(server.url).origin;
     const csrfToken = csrfTokenFrom(await (await fetch(server.url)).text());
-    const created = await readJson<{ readonly sessionId: string; readonly turnId: string }>(
-      await fetch(`${origin}/api/sessions`, {
-        method: 'POST',
-        headers: {
-          origin,
-          'content-type': 'application/json',
-          'x-agent-workbench-csrf': csrfToken,
-        },
-        body: JSON.stringify({ submissionId: randomUUID(), prompt: PROMPT }),
-      }),
-    );
+    const createSession = async () =>
+      await readJson<{ readonly sessionId: string; readonly turnId: string }>(
+        await fetch(`${origin}/api/sessions`, {
+          method: 'POST',
+          headers: {
+            origin,
+            'content-type': 'application/json',
+            'x-agent-workbench-csrf': csrfToken,
+          },
+          body: JSON.stringify({ submissionId: randomUUID(), prompt: PROMPT }),
+        }),
+      );
+    const first = await createSession();
+    const second = await createSession();
 
-    await within(requestMatched.promise, 'the hanging Provider request', 10_000);
+    await waitFor(
+      () => matchedRequests === 2,
+      'two hanging Provider requests',
+      10_000,
+    );
     if (daemonHandle === undefined || daemonIdentity === undefined) {
       throw new Error('The real daemon identity was not captured');
     }
@@ -496,43 +507,51 @@ describe('Web Console shutdown with an active Runner', () => {
     const capturedDaemonIdentity = daemonIdentity;
     const inspection = await openRuntimeDatabase({ dataDir });
     try {
-      const lease = inspection
+      const leases = inspection
         .prepare(
           `SELECT pid, process_start_identity AS processStartIdentity
            FROM runner_leases
-           WHERE current_turn_id = ? AND status = 'active'`,
+           WHERE current_turn_id IN (?, ?) AND status = 'active'
+           ORDER BY current_turn_id`,
         )
-        .get(created.turnId) as
-        | { readonly pid: number | null; readonly processStartIdentity: string | null }
-        | undefined;
-      if (lease?.pid === null || lease?.pid === undefined || !lease.processStartIdentity) {
-        throw new Error('The active Runner identity was not persisted');
+        .all(first.turnId, second.turnId) as readonly {
+        readonly pid: number | null;
+        readonly processStartIdentity: string | null;
+      }[];
+      if (
+        leases.length !== 2 ||
+        leases.some((lease) => lease.pid === null || !lease.processStartIdentity)
+      ) {
+        throw new Error('Both active Runner identities were not persisted');
       }
-      runnerIdentity = {
-        pid: lease.pid,
+      runnerIdentities = leases.map((lease) => ({
+        pid: lease.pid as number,
         processStartIdentity: normalizeProcessStartIdentity(
-          lease.processStartIdentity,
+          lease.processStartIdentity as string,
         ),
-      };
+      }));
     } finally {
       inspection.close();
     }
-    if (runnerIdentity === undefined) {
-      throw new Error('The real Runner identity was not captured');
-    }
-    const capturedRunnerIdentity = runnerIdentity;
+    const capturedRunnerIdentities = [...runnerIdentities];
 
     const stoppedServer = server;
     await within(stoppedServer.stop(), 'Web Console shutdown', 8_000);
     server = undefined;
-    await within(requestAborted.promise, 'the hanging Provider request abort', 1_000);
+    await waitFor(
+      () => abortedRequests === 2,
+      'both hanging Provider request aborts',
+      1_000,
+    );
     await within(stoppedServer.stop(), 'idempotent Web Console shutdown', 1_000);
 
     await waitFor(
       () =>
         !processIdentityIsLive(capturedDaemonIdentity) &&
-        !processIdentityIsLive(capturedRunnerIdentity),
-      'daemon and Runner process exit',
+        capturedRunnerIdentities.every(
+          (runnerIdentity) => !processIdentityIsLive(runnerIdentity),
+        ),
+      'daemon and both Runner process exits',
     );
     expect(existsSync(capturedDaemonHandle.socketPath)).toBe(false);
     expect(existsSync(dirname(capturedDaemonHandle.socketPath))).toBe(false);
