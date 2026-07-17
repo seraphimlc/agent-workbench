@@ -725,6 +725,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
             const gateway = new ModelGateway(database, {
               adapter: this.options.modelAdapter,
               provider: this.options.provider,
+              secrets: this.secrets,
               tools: this.modelTools,
             });
             const result = await gateway.call({

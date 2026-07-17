@@ -249,6 +249,47 @@ describe('professional web workbench', () => {
     expect(screen.queryByText('must-not-render')).toBeNull();
   });
 
+  it('uses a Runtime heartbeat to degrade and recover the empty workbench', async () => {
+    const degraded = deferred<Awaited<ReturnType<ApiClient['getRuntime']>>>();
+    const recovered = deferred<Awaited<ReturnType<ApiClient['getRuntime']>>>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(runtime)
+      .mockImplementationOnce(() => degraded.promise)
+      .mockImplementationOnce(() => recovered.promise)
+      .mockImplementation(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({ getRuntime })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('chat-model')).toBeTruthy();
+    await waitFor(() => expect(getRuntime).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      degraded.resolve(unavailableRuntime);
+      await degraded.promise;
+    });
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+    expect(
+      (screen.getByLabelText('Task prompt') as HTMLTextAreaElement)
+        .disabled,
+    ).toBe(true);
+
+    await waitFor(() => expect(getRuntime).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      recovered.resolve(runtime);
+      await recovered.promise;
+    });
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+    expect(
+      (screen.getByLabelText('Task prompt') as HTMLTextAreaElement)
+        .disabled,
+    ).toBe(false);
+  });
+
   it('recovers from a bootstrap error without reloading the page', async () => {
     const getRuntime = vi
       .fn<ApiClient['getRuntime']>()
@@ -737,6 +778,61 @@ describe('professional web workbench', () => {
         'Status: running',
       ),
     ).toBeTruthy();
+  });
+
+  it('fences an in-flight Event poll when the Runtime heartbeat degrades and restarts it after recovery', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const runningSnapshot = snapshot({ runtimeStatus: 'running' });
+    const degraded = deferred<Awaited<ReturnType<ApiClient['getRuntime']>>>();
+    const recovered = deferred<Awaited<ReturnType<ApiClient['getRuntime']>>>();
+    const staleEvents = deferred<Awaited<ReturnType<ApiClient['getEvents']>>>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(runtime)
+      .mockImplementationOnce(() => degraded.promise)
+      .mockImplementationOnce(() => recovered.promise)
+      .mockImplementation(() => new Promise(() => undefined));
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockResolvedValue(runningSnapshot);
+    const getEvents = vi
+      .fn<ApiClient['getEvents']>()
+      .mockImplementationOnce(() => staleEvents.promise)
+      .mockImplementation(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({ getEvents, getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 1, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getRuntime).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      degraded.resolve(unavailableRuntime);
+      await degraded.promise;
+    });
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+
+    await act(async () => {
+      staleEvents.resolve({
+        events: [event(1, 'model.completed', { actor: 'model' })],
+        highWaterSeq: 1,
+      });
+      await staleEvents.promise;
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(getRuntime).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      recovered.resolve(runtime);
+      await recovered.promise;
+    });
+    await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(2));
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it('shows an unavailable top status and disables submission', async () => {

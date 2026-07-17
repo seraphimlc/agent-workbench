@@ -32,6 +32,7 @@ export const CURRENT_SESSION_STORAGE_KEY =
 export type PollIntervals = Readonly<{
   activeMs: number;
   idleMs: number;
+  runtimeMs?: number;
 }>;
 
 type AppProps = Readonly<{
@@ -73,7 +74,19 @@ type MutationFailure = Readonly<{
 const DEFAULT_POLL_INTERVALS: PollIntervals = {
   activeMs: 500,
   idleMs: 2_000,
+  runtimeMs: 1_000,
 };
+
+const runtimeInfoEqual = (
+  left: Awaited<ReturnType<ApiClient['getRuntime']>>,
+  right: Awaited<ReturnType<ApiClient['getRuntime']>>,
+): boolean =>
+  left.daemon.status === right.daemon.status &&
+  left.daemon.protocolVersion === right.daemon.protocolVersion &&
+  left.daemon.pid === right.daemon.pid &&
+  left.provider.baseHost === right.provider.baseHost &&
+  left.provider.modelId === right.provider.modelId &&
+  left.workspace.name === right.workspace.name;
 
 const activeStatuses = new Set<SessionRuntimeStatus>([
   'queued',
@@ -234,6 +247,52 @@ export function App({
       canceled = true;
     };
   }, [adoptSnapshot, api, bootstrapAttempt, clearSession, storage]);
+
+  useEffect(() => {
+    if (bootstrap.status !== 'ready') return;
+
+    let canceled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const runtimeDelay = Math.max(
+      1,
+      pollIntervals.runtimeMs ?? DEFAULT_POLL_INTERVALS.runtimeMs ?? 1_000,
+    );
+
+    const schedule = (): void => {
+      if (canceled) return;
+      timer = setTimeout(() => void heartbeat(), runtimeDelay);
+    };
+
+    const heartbeat = async (): Promise<void> => {
+      let nextRuntime: Awaited<ReturnType<ApiClient['getRuntime']>> | null = null;
+      try {
+        nextRuntime = await api.getRuntime();
+      } catch {
+        nextRuntime = null;
+      }
+      if (canceled) return;
+
+      setBootstrap((current) => {
+        if (current.status !== 'ready') return current;
+        const runtime =
+          nextRuntime ??
+          ({
+            ...current.runtime,
+            daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+          } as const);
+        return runtimeInfoEqual(current.runtime, runtime)
+          ? current
+          : { status: 'ready', runtime };
+      });
+      schedule();
+    };
+
+    schedule();
+    return () => {
+      canceled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [api, bootstrap.status, pollIntervals.runtimeMs]);
 
   const sessionId = snapshot?.session.id ?? null;
 

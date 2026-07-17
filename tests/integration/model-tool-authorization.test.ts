@@ -75,6 +75,7 @@ type ModelGatewayModule = {
         readonly apiKey: string;
       };
       readonly tools?: readonly unknown[];
+      readonly secrets?: readonly string[];
       readonly now: () => Date;
       readonly createId: () => string;
     },
@@ -728,6 +729,96 @@ describe('ModelAttempt and ToolCall authorization', () => {
     }
   });
 
+  it('redacts registered secrets from validated Provider output before persistence audit and return', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createFixture(runtime);
+    const registeredSecret = 'registered-model-secret';
+    const providerRequestId = `request:${registeredSecret}`;
+    const rawArguments = JSON.stringify({
+      path: `notes-${registeredSecret}.md`,
+      content: `write ${registeredSecret}`,
+    });
+    const redactedArguments = JSON.stringify({
+      path: 'notes-[REDACTED].md',
+      content: 'write [REDACTED]',
+    });
+    const result: ProviderResult = {
+      finishReason: 'tool_calls',
+      content: null,
+      toolCalls: [
+        {
+          logicalCallId: `call:${registeredSecret}`,
+          toolId: 'fs.write_text',
+          argumentsJson: rawArguments,
+        },
+      ],
+      providerRequestId,
+      usage: null,
+    };
+    const adapter: ModelAdapter = { call: async () => result };
+    const { ModelGateway } = await loadModelGateway();
+    const gateway = new ModelGateway(fixture.database, {
+      adapter,
+      provider: {
+        endpoint: PROVIDER_ENDPOINT,
+        modelId: PROVIDER_MODEL,
+        apiKey: PROVIDER_API_KEY,
+      },
+      secrets: [registeredSecret],
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('model-redaction'),
+    });
+
+    try {
+      await expect(
+        gateway.call({ binding: fixture.claim, messages: modelMessages() }),
+      ).resolves.toMatchObject({
+        finishReason: 'tool_calls',
+        content: null,
+        toolCalls: [
+          {
+            logicalCallId: 'call:[REDACTED]',
+            toolId: 'fs.write_text',
+            argumentsJson: redactedArguments,
+          },
+        ],
+      });
+
+      const persisted = JSON.stringify({
+        calls: fixture.database.prepare('SELECT * FROM model_calls').all(),
+        attempts: fixture.database.prepare('SELECT * FROM model_attempts').all(),
+        toolCalls: fixture.database.prepare('SELECT * FROM model_tool_calls').all(),
+        audit: fixture.database.prepare('SELECT * FROM audit_events').all(),
+        events: fixture.database.prepare('SELECT * FROM session_events').all(),
+      });
+      expect(persisted).not.toContain(registeredSecret);
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT provider_request_id AS providerRequestId
+             FROM model_attempts WHERE status = 'succeeded'`,
+          )
+          .get(),
+      ).toEqual({ providerRequestId: 'request:[REDACTED]' });
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT logical_call_id AS logicalCallId,
+                    arguments_json AS argumentsJson,
+                    normalized_input_hash AS normalizedInputHash
+             FROM model_tool_calls`,
+          )
+          .get(),
+      ).toEqual({
+        logicalCallId: 'call:[REDACTED]',
+        argumentsJson: redactedArguments,
+        normalizedInputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it('returns AUDIT_UNAVAILABLE and performs zero network calls when audit intent cannot commit', async () => {
     await loadModelGateway();
     runtime = createTempRuntime();
@@ -1182,13 +1273,11 @@ describe('ModelAttempt and ToolCall authorization', () => {
         payload: {
           toolRunId: result.toolRunId,
           outputBytes: Buffer.byteLength(redactedContent, 'utf8'),
-          outputSummary: expect.any(String),
+          outputSummary: `Result provided to model (${Buffer.byteLength(redactedContent, 'utf8')} bytes).`,
         },
       });
-      expect(Buffer.byteLength(String(events[1]?.payload.outputSummary), 'utf8')).toBeLessThanOrEqual(
-        1_024,
-      );
-      expect(String(events[1]?.payload.outputSummary)).not.toContain('\uFFFD');
+      expect(String(events[1]?.payload.outputSummary)).not.toContain('[REDACTED]');
+      expect(String(events[1]?.payload.outputSummary)).not.toContain('😀');
       const sessionSequences = (
         fixture.database
           .prepare('SELECT seq FROM session_events WHERE session_id = ? ORDER BY seq')
@@ -1472,7 +1561,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
     },
   );
 
-  it('passes Provider and registered secrets from RunnerExecutionDriver into ToolGateway', async () => {
+  it('passes Provider and registered secrets from RunnerExecutionDriver into ModelGateway and ToolGateway', async () => {
     runtime = createTempRuntime();
     const fixture = await createFixture(runtime);
     const providerSecret = 'driver-provider-secret';
@@ -1481,6 +1570,8 @@ describe('ModelAttempt and ToolCall authorization', () => {
     const bootstrapBase64 = bootstrapSecret.toString('base64');
     const returnedContent = `${providerSecret}:${bootstrapHex}:${bootstrapBase64}:visible`;
     const redactedContent = '[REDACTED]:[REDACTED]:[REDACTED]:visible';
+    const finalContent = `${providerSecret}:${bootstrapHex}:${bootstrapBase64}:done`;
+    const redactedFinalContent = '[REDACTED]:[REDACTED]:[REDACTED]:done';
     let callIndex = 0;
     let toolMessageContent: string | undefined;
     const adapter: ModelAdapter = {
@@ -1492,7 +1583,7 @@ describe('ModelAttempt and ToolCall authorization', () => {
         ).find((message) => message.role === 'tool')?.content;
         return {
           finishReason: 'stop',
-          content: 'Done',
+          content: finalContent,
           toolCalls: [],
           providerRequestId: 'provider-driver-stop',
           usage: null,
@@ -1530,6 +1621,15 @@ describe('ModelAttempt and ToolCall authorization', () => {
       expect(persisted).not.toContain(providerSecret);
       expect(persisted).not.toContain(bootstrapHex);
       expect(persisted).not.toContain(bootstrapBase64);
+      expect(
+        fixture.database
+          .prepare(
+            `SELECT content FROM messages
+             WHERE session_id = ? AND role = 'assistant'
+             ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(fixture.sessionId),
+      ).toEqual({ content: redactedFinalContent });
       expect(
         fixture.database.prepare('SELECT result_json AS resultJson FROM tool_runs').get(),
       ).toEqual({ resultJson: JSON.stringify({ content: redactedContent }) });

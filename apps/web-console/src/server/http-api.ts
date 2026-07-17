@@ -74,6 +74,7 @@ const EventQuerySchema = z
   })
   .strict();
 const EmptyQuerySchema = z.object({}).strict();
+const HTTP_JSON_BODY_MAX_BYTES = 128 * 1024;
 
 const headerValue = (
   value: string | readonly string[] | undefined,
@@ -121,6 +122,13 @@ class RpcPublicError extends Error {
   ) {
     super(response.error.message);
     this.name = 'RpcPublicError';
+  }
+}
+
+class HttpRequestBodyTooLargeError extends Error {
+  constructor() {
+    super('Request body is too large');
+    this.name = 'HttpRequestBodyTooLargeError';
   }
 }
 
@@ -276,11 +284,45 @@ const sendRpcFailure = (response: ServerResponse, error: unknown): void => {
 };
 
 const readJsonBody = async (request: IncomingMessage): Promise<unknown> => {
+  const contentLength = headerValue(request.headers['content-length']);
+  if (
+    contentLength !== undefined &&
+    /^\d+$/.test(contentLength) &&
+    Number(contentLength) > HTTP_JSON_BODY_MAX_BYTES
+  ) {
+    request.resume();
+    throw new HttpRequestBodyTooLargeError();
+  }
+
   const chunks: Buffer[] = [];
+  let bodyBytes = 0;
   for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bodyBytes += buffer.byteLength;
+    if (bodyBytes > HTTP_JSON_BODY_MAX_BYTES) {
+      throw new HttpRequestBodyTooLargeError();
+    }
+    chunks.push(buffer);
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+};
+
+const sendBodyFailure = (response: ServerResponse, error: unknown): void => {
+  if (error instanceof HttpRequestBodyTooLargeError) {
+    sendPublicError(
+      response,
+      413,
+      'WEB_REQUEST_TOO_LARGE',
+      'Request body is too large',
+    );
+    return;
+  }
+  sendPublicError(
+    response,
+    400,
+    'WEB_REQUEST_INVALID',
+    'Request body is invalid',
+  );
 };
 
 const matchSessionPath = (
@@ -406,13 +448,8 @@ export const createHttpApiHandler = (
       let submission;
       try {
         submission = SessionSubmissionSchema.parse(await readJsonBody(request));
-      } catch {
-        sendPublicError(
-          response,
-          400,
-          'WEB_REQUEST_INVALID',
-          'Request body is invalid',
-        );
+      } catch (error) {
+        sendBodyFailure(response, error);
         return;
       }
 
@@ -464,13 +501,8 @@ export const createHttpApiHandler = (
       let submission;
       try {
         submission = TurnSubmissionSchema.parse(await readJsonBody(request));
-      } catch {
-        sendPublicError(
-          response,
-          400,
-          'WEB_REQUEST_INVALID',
-          'Request body is invalid',
-        );
+      } catch (error) {
+        sendBodyFailure(response, error);
         return;
       }
 

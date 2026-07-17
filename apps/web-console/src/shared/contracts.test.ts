@@ -104,6 +104,13 @@ describe('web console HTTP contracts', () => {
     });
     expect(() => schema.parse({ submissionId: 'retry-1', prompt: 'Read README.md' })).toThrow();
     expect(() => schema.parse({ submissionId, prompt: '   ' })).toThrow();
+    expect(schema.parse({ submissionId, prompt: 'x'.repeat(64 * 1024) })).toEqual({
+      submissionId,
+      prompt: 'x'.repeat(64 * 1024),
+    });
+    expect(() =>
+      schema.parse({ submissionId, prompt: 'x'.repeat(64 * 1024 + 1) }),
+    ).toThrow();
   });
 
   it('wraps protocol snapshots and event pages without accepting extra fields', async () => {

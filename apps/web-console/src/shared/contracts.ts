@@ -7,6 +7,7 @@ import {
 import { z } from 'zod';
 
 const NonEmptyStringSchema = z.string().min(1);
+export const PROMPT_MAX_LENGTH = 64 * 1024;
 const SubmissionIdSchema = z
   .uuid()
   .refine((value) => value === value.toLowerCase(), {
@@ -45,7 +46,7 @@ export const RuntimePublicInfoSchema = z
 
 const SubmissionShape = {
   submissionId: SubmissionIdSchema,
-  prompt: z.string().trim().min(1),
+  prompt: z.string().trim().min(1).max(PROMPT_MAX_LENGTH),
 };
 
 export const SessionSubmissionSchema = z.object(SubmissionShape).strict();

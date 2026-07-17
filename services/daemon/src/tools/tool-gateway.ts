@@ -88,6 +88,9 @@ const summarizeInput = (
   return truncateSummary(redactSecrets(path, secrets));
 };
 
+const summarizeOutput = (outputBytes: number): string =>
+  `Result provided to model (${outputBytes} bytes).`;
+
 export class ToolGateway {
   private readonly repository: ExecutionRepository;
   private readonly events: SessionEventWriter;
@@ -318,6 +321,7 @@ export class ToolGateway {
     }
 
     const content = redactSecrets(result.content, this.secrets);
+    const outputBytes = Buffer.byteLength(content, 'utf8');
     const finishedAt = this.now().toISOString();
     this.database.transaction(() => {
       const completion = this.database
@@ -343,8 +347,8 @@ export class ToolGateway {
             audience: 'both',
             payload: {
               toolRunId,
-              outputBytes: Buffer.byteLength(content, 'utf8'),
-              outputSummary: truncateSummary(content),
+              outputBytes,
+              outputSummary: summarizeOutput(outputBytes),
             },
           },
         ],

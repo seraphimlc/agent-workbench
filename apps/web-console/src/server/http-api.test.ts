@@ -1,6 +1,7 @@
 import {
   createServer,
   type IncomingMessage,
+  request as httpRequest,
   type Server,
   type ServerResponse,
 } from 'node:http';
@@ -124,6 +125,42 @@ const startApi = async (rpc: {
 };
 
 const success = (result: unknown): RpcReply => ({ ok: true, result });
+
+const postChunkedJson = async (
+  origin: string,
+  pathname: string,
+  body: string,
+): Promise<{ readonly body: string; readonly status: number }> =>
+  await new Promise((resolvePromise, rejectPromise) => {
+    const target = new URL(pathname, origin);
+    const request = httpRequest(
+      {
+        hostname: target.hostname,
+        method: 'POST',
+        path: target.pathname,
+        port: target.port,
+        headers: {
+          'content-type': 'application/json',
+          origin,
+          'x-agent-workbench-csrf': 'csrf-token',
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.once('end', () => {
+          resolvePromise({
+            body: Buffer.concat(chunks).toString('utf8'),
+            status: response.statusCode ?? 0,
+          });
+        });
+      },
+    );
+    request.once('error', rejectPromise);
+    const midpoint = Math.floor(body.length / 2);
+    request.write(body.slice(0, midpoint));
+    request.end(body.slice(midpoint));
+  });
 
 describe('web console HTTP API', () => {
   it('returns sanitized runtime information from a validated health result', async () => {
@@ -450,6 +487,101 @@ describe('web console HTTP API', () => {
     expect(invalidBody.status).toBe(400);
     expect(invalidQuery.status).toBe(400);
     expect(invalidPath.status).toBe(404);
+    expect(calls).toEqual([]);
+  });
+
+  it('returns 413 for an oversized JSON body without reflecting its content', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        throw new Error('RPC must not be called');
+      },
+    });
+    const privateMarker = 'oversized-private-marker';
+    const response = await fetch(`${api.origin}/api/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: api.origin,
+        'x-agent-workbench-csrf': 'csrf-token',
+      },
+      body: JSON.stringify({
+        submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        prompt: `${privateMarker}:${'x'.repeat(128 * 1024)}`,
+      }),
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(413);
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: 'WEB_REQUEST_TOO_LARGE',
+        message: 'Request body is too large',
+        retryable: false,
+        userAction: null,
+      },
+    });
+    expect(body).not.toContain(privateMarker);
+    expect(calls).toEqual([]);
+  });
+
+  it('enforces the JSON body byte cap when Content-Length is absent', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        throw new Error('RPC must not be called');
+      },
+    });
+    const privateMarker = 'chunked-private-marker';
+    const response = await postChunkedJson(
+      api.origin,
+      '/api/sessions',
+      JSON.stringify({
+        submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        prompt: `${privateMarker}:${'x'.repeat(128 * 1024)}`,
+      }),
+    );
+
+    expect(response.status).toBe(413);
+    expect(response.body).not.toContain(privateMarker);
+    expect(calls).toEqual([]);
+  });
+
+  it('returns the existing safe 400 when the prompt exceeds its schema limit', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        throw new Error('RPC must not be called');
+      },
+    });
+    const privateMarker = 'prompt-private-marker';
+    const response = await fetch(`${api.origin}/api/sessions/session-1/turns`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        origin: api.origin,
+        'x-agent-workbench-csrf': 'csrf-token',
+      },
+      body: JSON.stringify({
+        submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        prompt: `${privateMarker}:${'x'.repeat(64 * 1024)}`,
+      }),
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(400);
+    expect(JSON.parse(body)).toEqual({
+      error: {
+        code: 'WEB_REQUEST_INVALID',
+        message: 'Request body is invalid',
+        retryable: false,
+        userAction: null,
+      },
+    });
+    expect(body).not.toContain(privateMarker);
     expect(calls).toEqual([]);
   });
 

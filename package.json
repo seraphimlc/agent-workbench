@@ -14,7 +14,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1",
     "test:watch": "vitest",
     "lint": "eslint . --max-warnings=0",
     "demo:web": "pnpm --filter @agent-workbench/web-console dev",
