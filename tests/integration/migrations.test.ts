@@ -67,6 +67,12 @@ const sourceArtifactMigrationPath = fileURLToPath(
     import.meta.url,
   ),
 );
+const sourceTwoSlotMigrationPath = fileURLToPath(
+  new URL(
+    '../../services/daemon/src/db/migrations/005_scheduler_two_slots.sql',
+    import.meta.url,
+  ),
+);
 const committedWalProducerEntryPoint = fileURLToPath(
   new URL('../fixtures/committed-wal-producer-daemon.ts', import.meta.url),
 );
@@ -325,6 +331,7 @@ describe('daemon SQLite migrations', () => {
         { version: 2 },
         { version: 3 },
         { version: 4 },
+        { version: 5 },
       ]);
       expect(database.pragma('foreign_key_check')).toEqual([]);
     } finally {
@@ -335,6 +342,77 @@ describe('daemon SQLite migrations', () => {
     expect(
       existsSync(backupDirectory) ? readdirSync(backupDirectory) : [],
     ).toEqual([]);
+  });
+
+  it('upgrades an owned historical slot 1 to exact persistent slots 1 and 2', async () => {
+    runtime = createTempRuntime();
+    const migrationsDirectory = createMigrationDirectory(runtime, {});
+    for (const [source, filename] of [
+      [sourceMigrationPath, '001_runtime_foundation.sql'],
+      [sourceSchedulerMigrationPath, '002_scheduler_invariants.sql'],
+      [sourceExecutionMigrationPath, '003_execution_ledger.sql'],
+      [sourceArtifactMigrationPath, '004_artifact_store.sql'],
+    ] as const) {
+      copyFileSync(source, join(migrationsDirectory, filename));
+    }
+    const database = openConfiguredDatabase(join(runtime.dataDir, 'historical.sqlite3'));
+    try {
+      await migrateDatabase(database, { dataDir: runtime.dataDir, migrationsDirectory });
+      const owned = seedTurn(database, 'historical-owned');
+      database
+        .prepare(
+          `UPDATE scheduler_slots
+           SET state = 'owned', owner_turn_id = ?, updated_at = ?
+           WHERE slot_no = 1`,
+        )
+        .run(owned.turnId, '2026-07-14T08:00:00.000Z');
+
+      copyFileSync(
+        sourceTwoSlotMigrationPath,
+        join(migrationsDirectory, '005_scheduler_two_slots.sql'),
+      );
+      await migrateDatabase(database, { dataDir: runtime.dataDir, migrationsDirectory });
+
+      expect(
+        database
+          .prepare(
+            `SELECT slot_no, state, owner_turn_id, updated_at
+             FROM scheduler_slots ORDER BY slot_no`,
+          )
+          .all(),
+      ).toEqual([
+        {
+          slot_no: 1,
+          state: 'owned',
+          owner_turn_id: owned.turnId,
+          updated_at: '2026-07-14T08:00:00.000Z',
+        },
+        {
+          slot_no: 2,
+          state: 'free',
+          owner_turn_id: null,
+          updated_at: expect.any(String),
+        },
+      ]);
+      const schedulerSlotsSql = database
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scheduler_slots'",
+        )
+        .get() as { readonly sql: string };
+      expect(schedulerSlotsSql.sql).toMatch(
+        /CHECK\s*\(\s*slot_no\s+IN\s*\(\s*1\s*,\s*2\s*\)\s*\)/i,
+      );
+      expect(() => {
+        database
+          .prepare(
+            "INSERT INTO scheduler_slots (slot_no, state, owner_turn_id, updated_at) VALUES (3, 'free', NULL, 'now')",
+          )
+          .run();
+      }).toThrow();
+      expect(database.pragma('foreign_key_check')).toEqual([]);
+    } finally {
+      database.close();
+    }
   });
 
   it('rejects a symlink database boundary before opening native SQLite', () => {
@@ -676,11 +754,15 @@ describe('daemon SQLite migrations', () => {
       expect(createSql.turns).not.toMatch(
         /UNIQUE\s*\(\s*session_id\s*,\s*client_request_id\s*\)/i,
       );
-      expect(
-        database.prepare('SELECT * FROM scheduler_slots').all(),
-      ).toEqual([
+      expect(database.prepare('SELECT * FROM scheduler_slots ORDER BY slot_no').all()).toEqual([
         {
           slot_no: 1,
+          state: 'free',
+          owner_turn_id: null,
+          updated_at: expect.any(String),
+        },
+        {
+          slot_no: 2,
           state: 'free',
           owner_turn_id: null,
           updated_at: expect.any(String),
@@ -2915,6 +2997,9 @@ describe('daemon SQLite migrations', () => {
     expect(
       readFileSync(join(distMigrations, '004_artifact_store.sql'), 'utf8'),
     ).toBe(readFileSync(sourceArtifactMigrationPath, 'utf8'));
+    expect(
+      readFileSync(join(distMigrations, '005_scheduler_two_slots.sql'), 'utf8'),
+    ).toBe(readFileSync(sourceTwoSlotMigrationPath, 'utf8'));
 
     const builtModulePath = join(
       repositoryRoot,
@@ -2924,7 +3009,7 @@ describe('daemon SQLite migrations', () => {
       `${pathToFileURL(builtModulePath).href}?test=${randomUUID()}`
     )) as { readonly discoverMigrations: () => Array<{ readonly path: string }> };
     const discovered = builtModule.discoverMigrations();
-    expect(discovered).toHaveLength(4);
+    expect(discovered).toHaveLength(5);
     expect(discovered[0]?.path).toBe(
       join(distMigrations, '001_runtime_foundation.sql'),
     );
@@ -2936,6 +3021,9 @@ describe('daemon SQLite migrations', () => {
     );
     expect(discovered[3]?.path).toBe(
       join(distMigrations, '004_artifact_store.sql'),
+    );
+    expect(discovered[4]?.path).toBe(
+      join(distMigrations, '005_scheduler_two_slots.sql'),
     );
 
     const builtPackageRoot = join(runtime.rootDir, 'built-daemon-package');
@@ -3002,6 +3090,7 @@ describe('daemon SQLite migrations', () => {
         { version: 2 },
         { version: 3 },
         { version: 4 },
+        { version: 5 },
       ]);
     } finally {
       builtDatabase.close();

@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 
 import type { Claim } from '../runtime/scheduler.js';
 
-const SLOT_NO = 1;
+const SLOT_NOS = [1, 2] as const;
 
 type ActiveTupleRow = {
   readonly turnId: string;
@@ -25,6 +25,40 @@ type ActiveTupleRow = {
   readonly leaseSessionId: string;
   readonly leaseTurnId: string;
   readonly leaseStatus: string;
+  readonly slotNo: number;
+  readonly slotState: string;
+  readonly ownerTurnId: string | null;
+};
+
+type ActiveTurnFact = {
+  readonly turnId: string;
+  readonly sessionId: string;
+  readonly turnStatus: 'running' | 'cancel_requested';
+  readonly queueKind: string;
+  readonly executionFence: number;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly errorCode: string | null;
+  readonly errorMessage: string | null;
+  readonly resultMessageId: string | null;
+};
+
+type ActiveSessionFact = {
+  readonly sessionId: string;
+  readonly runtimeStatus: string;
+  readonly queueBlockReason: string | null;
+  readonly currentTurnId: string | null;
+};
+
+type ActiveLeaseFact = {
+  readonly leaseId: string;
+  readonly daemonEpoch: string;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly leaseStatus: string;
+};
+
+type SlotFact = {
   readonly slotNo: number;
   readonly slotState: string;
   readonly ownerTurnId: string | null;
@@ -117,6 +151,7 @@ export class ExecutionRepository {
     allowedStatuses: readonly ActiveTupleRow['turnStatus'][],
   ): ActiveExecutionTuple {
     this.assertCallerTransaction();
+    this.assertGlobalActiveTuples(binding);
     const row = this.database
       .prepare(
         `SELECT
@@ -155,31 +190,9 @@ export class ExecutionRepository {
       throw new TurnTerminalizationInvariantError('active tuple is missing');
     }
     this.assertTurnExecutionOwnership(binding);
-
-    const counts = this.database
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM turns
-             WHERE status IN ('running', 'cancel_requested')) AS activeTurns,
-           (SELECT COUNT(*) FROM sessions
-             WHERE current_turn_id IS NOT NULL
-                OR runtime_status IN ('running', 'canceling')) AS activeSessions,
-           (SELECT COUNT(*) FROM runner_leases WHERE status = 'active') AS activeLeases,
-           (SELECT COUNT(*) FROM scheduler_slots) AS slots`,
-      )
-      .get() as {
-      readonly activeTurns: number;
-      readonly activeSessions: number;
-      readonly activeLeases: number;
-      readonly slots: number;
-    };
     const expectedRuntimeStatus =
       row.turnStatus === 'cancel_requested' ? 'canceling' : 'running';
     if (
-      counts.activeTurns !== 1 ||
-      counts.activeSessions !== 1 ||
-      counts.activeLeases !== 1 ||
-      counts.slots !== 1 ||
       !allowedStatuses.includes(row.turnStatus) ||
       row.queueKind !== 'normal' ||
       row.executionFence !== binding.executionFence ||
@@ -198,13 +211,123 @@ export class ExecutionRepository {
       row.leaseTurnId !== binding.turnId ||
       row.leaseStatus !== 'active' ||
       row.slotNo !== binding.slotNo ||
-      row.slotNo !== SLOT_NO ||
       row.slotState !== 'owned' ||
       row.ownerTurnId !== binding.turnId
     ) {
       throw new TurnTerminalizationInvariantError('active tuple is inconsistent');
     }
     return row;
+  }
+
+  private assertGlobalActiveTuples(binding: Pick<Claim, 'daemonEpoch'>): void {
+    const slots = this.database
+      .prepare(
+        `SELECT slot_no AS slotNo, state AS slotState,
+                owner_turn_id AS ownerTurnId
+         FROM scheduler_slots ORDER BY slot_no`,
+      )
+      .all() as SlotFact[];
+    if (
+      slots.length !== SLOT_NOS.length ||
+      slots.some((slot, index) => slot.slotNo !== SLOT_NOS[index])
+    ) {
+      throw new TurnTerminalizationInvariantError('slots must be exactly 1 and 2');
+    }
+    if (
+      slots.some(
+        (slot) =>
+          !(
+            (slot.slotState === 'free' && slot.ownerTurnId === null) ||
+            (slot.slotState === 'owned' && slot.ownerTurnId !== null)
+          ),
+      )
+    ) {
+      throw new TurnTerminalizationInvariantError('slot ownership projection is invalid');
+    }
+
+    const activeTurns = this.database
+      .prepare(
+        `SELECT id AS turnId, session_id AS sessionId, status AS turnStatus,
+                queue_kind AS queueKind, execution_fence AS executionFence,
+                started_at AS startedAt, finished_at AS finishedAt,
+                error_code AS errorCode, error_message AS errorMessage,
+                result_message_id AS resultMessageId
+         FROM turns
+         WHERE status IN ('running', 'cancel_requested')
+         ORDER BY id`,
+      )
+      .all() as ActiveTurnFact[];
+    const activeSessions = this.database
+      .prepare(
+        `SELECT id AS sessionId, runtime_status AS runtimeStatus,
+                queue_block_reason AS queueBlockReason,
+                current_turn_id AS currentTurnId
+         FROM sessions
+         WHERE current_turn_id IS NOT NULL
+            OR runtime_status IN ('running', 'canceling')
+         ORDER BY id`,
+      )
+      .all() as ActiveSessionFact[];
+    const activeLeases = this.database
+      .prepare(
+        `SELECT id AS leaseId, daemon_epoch AS daemonEpoch,
+                session_id AS sessionId,
+                current_turn_id AS turnId, status AS leaseStatus
+         FROM runner_leases
+         WHERE status = 'active'
+         ORDER BY id`,
+      )
+      .all() as ActiveLeaseFact[];
+    const ownedSlots = slots.filter((slot) => slot.slotState === 'owned');
+    const activeCount = ownedSlots.length;
+
+    if (
+      activeTurns.length !== activeCount ||
+      activeSessions.length !== activeCount ||
+      activeLeases.length !== activeCount ||
+      new Set(ownedSlots.map((slot) => slot.ownerTurnId)).size !== activeCount ||
+      new Set(activeTurns.map((turn) => turn.turnId)).size !== activeCount ||
+      new Set(activeSessions.map((session) => session.sessionId)).size !== activeCount ||
+      new Set(activeLeases.map((lease) => lease.turnId)).size !== activeCount
+    ) {
+      throw new TurnTerminalizationInvariantError(
+        'active facts do not match owned slot count',
+      );
+    }
+
+    for (const slot of ownedSlots) {
+      const ownerTurnId = slot.ownerTurnId as string;
+      const turn = activeTurns.find((row) => row.turnId === ownerTurnId);
+      const session = turn
+        ? activeSessions.find((row) => row.sessionId === turn.sessionId)
+        : undefined;
+      const lease = activeLeases.find((row) => row.turnId === ownerTurnId);
+      const expectedRuntimeStatus =
+        turn?.turnStatus === 'cancel_requested' ? 'canceling' : 'running';
+      if (
+        !turn ||
+        !session ||
+        !lease ||
+        turn.queueKind !== 'normal' ||
+        turn.executionFence <= 0 ||
+        turn.startedAt === null ||
+        turn.finishedAt !== null ||
+        turn.errorCode !== null ||
+        turn.errorMessage !== null ||
+        turn.resultMessageId !== null ||
+        session.currentTurnId !== turn.turnId ||
+        session.runtimeStatus !== expectedRuntimeStatus ||
+        session.queueBlockReason !== null ||
+        lease.daemonEpoch !== binding.daemonEpoch ||
+        lease.sessionId !== turn.sessionId ||
+        lease.turnId !== turn.turnId ||
+        lease.leaseStatus !== 'active'
+      ) {
+        throw new TurnTerminalizationInvariantError(
+          'active slot tuple is inconsistent',
+        );
+      }
+    }
   }
 
   assertTurnExecutionOwnership(

@@ -608,12 +608,18 @@ describe('startup scheduler recovery', () => {
           revision: Number(beforeSession.revision) + 1,
           updated_at: RECOVERY_TIME,
         });
-        expect(database.prepare('SELECT * FROM scheduler_slots').all()).toEqual([
+        expect(database.prepare('SELECT * FROM scheduler_slots ORDER BY slot_no').all()).toEqual([
           {
             slot_no: 1,
             state: 'free',
             owner_turn_id: null,
             updated_at: RECOVERY_TIME,
+          },
+          {
+            slot_no: 2,
+            state: 'free',
+            owner_turn_id: null,
+            updated_at: expect.any(String),
           },
         ]);
         expect(

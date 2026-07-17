@@ -12,7 +12,7 @@ import {
   validateToolRunStatusTuple,
 } from './tool-run-status-validator.js';
 
-const SLOT_NO = 1 as const;
+const SLOT_NOS = [1, 2] as const;
 
 type SlotRow = {
   readonly slotNo: number;
@@ -473,10 +473,12 @@ const inspectStartupState = (
        FROM scheduler_slots ORDER BY slot_no`,
     )
     .all() as SlotRow[];
-  if (slots.length !== 1 || slots[0]?.slotNo !== SLOT_NO) {
-    throw new StartupRecoveryInvariantError('slot 1 is missing or duplicated');
+  if (
+    slots.length !== SLOT_NOS.length ||
+    slots.some((slot, index) => slot.slotNo !== SLOT_NOS[index])
+  ) {
+    throw new StartupRecoveryInvariantError('slots must be exactly 1 and 2');
   }
-  const slot = slots[0];
   const activeTurns = database
     .prepare(
       `SELECT id AS turnId, session_id AS sessionId, status,
@@ -514,18 +516,30 @@ const inspectStartupState = (
     )
     .all() as ActiveLeaseRow[];
 
+  const invalidSlotProjection = slots.some(
+    (slot) =>
+      !(
+        (slot.state === 'free' && slot.ownerTurnId === null) ||
+        (slot.state === 'owned' && slot.ownerTurnId !== null)
+      ),
+  );
+  if (invalidSlotProjection) {
+    throw new StartupRecoveryInvariantError('slot ownership projection is invalid');
+  }
+  const ownedSlots = slots.filter((slot) => slot.state === 'owned');
+
   if (
-    slot.state === 'free' &&
-    slot.ownerTurnId === null &&
+    ownedSlots.length === 0 &&
     activeTurns.length === 0 &&
     activeSessions.length === 0 &&
     activeLeases.length === 0
   ) {
     return null;
   }
+  const slot = ownedSlots[0];
   if (
-    slot.state !== 'owned' ||
-    slot.ownerTurnId === null ||
+    ownedSlots.length !== 1 ||
+    slot === undefined ||
     activeTurns.length !== 1 ||
     activeSessions.length !== 1 ||
     activeLeases.length !== 1
@@ -573,7 +587,7 @@ const inspectStartupState = (
   }
   return {
     binding: {
-      slotNo: SLOT_NO,
+      slotNo: slot.slotNo as Claim['slotNo'],
       sessionId: turn.sessionId,
       turnId: turn.turnId,
       leaseId: lease.leaseId,

@@ -1,8 +1,10 @@
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
-const SLOT_NO = 1 as const;
+const SLOT_NOS = [1, 2] as const;
 const LEASE_DURATION_MS = 20_000;
+
+export type SlotNo = (typeof SLOT_NOS)[number];
 
 type ActiveTurnRow = {
   readonly turnId: string;
@@ -54,7 +56,7 @@ type CandidateRow = {
 };
 
 export interface Claim {
-  readonly slotNo: 1;
+  readonly slotNo: SlotNo;
   readonly sessionId: string;
   readonly turnId: string;
   readonly leaseId: string;
@@ -105,30 +107,15 @@ export class Scheduler {
   }
 
   private claimWithinTransaction(): Claim | null {
-    const slot = this.readSlot();
+    const slots = this.readSlots();
     const activeTurns = this.readActiveTurns();
     const activeSessions = this.readActiveSessions();
     const activeLeases = this.readActiveLeases();
+    this.assertActiveTuples(slots, activeTurns, activeSessions, activeLeases);
 
-    if (slot.state === 'owned') {
-      this.assertCompleteOwnedTuple(
-        slot,
-        activeTurns,
-        activeSessions,
-        activeLeases,
-      );
+    const slot = slots.find((row) => row.state === 'free');
+    if (!slot) {
       return null;
-    }
-
-    if (slot.state !== 'free' || slot.ownerTurnId !== null) {
-      throw new SchedulerInvariantError('slot 1 has an invalid free projection');
-    }
-    if (
-      activeTurns.length !== 0 ||
-      activeSessions.length !== 0 ||
-      activeLeases.length !== 0
-    ) {
-      throw new SchedulerInvariantError('free slot has orphaned active facts');
     }
 
     const candidate = this.readCandidate();
@@ -156,6 +143,7 @@ export class Scheduler {
     const leaseEpoch = this.readNextLeaseEpoch();
     const leaseId = this.createId();
     const eventId = this.createId();
+    const slotNo = slot.slotNo as SlotNo;
 
     expectOneChange(
       this.database
@@ -164,7 +152,7 @@ export class Scheduler {
            SET state = 'owned', owner_turn_id = ?, updated_at = ?
            WHERE slot_no = ? AND state = 'free' AND owner_turn_id IS NULL`,
         )
-        .run(candidate.turnId, now, SLOT_NO),
+        .run(candidate.turnId, now, slotNo),
       'slot claim CAS',
     );
     expectOneChange(
@@ -244,7 +232,7 @@ export class Scheduler {
           JSON.stringify({
             ordinal: candidate.ordinal,
             queueKind: candidate.queueKind,
-            slotNo: SLOT_NO,
+            slotNo,
           }),
           now,
         ),
@@ -252,7 +240,7 @@ export class Scheduler {
     );
 
     return {
-      slotNo: SLOT_NO,
+      slotNo,
       sessionId: candidate.sessionId,
       turnId: candidate.turnId,
       leaseId,
@@ -262,7 +250,7 @@ export class Scheduler {
     };
   }
 
-  private readSlot(): SlotRow {
+  private readSlots(): SlotRow[] {
     const rows = this.database
       .prepare(
         `SELECT slot_no AS slotNo, state, owner_turn_id AS ownerTurnId
@@ -270,10 +258,13 @@ export class Scheduler {
          ORDER BY slot_no`,
       )
       .all() as SlotRow[];
-    if (rows.length !== 1 || rows[0]?.slotNo !== SLOT_NO) {
-      throw new SchedulerInvariantError('slot 1 is missing or duplicated');
+    if (
+      rows.length !== SLOT_NOS.length ||
+      rows.some((row, index) => row.slotNo !== SLOT_NOS[index])
+    ) {
+      throw new SchedulerInvariantError('slots must be exactly 1 and 2');
     }
-    return rows[0];
+    return rows;
   }
 
   private readActiveTurns(): ActiveTurnRow[] {
@@ -319,47 +310,77 @@ export class Scheduler {
       .all() as ActiveLeaseRow[];
   }
 
-  private assertCompleteOwnedTuple(
-    slot: SlotRow,
+  private assertActiveTuples(
+    slots: readonly SlotRow[],
     activeTurns: readonly ActiveTurnRow[],
     activeSessions: readonly ActiveSessionRow[],
     activeLeases: readonly ActiveLeaseRow[],
   ): void {
-    if (slot.ownerTurnId === null) {
-      throw new SchedulerInvariantError('owned slot has no owner Turn');
-    }
-    if (
-      activeTurns.length !== 1 ||
-      activeSessions.length !== 1 ||
-      activeLeases.length !== 1
-    ) {
-      throw new SchedulerInvariantError('owned slot does not have one active tuple');
+    const ownedSlots = slots.filter((slot) => slot.state === 'owned');
+    for (const slot of slots) {
+      if (
+        (slot.state === 'free' && slot.ownerTurnId === null) ||
+        (slot.state === 'owned' && slot.ownerTurnId !== null)
+      ) {
+        continue;
+      }
+      throw new SchedulerInvariantError('slot has an invalid ownership projection');
     }
 
-    const turn = activeTurns[0] as ActiveTurnRow;
-    const session = activeSessions[0] as ActiveSessionRow;
-    const lease = activeLeases[0] as ActiveLeaseRow;
-    const expectedRuntimeStatus =
-      turn.status === 'running' ? 'running' : 'canceling';
-
+    const activeCount = ownedSlots.length;
     if (
-      turn.turnId !== slot.ownerTurnId ||
-      turn.queueKind !== 'normal' ||
-      turn.executionFence <= 0 ||
-      turn.startedAt === null ||
-      turn.finishedAt !== null ||
-      turn.errorCode !== null ||
-      turn.errorMessage !== null ||
-      turn.resultMessageId !== null ||
-      session.sessionId !== turn.sessionId ||
-      session.currentTurnId !== turn.turnId ||
-      session.runtimeStatus !== expectedRuntimeStatus ||
-      session.queueBlockReason !== null ||
-      lease.daemonEpoch !== this.daemonEpoch ||
-      lease.sessionId !== turn.sessionId ||
-      lease.turnId !== turn.turnId
+      activeTurns.length !== activeCount ||
+      activeSessions.length !== activeCount ||
+      activeLeases.length !== activeCount
     ) {
-      throw new SchedulerInvariantError('owned slot tuple is inconsistent');
+      throw new SchedulerInvariantError('active facts do not match owned slot count');
+    }
+
+    const ownerTurnIds = new Set(
+      ownedSlots.map((slot) => slot.ownerTurnId as string),
+    );
+    if (ownerTurnIds.size !== ownedSlots.length) {
+      throw new SchedulerInvariantError('owned slots have duplicate Turn owners');
+    }
+    const turnIds = new Set(activeTurns.map((turn) => turn.turnId));
+    const sessionIds = new Set(activeSessions.map((session) => session.sessionId));
+    const leaseTurnIds = new Set(activeLeases.map((lease) => lease.turnId));
+    if (
+      turnIds.size !== activeTurns.length ||
+      sessionIds.size !== activeSessions.length ||
+      leaseTurnIds.size !== activeLeases.length
+    ) {
+      throw new SchedulerInvariantError('active facts contain duplicate identities');
+    }
+
+    for (const slot of ownedSlots) {
+      const ownerTurnId = slot.ownerTurnId as string;
+      const turn = activeTurns.find((row) => row.turnId === ownerTurnId);
+      const session = turn
+        ? activeSessions.find((row) => row.sessionId === turn.sessionId)
+        : undefined;
+      const lease = activeLeases.find((row) => row.turnId === ownerTurnId);
+      const expectedRuntimeStatus =
+        turn?.status === 'running' ? 'running' : 'canceling';
+      if (
+        !turn ||
+        !session ||
+        !lease ||
+        turn.queueKind !== 'normal' ||
+        turn.executionFence <= 0 ||
+        turn.startedAt === null ||
+        turn.finishedAt !== null ||
+        turn.errorCode !== null ||
+        turn.errorMessage !== null ||
+        turn.resultMessageId !== null ||
+        session.currentTurnId !== turn.turnId ||
+        session.runtimeStatus !== expectedRuntimeStatus ||
+        session.queueBlockReason !== null ||
+        lease.daemonEpoch !== this.daemonEpoch ||
+        lease.sessionId !== turn.sessionId
+      ) {
+        throw new SchedulerInvariantError('owned slot tuple is inconsistent');
+      }
     }
   }
 

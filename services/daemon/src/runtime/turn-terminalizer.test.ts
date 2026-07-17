@@ -101,6 +101,42 @@ const createActiveFixture = async (
   };
 };
 
+const createSecondActiveFixture = (
+  runtime: TempRuntime,
+  database: Database.Database,
+): ActiveFixture => {
+  const sessions = new SessionService(database);
+  const workspacePath = join(runtime.rootDir, 'workspace-second');
+  mkdirSync(workspacePath);
+  const workspace = sessions.registerWorkspace(
+    { path: workspacePath },
+    `workspace-second-${runtime.rootDir}`,
+  );
+  const created = sessions.createSession(
+    {
+      workspaceId: workspace.workspaceId,
+      title: 'Independent terminalization',
+      prompt: 'Complete this other Turn',
+    },
+    `session-second-${runtime.rootDir}`,
+  );
+  const claim = new Scheduler(database, {
+    daemonEpoch: DAEMON_EPOCH,
+    now: () => new Date(CLAIM_TIME),
+    createId: createIdFactory('second-claim'),
+  }).claimNext();
+  if (!claim) {
+    throw new Error('Second fixture Turn was not claimed');
+  }
+  return {
+    database,
+    claim,
+    sessionId: created.sessionId,
+    turnId: created.turnId,
+    queuedTurnId: null,
+  };
+};
+
 const createForeignSession = (
   database: Database.Database,
   fixture: Pick<ActiveFixture, 'sessionId'>,
@@ -441,6 +477,22 @@ const captureFacts = (database: Database.Database): string =>
       .all(),
   });
 
+const captureTupleFacts = (
+  database: Database.Database,
+  fixture: Pick<ActiveFixture, 'claim' | 'sessionId' | 'turnId'>,
+): string =>
+  JSON.stringify({
+    session: database.prepare('SELECT * FROM sessions WHERE id = ?').get(fixture.sessionId),
+    turn: database.prepare('SELECT * FROM turns WHERE id = ?').get(fixture.turnId),
+    lease: database.prepare('SELECT * FROM runner_leases WHERE id = ?').get(fixture.claim.leaseId),
+    slot: database
+      .prepare('SELECT * FROM scheduler_slots WHERE slot_no = ?')
+      .get(fixture.claim.slotNo),
+    events: database
+      .prepare('SELECT * FROM session_events WHERE session_id = ? ORDER BY seq')
+      .all(fixture.sessionId),
+  });
+
 const activeWorkerExpected = new Map<
   string,
   readonly ['canceled' | 'interrupted', 'not_applied' | 'unknown']
@@ -481,6 +533,88 @@ describe('TurnTerminalizer', () => {
   afterEach(() => {
     runtime?.cleanup();
     runtime = undefined;
+  });
+
+  it('terminalizes only the requested active tuple when two slots are owned', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    const otherBefore = captureTupleFacts(fixture.database, other);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('two-tuple'),
+    });
+
+    try {
+      terminalizer.fail({
+        binding: fixture.claim,
+        errorCode: 'RUNNER_START_FAILED',
+        errorMessage: 'Runner failed to become ready',
+      });
+
+      expect(
+        fixture.database
+          .prepare('SELECT status, execution_fence FROM turns WHERE id = ?')
+          .get(fixture.turnId),
+      ).toEqual({ status: 'failed', execution_fence: fixture.claim.executionFence + 1 });
+      expect(captureTupleFacts(fixture.database, other)).toBe(otherBefore);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('fails closed before target writes when another active tuple is cross-linked', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    fixture.database
+      .prepare('UPDATE runner_leases SET session_id = ? WHERE id = ?')
+      .run(fixture.sessionId, other.claim.leaseId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('two-tuple-corrupt'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'RUNNER_START_FAILED',
+          errorMessage: 'Runner failed to become ready',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('fails closed before writes when another active Lease has another daemon epoch', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    fixture.database
+      .prepare('UPDATE runner_leases SET daemon_epoch = ? WHERE id = ?')
+      .run('018f0000-0000-7000-8000-000000009999', other.claim.leaseId);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('two-tuple-other-epoch'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.fail({
+          binding: fixture.claim,
+          errorCode: 'RUNNER_START_FAILED',
+          errorMessage: 'Runner failed to become ready',
+        }),
+      ).toThrow(/terminalization invariant/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
   });
 
   it.each(['succeed', 'fail', 'interrupt'] as const)(

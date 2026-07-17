@@ -190,7 +190,7 @@ const spawnClaimContender = (
   return { child, ready, result };
 };
 
-describe('single-slot Scheduler claim', () => {
+describe('two-slot Scheduler claim', () => {
   let runtime: TempRuntime | undefined;
   let database: RuntimeDatabase | undefined;
 
@@ -257,12 +257,18 @@ describe('single-slot Scheduler claim', () => {
       revision: Number(beforeSession.revision) + 1,
       updated_at: NOW,
     });
-    expect(database.prepare('SELECT * FROM scheduler_slots').all()).toEqual([
+    expect(database.prepare('SELECT * FROM scheduler_slots ORDER BY slot_no').all()).toEqual([
       {
         slot_no: 1,
         state: 'owned',
         owner_turn_id: created.turnId,
         updated_at: NOW,
+      },
+      {
+        slot_no: 2,
+        state: 'free',
+        owner_turn_id: null,
+        updated_at: expect.any(String),
       },
     ]);
     expect(database.prepare('SELECT * FROM runner_leases').all()).toEqual([
@@ -314,6 +320,140 @@ describe('single-slot Scheduler claim', () => {
       database.prepare('SELECT status FROM turns WHERE id = ?').get(second.turnId),
     ).toEqual({ status: 'queued' });
     expect(database.pragma('foreign_key_check')).toEqual([]);
+  });
+
+  it('claims two different Session heads in slots 1 and 2 and leaves a third queued', async () => {
+    runtime = createTempRuntime();
+    database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    const firstSession = createSession(runtime, service, 'two-slot-first');
+    const secondSession = createSession(runtime, service, 'two-slot-second');
+    const thirdSession = createSession(runtime, service, 'two-slot-third');
+    database
+      .prepare('UPDATE turns SET queued_at = ? WHERE id = ?')
+      .run('2026-07-14T07:00:00.000Z', firstSession.turnId);
+    database
+      .prepare('UPDATE turns SET queued_at = ? WHERE id = ?')
+      .run('2026-07-14T07:01:00.000Z', secondSession.turnId);
+    database
+      .prepare('UPDATE turns SET queued_at = ? WHERE id = ?')
+      .run('2026-07-14T07:02:00.000Z', thirdSession.turnId);
+    const scheduler = createScheduler(database, DAEMON_EPOCH, [
+      '018f0000-0000-7000-8000-000000000131',
+      '018f0000-0000-7000-8000-000000000132',
+      '018f0000-0000-7000-8000-000000000133',
+      '018f0000-0000-7000-8000-000000000134',
+    ]);
+
+    const first = scheduler.claimNext();
+    const second = scheduler.claimNext();
+    const third = scheduler.claimNext();
+
+    expect([first?.slotNo, second?.slotNo]).toEqual([1, 2]);
+    expect(new Set([first?.sessionId, second?.sessionId]).size).toBe(2);
+    expect([first?.sessionId, second?.sessionId]).toEqual(
+      expect.arrayContaining([firstSession.sessionId, secondSession.sessionId]),
+    );
+    expect(third).toBeNull();
+    expect(
+      database
+        .prepare(
+          `SELECT status, started_at AS startedAt, execution_fence AS executionFence
+           FROM turns WHERE id = ?`,
+        )
+        .get(thirdSession.turnId),
+    ).toEqual({ status: 'queued', startedAt: null, executionFence: 0 });
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM runner_leases WHERE status = 'active' AND current_turn_id = ?")
+        .get(thirdSession.turnId),
+    ).toEqual({ count: 0 });
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM session_events WHERE turn_id = ? AND type = 'turn.started'")
+        .get(thirdSession.turnId),
+    ).toEqual({ count: 0 });
+  });
+
+  it('does not let a canceled ordinal block a later queued Session head', async () => {
+    runtime = createTempRuntime();
+    database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    const created = createSession(runtime, service, 'canceled-head');
+    const later = service.enqueueTurn(
+      { sessionId: created.sessionId, prompt: 'Later prompt' },
+      'enqueue-canceled-head-2',
+    );
+    database
+      .prepare("UPDATE turns SET status = 'canceled', finished_at = ? WHERE id = ?")
+      .run(NOW, created.turnId);
+
+    expect(createScheduler(database).claimNext()?.turnId).toBe(later.turnId);
+  });
+
+  it.each([
+    {
+      name: 'an active Lease is missing',
+      corrupt: (database: RuntimeDatabase, first: NonNullable<ReturnType<Scheduler['claimNext']>>) => {
+        database.prepare('DELETE FROM runner_leases WHERE id = ?').run(first.leaseId);
+      },
+    },
+    {
+      name: 'an active Session is duplicated',
+      corrupt: (database: RuntimeDatabase, first: NonNullable<ReturnType<Scheduler['claimNext']>>) => {
+        const otherOwnedSession = database
+          .prepare(
+            `SELECT session_id AS sessionId
+             FROM turns WHERE id IN (
+               SELECT owner_turn_id FROM scheduler_slots WHERE state = 'owned'
+             ) AND session_id != ? LIMIT 1`,
+          )
+          .get(first.sessionId) as { readonly sessionId: string };
+        database
+          .prepare(
+            `UPDATE sessions
+             SET current_turn_id = ?, runtime_status = 'running'
+             WHERE id NOT IN (?, ?)
+             LIMIT 1`,
+          )
+          .run(first.turnId, first.sessionId, otherOwnedSession.sessionId);
+      },
+    },
+    {
+      name: 'an active Lease cross-links another Session',
+      corrupt: (
+        database: RuntimeDatabase,
+        first: NonNullable<ReturnType<Scheduler['claimNext']>>,
+        second: NonNullable<ReturnType<Scheduler['claimNext']>>,
+      ) => {
+        database
+          .prepare('UPDATE runner_leases SET session_id = ? WHERE id = ?')
+          .run(second.sessionId, first.leaseId);
+      },
+    },
+  ])('fails closed before writes when $name', async ({ corrupt }) => {
+    runtime = createTempRuntime();
+    database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    createSession(runtime, service, 'corrupt-first');
+    createSession(runtime, service, 'corrupt-second');
+    createSession(runtime, service, 'corrupt-third');
+    const scheduler = createScheduler(database, DAEMON_EPOCH, [
+      '018f0000-0000-7000-8000-000000000136',
+      '018f0000-0000-7000-8000-000000000137',
+      '018f0000-0000-7000-8000-000000000138',
+      '018f0000-0000-7000-8000-000000000139',
+    ]);
+    const first = scheduler.claimNext();
+    const second = scheduler.claimNext();
+    if (!first || !second) {
+      throw new Error('Fixture did not establish two active Claims');
+    }
+    corrupt(database, first, second);
+    const before = captureFacts(database);
+
+    expect(() => scheduler.claimNext()).toThrow(/invariant/i);
+    expect(captureFacts(database)).toBe(before);
   });
 
   it('skips a blocked Session and still claims an archived eligible Session', async () => {
@@ -541,15 +681,18 @@ describe('single-slot Scheduler claim', () => {
     },
   );
 
-  it('serializes two concurrent default-timeout connections to one winner and one null result', async () => {
+  it('serializes three concurrent default-timeout connections to two distinct winners and one null result', async () => {
     runtime = createTempRuntime();
     database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
     const service = new SessionService(database);
-    createSession(runtime, service, 'two-connections');
+    createSession(runtime, service, 'three-connections-first');
+    createSession(runtime, service, 'three-connections-second');
+    createSession(runtime, service, 'three-connections-third');
     database.close();
     database = undefined;
     const databasePath = join(runtime.dataDir, 'runtime.sqlite3');
     const contenders = [
+      spawnClaimContender(databasePath, DAEMON_EPOCH),
       spawnClaimContender(databasePath, DAEMON_EPOCH),
       spawnClaimContender(databasePath, DAEMON_EPOCH),
     ];
@@ -562,21 +705,31 @@ describe('single-slot Scheduler claim', () => {
         contenders.map(async (contender) => await contender.result),
       );
 
-      expect(results.filter((result) => result !== null)).toHaveLength(1);
+      expect(results.filter((result) => result !== null)).toHaveLength(2);
       expect(results.filter((result) => result === null)).toHaveLength(1);
+      const claims = results.filter(
+        (result): result is { readonly slotNo: number; readonly turnId: string } =>
+          result !== null,
+      );
+      expect(new Set(claims.map((claim) => claim.slotNo))).toEqual(new Set([1, 2]));
+      expect(new Set(claims.map((claim) => claim.turnId)).size).toBe(2);
       database = new Database(databasePath);
       configureDatabase(database);
       expect(
         database.prepare('SELECT COUNT(*) AS count FROM runner_leases').get(),
-      ).toEqual({ count: 1 });
+      ).toEqual({ count: 2 });
       expect(
-        database.prepare('SELECT execution_fence AS executionFence FROM turns').get(),
-      ).toEqual({ executionFence: 1 });
+        database
+          .prepare(
+            'SELECT COUNT(*) AS count FROM turns WHERE execution_fence = 1',
+          )
+          .get(),
+      ).toEqual({ count: 2 });
       expect(
         database
           .prepare("SELECT COUNT(*) AS count FROM session_events WHERE type = 'turn.started'")
           .get(),
-      ).toEqual({ count: 1 });
+      ).toEqual({ count: 2 });
     } finally {
       for (const contender of contenders) {
         contender.child.stdin.destroy();
