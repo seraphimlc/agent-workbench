@@ -69,6 +69,12 @@ type ClaimedDaemonFixture = ActiveFixture & {
   readonly daemonEpoch: string;
 };
 
+type ActiveSubexecution = {
+  readonly callId: string;
+  readonly attemptId: string;
+  readonly toolRunId: string;
+};
+
 const mutationRequest = (
   client: RpcClient,
   method: 'workspace.register' | 'session.create' | 'turn.enqueue',
@@ -156,6 +162,118 @@ const createDirectActiveFixture = async (
       leaseId,
     },
   };
+};
+
+const createSecondDirectActiveFixture = (
+  runtime: TempRuntime,
+  database: RuntimeDatabase,
+  status: 'running' | 'cancel_requested' = 'running',
+): ActiveFixture => {
+  const service = new SessionService(database);
+  const workspacePath = join(runtime.rootDir, `direct-workspace-second-${status}`);
+  mkdirSync(workspacePath);
+  const workspace = service.registerWorkspace(
+    { path: workspacePath },
+    `direct-workspace-second-${status}`,
+  );
+  const created = service.createSession(
+    {
+      workspaceId: workspace.workspaceId,
+      title: `Second direct ${status}`,
+      prompt: 'Second prompt',
+    },
+    `direct-session-second-${status}`,
+  );
+  const queued = service.enqueueTurn(
+    { sessionId: created.sessionId, prompt: 'Second queued follower' },
+    `direct-enqueue-second-${status}`,
+  );
+  const leaseId = '018f0000-0000-7000-8000-000000000311';
+  const claim = new Scheduler(database, {
+    daemonEpoch: OLD_DAEMON_EPOCH,
+    now: () => new Date(CLAIM_TIME),
+    createId: createIdFactory(
+      leaseId,
+      '018f0000-0000-7000-8000-000000000312',
+    ),
+  }).claimNext();
+  if (!claim || claim.turnId !== created.turnId) {
+    throw new Error('Second fixture Turn was not claimed');
+  }
+  if (status === 'cancel_requested') {
+    database
+      .prepare("UPDATE turns SET status = 'cancel_requested' WHERE id = ?")
+      .run(created.turnId);
+    database
+      .prepare("UPDATE sessions SET runtime_status = 'canceling' WHERE id = ?")
+      .run(created.sessionId);
+  }
+  return {
+    sessionId: created.sessionId,
+    turnId: created.turnId,
+    queuedTurnId: queued.turnId,
+    leaseId,
+  };
+};
+
+const insertActiveSubexecution = (
+  database: RuntimeDatabase,
+  fixture: Pick<ActiveFixture, 'sessionId' | 'turnId'>,
+  suffix: string,
+): ActiveSubexecution => {
+  const callId = `active-call-${suffix}`;
+  const attemptId = `active-attempt-${suffix}`;
+  const toolRunId = `active-tool-${suffix}`;
+  database
+    .prepare(
+      `INSERT INTO model_calls (
+        id, session_id, turn_id, ordinal, kind, status,
+        profile_snapshot_json, input_json, result_json,
+        successful_attempt_id, error_code, error_message,
+        created_at, started_at, finished_at
+      ) VALUES (?, ?, ?, 1, 'craft', 'running', '{}', '{}', NULL, NULL,
+        NULL, NULL, ?, ?, NULL)`,
+    )
+    .run(callId, fixture.sessionId, fixture.turnId, CLAIM_TIME, CLAIM_TIME);
+  database
+    .prepare(
+      `INSERT INTO model_attempts (
+        id, model_call_id, attempt, status, provider_request_id,
+        partial_output_json, result_json, finish_reason,
+        input_tokens, output_tokens, cached_tokens, latency_ms,
+        error_code, error_message, retryable, started_at, finished_at
+      ) VALUES (?, ?, 1, 'running', NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL)`,
+    )
+    .run(attemptId, callId, CLAIM_TIME);
+  database
+    .prepare(
+      `INSERT INTO tool_runs (
+        id, session_id, turn_id, ordinal, logical_call_id,
+        source_model_call_id, source_model_attempt_id, attempt,
+        operation_id, idempotency_key, source_handle, tool_id, tool_version,
+        execution_mode, side_effect_class, status, dispatch_state,
+        dispatch_nonce, normalized_input_hash, input_json, result_json,
+        effect_state, pid, process_start_identity, error_code, error_message,
+        queued_at, started_at, finished_at
+      ) VALUES (?, ?, ?, 1, ?, ?, ?, 1,
+        ?, NULL, NULL, 'fs.read_text', '1', 'read_inline', 'read', 'running',
+        NULL, NULL, ?, '{}', NULL, 'not_applied', NULL, NULL, NULL, NULL,
+        ?, ?, NULL)`,
+    )
+    .run(
+      toolRunId,
+      fixture.sessionId,
+      fixture.turnId,
+      `logical-${suffix}`,
+      callId,
+      attemptId,
+      `operation-${suffix}`,
+      `input-${suffix}`,
+      CLAIM_TIME,
+      CLAIM_TIME,
+    );
+  return { callId, attemptId, toolRunId };
 };
 
 const captureFacts = (database: RuntimeDatabase): string =>
@@ -548,6 +666,9 @@ const recoveryOptions = (
     '018f0000-0000-7000-8000-000000000401',
     '018f0000-0000-7000-8000-000000000402',
     '018f0000-0000-7000-8000-000000000403',
+    '018f0000-0000-7000-8000-000000000404',
+    '018f0000-0000-7000-8000-000000000405',
+    '018f0000-0000-7000-8000-000000000406',
   ),
   hooks,
 });
@@ -706,6 +827,336 @@ describe('startup scheduler recovery', () => {
       }
     },
   );
+
+  it('recovers two complete old tuples once and stays idempotent', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    const other = createSecondDirectActiveFixture(runtime, database);
+    try {
+      recoverStartupState(database, recoveryOptions());
+
+      expect(
+        database
+          .prepare('SELECT id, status FROM turns WHERE id IN (?, ?) ORDER BY id')
+          .all(fixture.turnId, other.turnId),
+      ).toEqual(
+        [
+          { id: fixture.turnId, status: 'interrupted' },
+          { id: other.turnId, status: 'interrupted' },
+        ].sort((left, right) => left.id.localeCompare(right.id)),
+      );
+      expect(
+        database
+          .prepare(
+            "SELECT turn_id AS turnId, type FROM session_events WHERE type IN ('turn.interrupted', 'recovery.detected') ORDER BY turn_id, seq",
+          )
+          .all(),
+      ).toEqual(
+        [
+          { turnId: fixture.turnId, type: 'turn.interrupted' },
+          { turnId: fixture.turnId, type: 'recovery.detected' },
+          { turnId: other.turnId, type: 'turn.interrupted' },
+          { turnId: other.turnId, type: 'recovery.detected' },
+        ].sort((left, right) => left.turnId.localeCompare(right.turnId)),
+      );
+      const recoveredFacts = captureFacts(database);
+
+      recoverStartupState(database, {
+        daemonEpoch: LATER_DAEMON_EPOCH,
+        createId: () => {
+          throw new Error('Idempotent batch recovery allocated an id');
+        },
+      });
+      expect(captureFacts(database)).toBe(recoveredFacts);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rejects recovery when a same-epoch tuple appears after startup inspection', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    database
+      .prepare(
+        `UPDATE runner_leases
+         SET runner_instance_id = ?, pid = ?, process_start_identity = ?
+         WHERE id = ?`,
+      )
+      .run('runner-first', 101, 'first-start', fixture.leaseId);
+    let beforeBatch = '';
+    try {
+      expect(() =>
+        recoverStartupState(database, {
+          ...recoveryOptions(),
+          inspectExecutor: () => {
+            createSecondDirectActiveFixture(runtime as TempRuntime, database);
+            beforeBatch = captureFacts(database);
+            return 'exited';
+          },
+        }),
+      ).toThrow(/batch.*active tuple/i);
+      expect(beforeBatch).not.toBe('');
+      expect(captureFacts(database)).toBe(beforeBatch);
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'runner instance id',
+      mutate: (database: RuntimeDatabase, leaseId: string) => {
+        database
+          .prepare('UPDATE runner_leases SET runner_instance_id = ? WHERE id = ?')
+          .run('runner-replaced', leaseId);
+      },
+    },
+    {
+      name: 'PID',
+      mutate: (database: RuntimeDatabase, leaseId: string) => {
+        database.prepare('UPDATE runner_leases SET pid = ? WHERE id = ?').run(202, leaseId);
+      },
+    },
+    {
+      name: 'process start identity',
+      mutate: (database: RuntimeDatabase, leaseId: string) => {
+        database
+          .prepare('UPDATE runner_leases SET process_start_identity = ? WHERE id = ?')
+          .run('second-start', leaseId);
+      },
+    },
+  ])('rejects recovery when $name changes after executor inspection', async ({ mutate }) => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    database
+      .prepare(
+        `UPDATE runner_leases
+         SET runner_instance_id = ?, pid = ?, process_start_identity = ?
+         WHERE id = ?`,
+      )
+      .run('runner-first', 101, 'first-start', fixture.leaseId);
+    let beforeBatch = '';
+    try {
+      expect(() =>
+        recoverStartupState(database, {
+          ...recoveryOptions(),
+          inspectExecutor: () => {
+            mutate(database, fixture.leaseId);
+            beforeBatch = captureFacts(database);
+            return 'exited';
+          },
+        }),
+      ).toThrow(/executor/i);
+      expect(beforeBatch).not.toBe('');
+      expect(captureFacts(database)).toBe(beforeBatch);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rejects malformed terminal subexecutions in tuple B before recovery writes', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    const other = createSecondDirectActiveFixture(runtime, database);
+    insertActiveSubexecution(database, fixture, 'first');
+    const secondSubexecution = insertActiveSubexecution(database, other, 'second');
+    database
+      .prepare("UPDATE model_calls SET status = 'failed', finished_at = NULL WHERE id = ?")
+      .run(secondSubexecution.callId);
+    database
+      .prepare("UPDATE model_attempts SET status = 'failed', finished_at = NULL WHERE id = ?")
+      .run(secondSubexecution.attemptId);
+    database
+      .prepare("UPDATE tool_runs SET status = 'failed', finished_at = NULL WHERE id = ?")
+      .run(secondSubexecution.toolRunId);
+    const before = captureFacts(database);
+    try {
+      expect(() => recoverStartupState(database, recoveryOptions())).toThrow(/invariant/i);
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('keeps recovered terminal subexecution projections valid on a repeated startup', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    insertActiveSubexecution(database, fixture, 'first');
+    try {
+      recoverStartupState(database, recoveryOptions());
+      const recoveredFacts = captureFacts(database);
+
+      expect(() =>
+        recoverStartupState(database, {
+          daemonEpoch: LATER_DAEMON_EPOCH,
+          createId: () => {
+            throw new Error('Repeated recovery allocated an id');
+          },
+        }),
+      ).not.toThrow();
+      expect(captureFacts(database)).toBe(recoveredFacts);
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'a running ModelAttempt under a non-running ModelCall',
+      corrupt: (
+        database: RuntimeDatabase,
+        first: ActiveFixture,
+        second: ActiveFixture,
+      ) => {
+        insertActiveSubexecution(database, first, 'first');
+        const subexecution = insertActiveSubexecution(database, second, 'second');
+        database
+          .prepare("UPDATE model_calls SET status = 'failed', finished_at = ? WHERE id = ?")
+          .run(CLAIM_TIME, subexecution.callId);
+      },
+    },
+    {
+      name: 'a ToolRun sourced from another tuple',
+      corrupt: (
+        database: RuntimeDatabase,
+        first: ActiveFixture,
+        second: ActiveFixture,
+      ) => {
+        const firstSubexecution = insertActiveSubexecution(database, first, 'first');
+        const secondSubexecution = insertActiveSubexecution(database, second, 'second');
+        database
+          .prepare(
+            `UPDATE tool_runs
+             SET source_model_call_id = ?, source_model_attempt_id = ?
+             WHERE id = ?`,
+          )
+          .run(
+            firstSubexecution.callId,
+            firstSubexecution.attemptId,
+            secondSubexecution.toolRunId,
+          );
+      },
+    },
+    {
+      name: 'a ToolRun whose source call and Attempt disagree',
+      corrupt: (
+        database: RuntimeDatabase,
+        first: ActiveFixture,
+        second: ActiveFixture,
+      ) => {
+        const firstSubexecution = insertActiveSubexecution(database, first, 'first');
+        const secondSubexecution = insertActiveSubexecution(database, second, 'second');
+        database
+          .prepare('UPDATE tool_runs SET source_model_attempt_id = ? WHERE id = ?')
+          .run(firstSubexecution.attemptId, secondSubexecution.toolRunId);
+      },
+    },
+  ])('rejects $name in tuple B before executor inspection or recovery writes', async ({ corrupt }) => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    const other = createSecondDirectActiveFixture(runtime, database);
+    corrupt(database, fixture, other);
+    database
+      .prepare(
+        `UPDATE runner_leases
+         SET runner_instance_id = ?, pid = ?, process_start_identity = ?
+         WHERE id = ?`,
+      )
+      .run('runner-first', 101, 'first-start', fixture.leaseId);
+    const before = captureFacts(database);
+    const inspected: number[] = [];
+    try {
+      expect(() =>
+        recoverStartupState(database, {
+          ...recoveryOptions(),
+          inspectExecutor: (identity) => {
+            inspected.push(identity.pid);
+            return 'exited';
+          },
+        }),
+      ).toThrow(/invariant/i);
+      expect(inspected).toEqual([]);
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('does not recover either active tuple when the other tuple is corrupt', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    const other = createSecondDirectActiveFixture(runtime, database);
+    database
+      .prepare('UPDATE runner_leases SET session_id = ? WHERE id = ?')
+      .run(fixture.sessionId, other.leaseId);
+    const before = captureFacts(database);
+    try {
+      expect(() => recoverStartupState(database, recoveryOptions())).toThrow(/invariant/i);
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('does not recover either tuple until every persisted executor is proven exited', async () => {
+    runtime = createTempRuntime();
+    const { database, fixture } = await createDirectActiveFixture(runtime);
+    const other = createSecondDirectActiveFixture(runtime, database);
+    database
+      .prepare(
+        `UPDATE runner_leases
+         SET runner_instance_id = ?, pid = ?, process_start_identity = ?
+         WHERE id = ?`,
+      )
+      .run('runner-first', 101, 'first-start', fixture.leaseId);
+    database
+      .prepare(
+        `UPDATE runner_leases
+         SET runner_instance_id = ?, pid = ?, process_start_identity = ?
+         WHERE id = ?`,
+      )
+      .run('runner-second', 202, 'second-start', other.leaseId);
+    const before = captureFacts(database);
+    const inspected: number[] = [];
+    try {
+      expect(() =>
+        recoverStartupState(database, {
+          ...recoveryOptions(),
+          inspectExecutor: (identity) => {
+            inspected.push(identity.pid);
+            return identity.pid === 101 ? 'exited' : 'ambiguous';
+          },
+        }),
+      ).toThrow(/executor/i);
+      expect(inspected).toEqual([101, 202]);
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
+
+  it('rolls back recovery facts for both tuples when beforeCommit throws', async () => {
+    runtime = createTempRuntime();
+    const { database } = await createDirectActiveFixture(runtime);
+    createSecondDirectActiveFixture(runtime, database);
+    const before = captureFacts(database);
+    const injectedFailure = new Error('injected batch recovery failure');
+    try {
+      expect(() =>
+        recoverStartupState(
+          database,
+          recoveryOptions({
+            beforeCommit: () => {
+              throw injectedFailure;
+            },
+          }),
+        ),
+      ).toThrow(injectedFailure);
+      expect(captureFacts(database)).toBe(before);
+    } finally {
+      database.close();
+    }
+  });
 
   it('rolls back all recovery writes when beforeCommit throws', async () => {
     runtime = createTempRuntime();

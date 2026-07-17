@@ -617,6 +617,183 @@ describe('TurnTerminalizer', () => {
     }
   });
 
+  it('interrupts a batch in slot order when both active tuples are valid', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    fixture.database.exec(`
+      CREATE TABLE terminalizer_write_order (slot_no INTEGER NOT NULL);
+      CREATE TRIGGER record_terminalizer_slot_order
+      AFTER UPDATE OF state ON scheduler_slots
+      WHEN OLD.state = 'owned' AND NEW.state = 'free'
+      BEGIN
+        INSERT INTO terminalizer_write_order (slot_no) VALUES (OLD.slot_no);
+      END;
+    `);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('batch-interrupt'),
+    });
+
+    try {
+      terminalizer.interruptMany([
+        {
+          binding: other.claim,
+          reason: 'daemon_restart',
+          executorExited: true,
+        },
+        {
+          binding: fixture.claim,
+          reason: 'daemon_restart',
+          executorExited: true,
+        },
+      ]);
+
+      expect(
+        fixture.database
+          .prepare('SELECT status FROM turns WHERE id IN (?, ?) ORDER BY id')
+          .all(fixture.turnId, other.turnId),
+      ).toEqual([{ status: 'interrupted' }, { status: 'interrupted' }]);
+      expect(
+        fixture.database
+          .prepare('SELECT slot_no FROM terminalizer_write_order ORDER BY rowid')
+          .all(),
+      ).toEqual([{ slot_no: 1 }, { slot_no: 2 }]);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rejects a batch that omits another active tuple before writes', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    createSecondActiveFixture(runtime, fixture.database);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('batch-complete-set'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interruptMany([
+          {
+            binding: fixture.claim,
+            reason: 'daemon_restart',
+            executorExited: true,
+          },
+        ]),
+      ).toThrow(/batch.*active tuple/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('interrupts two active tuples independently without changing the other tuple', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    const otherBefore = captureTupleFacts(fixture.database, other);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('independent-interrupt'),
+    });
+
+    try {
+      terminalizer.interrupt({
+        binding: fixture.claim,
+        reason: 'daemon_shutdown',
+        executorExited: true,
+      });
+      expect(captureTupleFacts(fixture.database, other)).toBe(otherBefore);
+
+      terminalizer.interrupt({
+        binding: other.claim,
+        reason: 'daemon_shutdown',
+        executorExited: true,
+      });
+      expect(
+        fixture.database
+          .prepare('SELECT status FROM turns WHERE id IN (?, ?) ORDER BY id')
+          .all(fixture.turnId, other.turnId),
+      ).toEqual([{ status: 'interrupted' }, { status: 'interrupted' }]);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('validates every batch input before its first write', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    const before = captureFacts(fixture.database);
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('batch-input-validation'),
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interruptMany([
+          {
+            binding: fixture.claim,
+            reason: 'daemon_restart',
+            executorExited: true,
+          },
+          {
+            binding: other.claim,
+            reason: 'daemon_restart',
+            executorExited: false,
+          },
+        ]),
+      ).toThrow(/executor exit/i);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it('rolls back the first batch tuple when the second tuple write group fails', async () => {
+    runtime = createTempRuntime();
+    const fixture = await createActiveFixture(runtime);
+    const other = createSecondActiveFixture(runtime, fixture.database);
+    const before = captureFacts(fixture.database);
+    const injected = new Error('second tuple fence failure');
+    let fenceWrites = 0;
+    const terminalizer = new TurnTerminalizer(fixture.database, {
+      now: () => new Date(FINISH_TIME),
+      createId: createIdFactory('batch-rollback'),
+      hooks: {
+        afterWriteGroup: (group) => {
+          if (group === 'fence' && ++fenceWrites === 2) {
+            throw injected;
+          }
+        },
+      },
+    });
+
+    try {
+      expect(() =>
+        terminalizer.interruptMany([
+          {
+            binding: fixture.claim,
+            reason: 'daemon_restart',
+            executorExited: true,
+          },
+          {
+            binding: other.claim,
+            reason: 'daemon_restart',
+            executorExited: true,
+          },
+        ]),
+      ).toThrow(injected);
+      expect(captureFacts(fixture.database)).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it.each(['succeed', 'fail', 'interrupt'] as const)(
     'rejects $operation before writes when a Terminal ToolRun tuple is invalid',
     async (operation) => {

@@ -4,6 +4,8 @@ import { v7 as uuidv7 } from 'uuid';
 import {
   ExecutionRepository,
   TurnTerminalizationInvariantError,
+  type ActiveExecutionTuple,
+  type LeaseExecutorIdentity,
 } from '../db/execution-repository.js';
 import {
   SessionEventWriter,
@@ -37,12 +39,21 @@ export interface TurnTerminalizerOptions {
   readonly now?: () => Date;
   readonly createId?: () => string;
   readonly onCommitted?: () => void;
+  readonly beforeCommit?: () => void;
   readonly hooks?: TurnTerminalizerHooks;
 }
 
 export type TurnSuccessResult = {
   readonly status: 'succeeded';
   readonly resultMessageId: string;
+};
+
+export type TurnInterruptInput = {
+  readonly binding: Claim;
+  readonly reason: string;
+  readonly executorExited: boolean;
+  readonly resolutions?: readonly EffectResolutionInput[];
+  readonly expectedExecutorIdentity?: LeaseExecutorIdentity;
 };
 
 const stableErrorMessage = (message: string): string =>
@@ -55,6 +66,7 @@ export class TurnTerminalizer {
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly onCommitted: () => void;
+  private readonly beforeCommit: () => void;
   private readonly hooks: TurnTerminalizerHooks;
 
   constructor(
@@ -64,6 +76,7 @@ export class TurnTerminalizer {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? uuidv7;
     this.onCommitted = options.onCommitted ?? (() => undefined);
+    this.beforeCommit = options.beforeCommit ?? (() => undefined);
     this.hooks = options.hooks ?? {};
     this.repository = new ExecutionRepository(database);
     this.recovery = new ExecutionRecovery(database, {
@@ -211,87 +224,143 @@ export class TurnTerminalizer {
     });
   }
 
-  interrupt(input: {
-    readonly binding: Claim;
-    readonly reason: string;
-    readonly executorExited: boolean;
-    readonly resolutions?: readonly EffectResolutionInput[];
-  }): void {
-    if (input.reason.trim().length === 0) {
+  interrupt(input: TurnInterruptInput): void {
+    this.commit(() => {
+      this.assertInterruptInputs([input]);
+      const tuple = this.repository.readActiveTuple(input.binding, [
+        'running',
+        'cancel_requested',
+      ]);
+      this.recovery.assertSubexecutionsValid(
+        input.binding.sessionId,
+        input.binding.turnId,
+      );
+      this.interruptWithinTransaction(input, tuple);
+    });
+  }
+
+  interruptMany(inputs: readonly TurnInterruptInput[]): void {
+    const ordered = [...inputs].sort(
+      (left, right) =>
+        left.binding.slotNo - right.binding.slotNo ||
+        left.binding.turnId.localeCompare(right.binding.turnId),
+    );
+    this.commit(() => {
+      this.assertInterruptInputs(ordered);
+      this.repository.assertExactActiveTupleBindings(
+        ordered.map((input) => input.binding),
+      );
+      for (const input of ordered) {
+        if (input.expectedExecutorIdentity) {
+          this.repository.assertLeaseExecutorIdentity(
+            input.binding,
+            input.expectedExecutorIdentity,
+          );
+        }
+      }
+      const validated = ordered.map((input) => ({
+        input,
+        tuple: this.repository.readActiveTuple(input.binding, [
+          'running',
+          'cancel_requested',
+        ]),
+      }));
+      for (const { input } of validated) {
+        this.recovery.assertSubexecutionsValid(
+          input.binding.sessionId,
+          input.binding.turnId,
+        );
+      }
+      for (const { input, tuple } of validated) {
+        this.interruptWithinTransaction(input, tuple);
+      }
+      this.beforeCommit();
+    });
+  }
+
+  private assertInterruptInputs(inputs: readonly TurnInterruptInput[]): void {
+    if (inputs.length === 0) {
       throw new TurnTerminalizationInvariantError(
-        'interrupt reason must be non-blank',
+        'interrupt batch must include at least one tuple',
       );
     }
-    this.commit(() => {
+    const slots = new Set<number>();
+    for (const input of inputs) {
+      if (input.reason.trim().length === 0) {
+        throw new TurnTerminalizationInvariantError(
+          'interrupt reason must be non-blank',
+        );
+      }
       if (!input.executorExited) {
         throw new TurnTerminalizationInvariantError(
           'executor exit must be proven before releasing the slot',
         );
       }
-      const now = this.now().toISOString();
-      const tuple = this.repository.readActiveTuple(input.binding, [
-        'running',
-        'cancel_requested',
-      ]);
-      this.recovery.assertToolRunsValid(
-        input.binding.sessionId,
-        input.binding.turnId,
-      );
-      const revokedFence = this.repository.revokeFence(input.binding);
-      this.after('fence');
-      const subexecutionEvents = this.recovery.interrupt({
-        sessionId: input.binding.sessionId,
-        turnId: input.binding.turnId,
-        reason: input.reason,
-        now,
-        ...(input.resolutions ? { resolutions: input.resolutions } : {}),
-      });
-      this.after('subexecutions');
-      this.repository.updateTurn({
-        binding: input.binding,
-        expectedStatus: tuple.turnStatus,
-        expectedFence: revokedFence,
-        status: 'interrupted',
-        now,
-        errorCode: null,
-        errorMessage: null,
-        resultMessageId: null,
-        incrementFence: false,
-      });
-      this.after('turn');
-      this.repository.expireLease(input.binding, now);
-      this.after('lease');
-      this.repository.freeSlot(input.binding, now);
-      this.after('slot');
-      const recoveryEpisode = this.repository.projectSessionForRecovery({
-        tuple,
-        now,
-      });
-      this.after('session');
-      const terminalEvents: SessionEventDraft[] = [
-        ...subexecutionEvents,
-        {
-          turnId: input.binding.turnId,
-          type: 'turn.interrupted',
-          payload: { reason: input.reason },
-        },
-        {
-          turnId: input.binding.turnId,
-          type: 'recovery.detected',
-          payload: {
-            reason: input.reason,
-            recoveryEpisode,
-            recoverySourceTurnId: input.binding.turnId,
-          },
-        },
-      ];
-      this.events.append({
-        sessionId: input.binding.sessionId,
-        now,
-        events: terminalEvents,
-      });
-      this.after('events');
+      if (slots.has(input.binding.slotNo)) {
+        throw new TurnTerminalizationInvariantError(
+          'interrupt batch bindings must own distinct slots',
+        );
+      }
+      slots.add(input.binding.slotNo);
+    }
+  }
+
+  private interruptWithinTransaction(
+    input: TurnInterruptInput,
+    tuple: ActiveExecutionTuple,
+  ): void {
+    const now = this.now().toISOString();
+    const revokedFence = this.repository.revokeFence(input.binding);
+    this.after('fence');
+    const subexecutionEvents = this.recovery.interrupt({
+      sessionId: input.binding.sessionId,
+      turnId: input.binding.turnId,
+      reason: input.reason,
+      now,
+      ...(input.resolutions ? { resolutions: input.resolutions } : {}),
     });
+    this.after('subexecutions');
+    this.repository.updateTurn({
+      binding: input.binding,
+      expectedStatus: tuple.turnStatus,
+      expectedFence: revokedFence,
+      status: 'interrupted',
+      now,
+      errorCode: null,
+      errorMessage: null,
+      resultMessageId: null,
+      incrementFence: false,
+    });
+    this.after('turn');
+    this.repository.expireLease(input.binding, now);
+    this.after('lease');
+    this.repository.freeSlot(input.binding, now);
+    this.after('slot');
+    const recoveryEpisode = this.repository.projectSessionForRecovery({ tuple, now });
+    this.after('session');
+    const terminalEvents: SessionEventDraft[] = [
+      ...subexecutionEvents,
+      {
+        turnId: input.binding.turnId,
+        type: 'turn.interrupted',
+        payload: { reason: input.reason },
+      },
+      {
+        turnId: input.binding.turnId,
+        type: 'recovery.detected',
+        payload: {
+          reason: input.reason,
+          recoveryEpisode,
+          recoverySourceTurnId: input.binding.turnId,
+        },
+      },
+    ];
+    this.events.append({
+      sessionId: input.binding.sessionId,
+      now,
+      events: terminalEvents,
+    });
+    this.after('events');
   }
 
   private commit<Result>(operation: () => Result): Result {

@@ -64,6 +64,12 @@ type SlotFact = {
   readonly ownerTurnId: string | null;
 };
 
+export type LeaseExecutorIdentity = {
+  readonly runnerInstanceId: string | null;
+  readonly pid: number | null;
+  readonly processStartIdentity: string | null;
+};
+
 type FinalAttemptRow = {
   readonly attemptId: string;
   readonly attempt: number;
@@ -217,6 +223,95 @@ export class ExecutionRepository {
       throw new TurnTerminalizationInvariantError('active tuple is inconsistent');
     }
     return row;
+  }
+
+  assertExactActiveTupleBindings(bindings: readonly Claim[]): void {
+    this.assertCallerTransaction();
+    if (bindings.length === 0) {
+      throw new TurnTerminalizationInvariantError(
+        'interrupt batch must include at least one active tuple',
+      );
+    }
+    const firstBinding = bindings[0];
+    if (!firstBinding) {
+      throw new TurnTerminalizationInvariantError(
+        'interrupt batch must include at least one active tuple',
+      );
+    }
+    this.assertGlobalActiveTuples(firstBinding);
+    const bindingKeys = new Set(
+      bindings.map(
+        (binding) =>
+          `${String(binding.slotNo)}:${binding.sessionId}:${binding.turnId}:${binding.leaseId}:${binding.daemonEpoch}:${String(binding.leaseEpoch)}:${String(binding.executionFence)}`,
+      ),
+    );
+    if (bindingKeys.size !== bindings.length) {
+      throw new TurnTerminalizationInvariantError(
+        'interrupt batch bindings must be unique',
+      );
+    }
+    const activeBindings = this.database
+      .prepare(
+        `SELECT scheduler_slots.slot_no AS slotNo,
+                turns.session_id AS sessionId, turns.id AS turnId,
+                runner_leases.id AS leaseId,
+                runner_leases.daemon_epoch AS daemonEpoch,
+                runner_leases.lease_epoch AS leaseEpoch,
+                turns.execution_fence AS executionFence
+         FROM scheduler_slots
+         JOIN turns ON turns.id = scheduler_slots.owner_turn_id
+         JOIN runner_leases
+           ON runner_leases.current_turn_id = turns.id
+          AND runner_leases.status = 'active'
+         WHERE scheduler_slots.state = 'owned'
+         ORDER BY scheduler_slots.slot_no`,
+      )
+      .all() as Claim[];
+    if (
+      activeBindings.length !== bindings.length ||
+      activeBindings.some(
+        (active) =>
+          !bindingKeys.has(
+            `${String(active.slotNo)}:${active.sessionId}:${active.turnId}:${active.leaseId}:${active.daemonEpoch}:${String(active.leaseEpoch)}:${String(active.executionFence)}`,
+          ),
+      )
+    ) {
+      throw new TurnTerminalizationInvariantError(
+        'interrupt batch does not match the complete active tuple set',
+      );
+    }
+  }
+
+  assertLeaseExecutorIdentity(
+    binding: Claim,
+    expected: LeaseExecutorIdentity,
+  ): void {
+    this.assertCallerTransaction();
+    const current = this.database
+      .prepare(
+        `SELECT runner_instance_id AS runnerInstanceId, pid,
+                process_start_identity AS processStartIdentity
+         FROM runner_leases
+         WHERE id = ? AND daemon_epoch = ? AND lease_epoch = ?
+           AND session_id = ? AND current_turn_id = ? AND status = 'active'`,
+      )
+      .get(
+        binding.leaseId,
+        binding.daemonEpoch,
+        binding.leaseEpoch,
+        binding.sessionId,
+        binding.turnId,
+      ) as LeaseExecutorIdentity | undefined;
+    if (
+      !current ||
+      current.runnerInstanceId !== expected.runnerInstanceId ||
+      current.pid !== expected.pid ||
+      current.processStartIdentity !== expected.processStartIdentity
+    ) {
+      throw new TurnTerminalizationInvariantError(
+        'active Lease executor identity changed before recovery',
+      );
+    }
   }
 
   private assertGlobalActiveTuples(binding: Pick<Claim, 'daemonEpoch'>): void {

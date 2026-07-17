@@ -160,4 +160,62 @@ describe('ExecutionRecovery transaction participation', () => {
       fixture.database.close();
     }
   });
+
+  it.each([
+    {
+      name: 'a running ModelAttempt under a terminal ModelCall',
+      corrupt: (database: Database.Database, fixture: Awaited<ReturnType<typeof seedActiveExecution>>) => {
+        database
+          .prepare(
+            "UPDATE model_calls SET status = 'failed', finished_at = ? WHERE id = 'recovery-call' AND turn_id = ?",
+          )
+          .run(NOW, fixture.turnId);
+      },
+    },
+    {
+      name: 'a running ModelAttempt under a ModelCall for another Session',
+      corrupt: (database: Database.Database, fixture: Awaited<ReturnType<typeof seedActiveExecution>>) => {
+        const workspace = database
+          .prepare('SELECT workspace_id AS workspaceId FROM sessions WHERE id = ?')
+          .get(fixture.sessionId) as { readonly workspaceId: string };
+        const foreign = new SessionService(database).createSession(
+          {
+            workspaceId: workspace.workspaceId,
+            title: 'Foreign execution ownership',
+            prompt: 'Foreign prompt',
+          },
+          'foreign-execution-ownership',
+        );
+        database
+          .prepare("UPDATE model_calls SET session_id = ? WHERE id = 'recovery-call'")
+          .run(foreign.sessionId);
+      },
+    },
+  ])('rejects $name without changing persisted subexecutions', async ({ corrupt }) => {
+    runtime = createTempRuntime();
+    const fixture = await seedActiveExecution(runtime);
+    const recovery = new ExecutionRecovery(fixture.database);
+    corrupt(fixture.database, fixture);
+    const before = JSON.stringify({
+      calls: fixture.database.prepare('SELECT * FROM model_calls ORDER BY id').all(),
+      attempts: fixture.database.prepare('SELECT * FROM model_attempts ORDER BY id').all(),
+      tools: fixture.database.prepare('SELECT * FROM tool_runs ORDER BY id').all(),
+    });
+    const validate = fixture.database.transaction(() =>
+      recovery.assertSubexecutionsValid(fixture.sessionId, fixture.turnId),
+    );
+
+    try {
+      expect(() => validate.immediate()).toThrow(/invariant/i);
+      expect(
+        JSON.stringify({
+          calls: fixture.database.prepare('SELECT * FROM model_calls ORDER BY id').all(),
+          attempts: fixture.database.prepare('SELECT * FROM model_attempts ORDER BY id').all(),
+          tools: fixture.database.prepare('SELECT * FROM tool_runs ORDER BY id').all(),
+        }),
+      ).toBe(before);
+    } finally {
+      fixture.database.close();
+    }
+  });
 });

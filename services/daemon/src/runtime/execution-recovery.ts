@@ -130,6 +130,130 @@ export class ExecutionRecovery {
     this.readValidatedToolRuns(sessionId, turnId);
   }
 
+  assertSubexecutionsValid(
+    sessionId: string,
+    turnId: string,
+    terminalFinishedAt?: string,
+  ): void {
+    this.assertCallerTransaction();
+    this.repository.assertTurnExecutionOwnership({ sessionId, turnId });
+    const invalid = this.database
+      .prepare(
+        `SELECT
+         EXISTS (
+           SELECT 1
+           FROM model_calls
+           LEFT JOIN model_attempts AS successful_attempt
+             ON successful_attempt.id = model_calls.successful_attempt_id
+           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+             AND (
+               (model_calls.status = 'running' AND model_calls.finished_at IS NOT NULL)
+               OR (model_calls.status <> 'running' AND model_calls.finished_at IS NULL)
+               OR (? IS NOT NULL AND model_calls.status = 'running')
+               OR (
+                 ? IS NOT NULL
+                 AND model_calls.finished_at IS NOT NULL
+                 AND model_calls.finished_at > ?
+               )
+               OR (
+                 model_calls.status = 'succeeded'
+                 AND (
+                   model_calls.successful_attempt_id IS NULL
+                   OR successful_attempt.status <> 'succeeded'
+                 )
+               )
+               OR (
+                 model_calls.status <> 'succeeded'
+                 AND model_calls.successful_attempt_id IS NOT NULL
+               )
+             )
+         ) AS modelCalls,
+         EXISTS (
+           SELECT 1
+           FROM model_attempts
+           JOIN model_calls ON model_calls.id = model_attempts.model_call_id
+           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
+             AND (
+               (
+                 model_attempts.status = 'running'
+                 AND (
+                   model_calls.status <> 'running'
+                   OR model_attempts.finished_at IS NOT NULL
+                 )
+               )
+               OR (
+                 model_attempts.status <> 'running'
+                 AND model_attempts.finished_at IS NULL
+               )
+               OR (? IS NOT NULL AND model_attempts.status = 'running')
+               OR (
+                 ? IS NOT NULL
+                 AND model_attempts.finished_at IS NOT NULL
+                 AND model_attempts.finished_at > ?
+               )
+               OR (
+                 model_attempts.status = 'succeeded'
+                 AND (
+                   model_calls.successful_attempt_id IS NULL
+                   OR model_calls.successful_attempt_id <> model_attempts.id
+                 )
+               )
+             )
+         ) AS modelAttempts,
+         EXISTS (
+           SELECT 1
+           FROM tool_runs
+           WHERE tool_runs.session_id = ? AND tool_runs.turn_id = ?
+             AND (
+               (
+                 tool_runs.status IN ('queued', 'running', 'cancel_requested')
+                 AND tool_runs.finished_at IS NOT NULL
+               )
+               OR (
+                 tool_runs.status NOT IN ('queued', 'running', 'cancel_requested')
+                 AND tool_runs.finished_at IS NULL
+               )
+               OR (
+                 ? IS NOT NULL
+                 AND tool_runs.status IN ('queued', 'running', 'cancel_requested')
+               )
+               OR (
+                 ? IS NOT NULL
+                 AND tool_runs.finished_at IS NOT NULL
+                 AND tool_runs.finished_at > ?
+               )
+             )
+         ) AS toolRuns`,
+      )
+      .get(
+        sessionId,
+        turnId,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+        sessionId,
+        turnId,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+        sessionId,
+        turnId,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+        terminalFinishedAt ?? null,
+      ) as {
+      readonly modelCalls: number;
+      readonly modelAttempts: number;
+      readonly toolRuns: number;
+    };
+    if (invalid.modelCalls || invalid.modelAttempts || invalid.toolRuns) {
+      throw new TurnTerminalizationInvariantError(
+        'subexecution lifecycle projection is inconsistent',
+      );
+    }
+    this.readValidatedToolRuns(sessionId, turnId);
+  }
+
   private assertCallerTransaction(): void {
     if (!this.database.inTransaction) {
       throw new TurnTerminalizationInvariantError(

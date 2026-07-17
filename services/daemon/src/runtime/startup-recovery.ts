@@ -1,16 +1,12 @@
 import type Database from 'better-sqlite3';
 
 import {
-  ExecutionRepository,
   TurnTerminalizationInvariantError,
+  type LeaseExecutorIdentity,
 } from '../db/execution-repository.js';
 import type { Claim } from './scheduler.js';
 import { TurnTerminalizer } from './turn-terminalizer.js';
-import {
-  ToolRunStatusMatrixError,
-  type ToolRunStatusTuple,
-  validateToolRunStatusTuple,
-} from './tool-run-status-validator.js';
+import { ExecutionRecovery } from './execution-recovery.js';
 
 const SLOT_NOS = [1, 2] as const;
 
@@ -53,14 +49,22 @@ type ActiveLeaseRow = {
 };
 
 type PersistedExecutorIdentity = {
+  readonly runnerInstanceId: string;
   readonly pid: number;
   readonly processStartIdentity: string;
 };
 
 type StartupInspection = {
   readonly binding: Claim;
-  readonly executorIdentity: PersistedExecutorIdentity | null;
+  readonly executorIdentity: LeaseExecutorIdentity;
 };
+
+const hasPersistedExecutorIdentity = (
+  identity: LeaseExecutorIdentity,
+): identity is PersistedExecutorIdentity =>
+  identity.runnerInstanceId !== null &&
+  identity.pid !== null &&
+  identity.processStartIdentity !== null;
 
 type RecoveryMarkerSessionRow = {
   readonly sessionId: string;
@@ -99,10 +103,6 @@ type RecoveryEventRow = {
   readonly toolRunId: string | null;
   readonly blobId: string | null;
   readonly createdAt: string;
-};
-
-type PersistedToolRunStatusRow = ToolRunStatusTuple & {
-  readonly finishedAt: string | null;
 };
 
 export interface StartupRecoveryHooks {
@@ -164,141 +164,15 @@ const assertRecoveredSubexecutionsAreComplete = (
   },
 ): void => {
   try {
-    new ExecutionRepository(database).assertTurnExecutionOwnership({
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-    });
+    new ExecutionRecovery(database).assertSubexecutionsValid(
+      input.sessionId,
+      input.turnId,
+      input.turnFinishedAt,
+    );
   } catch (error) {
     if (error instanceof TurnTerminalizationInvariantError) {
       throw new StartupRecoveryInvariantError(
-        'already-recovered execution ownership is inconsistent',
-      );
-    }
-    throw error;
-  }
-
-  const invalid = database
-    .prepare(
-      `SELECT
-         EXISTS (
-           SELECT 1
-           FROM model_calls
-           LEFT JOIN model_attempts AS successful_attempt
-             ON successful_attempt.id = model_calls.successful_attempt_id
-           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
-             AND (
-               model_calls.status = 'running'
-               OR model_calls.finished_at IS NULL
-               OR model_calls.finished_at > ?
-               OR (
-                 model_calls.status = 'succeeded'
-                 AND (
-                   model_calls.successful_attempt_id IS NULL
-                   OR successful_attempt.status <> 'succeeded'
-                 )
-               )
-               OR (
-                 model_calls.status <> 'succeeded'
-                 AND model_calls.successful_attempt_id IS NOT NULL
-               )
-             )
-         ) AS modelCalls,
-         EXISTS (
-           SELECT 1
-           FROM model_attempts
-           JOIN model_calls ON model_calls.id = model_attempts.model_call_id
-           WHERE model_calls.session_id = ? AND model_calls.turn_id = ?
-             AND (
-               model_attempts.status = 'running'
-               OR model_attempts.finished_at IS NULL
-               OR model_attempts.finished_at > ?
-               OR (
-                 model_attempts.status = 'succeeded'
-                 AND (
-                   model_calls.successful_attempt_id IS NULL
-                   OR model_calls.successful_attempt_id <> model_attempts.id
-                 )
-               )
-             )
-         ) AS modelAttempts,
-         EXISTS (
-           SELECT 1
-           FROM tool_runs
-           WHERE tool_runs.session_id = ? AND tool_runs.turn_id = ?
-             AND (
-               tool_runs.status IN ('queued', 'running', 'cancel_requested')
-               OR tool_runs.finished_at IS NULL
-               OR tool_runs.finished_at > ?
-             )
-         ) AS toolRuns`,
-    )
-    .get(
-      input.sessionId,
-      input.turnId,
-      input.turnFinishedAt,
-      input.sessionId,
-      input.turnId,
-      input.turnFinishedAt,
-      input.sessionId,
-      input.turnId,
-      input.turnFinishedAt,
-    ) as {
-    readonly modelCalls: number;
-    readonly modelAttempts: number;
-    readonly toolRuns: number;
-  };
-  if (invalid.modelCalls || invalid.modelAttempts || invalid.toolRuns) {
-    throw new StartupRecoveryInvariantError(
-      'already-recovered subexecution projection is incomplete',
-    );
-  }
-
-  const tools = database
-    .prepare(
-      `SELECT status, execution_mode AS executionMode,
-              dispatch_state AS dispatchState, effect_state AS effectState,
-              finished_at AS finishedAt
-       FROM tool_runs
-       WHERE session_id = ? AND turn_id = ?
-       ORDER BY ordinal, id`,
-    )
-    .all(input.sessionId, input.turnId) as PersistedToolRunStatusRow[];
-  try {
-    for (const tool of tools) {
-      validateToolRunStatusTuple(tool);
-    }
-  } catch (error) {
-    if (error instanceof ToolRunStatusMatrixError) {
-      throw new StartupRecoveryInvariantError(
-        'already-recovered ToolRun status tuple is inconsistent',
-      );
-    }
-    throw error;
-  }
-};
-
-const assertToolRunsAreRecoverable = (
-  database: Database.Database,
-  sessionId: string,
-  turnId: string,
-): void => {
-  const tools = database
-    .prepare(
-      `SELECT status, execution_mode AS executionMode,
-              dispatch_state AS dispatchState, effect_state AS effectState
-       FROM tool_runs
-       WHERE session_id = ? AND turn_id = ?
-       ORDER BY ordinal, id`,
-    )
-    .all(sessionId, turnId) as ToolRunStatusTuple[];
-  try {
-    for (const tool of tools) {
-      validateToolRunStatusTuple(tool);
-    }
-  } catch (error) {
-    if (error instanceof ToolRunStatusMatrixError) {
-      throw new StartupRecoveryInvariantError(
-        'ToolRun status tuple is inconsistent',
+        'already-recovered subexecution projection is incomplete',
       );
     }
     throw error;
@@ -464,7 +338,7 @@ const assertRecoveredStatesAreComplete = (
 const inspectStartupState = (
   database: Database.Database,
   daemonEpoch: string,
-): StartupInspection | null => {
+): readonly StartupInspection[] => {
   assertRecoveredStatesAreComplete(database, daemonEpoch);
 
   const slots = database
@@ -534,107 +408,126 @@ const inspectStartupState = (
     activeSessions.length === 0 &&
     activeLeases.length === 0
   ) {
-    return null;
+    return [];
   }
-  const slot = ownedSlots[0];
   if (
-    ownedSlots.length !== 1 ||
-    slot === undefined ||
-    activeTurns.length !== 1 ||
-    activeSessions.length !== 1 ||
-    activeLeases.length !== 1
+    activeTurns.length !== ownedSlots.length ||
+    activeSessions.length !== ownedSlots.length ||
+    activeLeases.length !== ownedSlots.length ||
+    new Set(ownedSlots.map((slot) => slot.ownerTurnId)).size !== ownedSlots.length ||
+    new Set(activeTurns.map((turn) => turn.turnId)).size !== ownedSlots.length ||
+    new Set(activeSessions.map((session) => session.sessionId)).size !==
+      ownedSlots.length ||
+    new Set(activeLeases.map((lease) => lease.turnId)).size !== ownedSlots.length
   ) {
     throw new StartupRecoveryInvariantError(
-      'persistent ownership facts do not form one complete tuple',
+      'persistent ownership facts do not form complete tuples',
     );
   }
 
-  const turn = activeTurns[0] as ActiveTurnRow;
-  const session = activeSessions[0] as ActiveSessionRow;
-  const lease = activeLeases[0] as ActiveLeaseRow;
-  const expectedRuntimeStatus =
-    turn.status === 'running' ? 'running' : 'canceling';
-  if (lease.daemonEpoch === daemonEpoch) {
-    throw new StartupRecoveryInvariantError(
-      'active Lease already uses the new daemon epoch',
-    );
-  }
-  if (
-    slot.ownerTurnId !== turn.turnId ||
-    turn.queueKind !== 'normal' ||
-    turn.executionFence <= 0 ||
-    turn.startedAt === null ||
-    turn.finishedAt !== null ||
-    turn.errorCode !== null ||
-    turn.errorMessage !== null ||
-    turn.resultMessageId !== null ||
-    session.sessionId !== turn.sessionId ||
-    session.currentTurnId !== turn.turnId ||
-    session.runtimeStatus !== expectedRuntimeStatus ||
-    session.queueBlockReason !== null ||
-    lease.sessionId !== turn.sessionId ||
-    lease.turnId !== turn.turnId
-  ) {
-    throw new StartupRecoveryInvariantError(
-      'persistent ownership tuple is inconsistent',
-    );
-  }
-  assertToolRunsAreRecoverable(database, turn.sessionId, turn.turnId);
-  const identityValues = [lease.runnerInstanceId, lease.pid, lease.processStartIdentity];
-  const hasIdentity = identityValues.every((value) => value !== null);
-  if (!hasIdentity && identityValues.some((value) => value !== null)) {
-    throw new StartupRecoveryExecutorError();
-  }
-  return {
-    binding: {
-      slotNo: slot.slotNo as Claim['slotNo'],
-      sessionId: turn.sessionId,
-      turnId: turn.turnId,
-      leaseId: lease.leaseId,
-      daemonEpoch: lease.daemonEpoch,
-      leaseEpoch: lease.leaseEpoch,
-      executionFence: turn.executionFence,
-    },
-    executorIdentity: hasIdentity
-      ? {
-          pid: lease.pid as number,
-          processStartIdentity: lease.processStartIdentity as string,
-        }
-      : null,
-  };
+  const recovery = new ExecutionRecovery(database);
+  return ownedSlots.map((slot) => {
+    const turn = activeTurns.find((row) => row.turnId === slot.ownerTurnId);
+    const session = turn
+      ? activeSessions.find((row) => row.sessionId === turn.sessionId)
+      : undefined;
+    const lease = activeLeases.find((row) => row.turnId === slot.ownerTurnId);
+    const expectedRuntimeStatus =
+      turn?.status === 'running' ? 'running' : 'canceling';
+    if (
+      !turn ||
+      !session ||
+      !lease ||
+      lease.daemonEpoch === daemonEpoch ||
+      turn.queueKind !== 'normal' ||
+      turn.executionFence <= 0 ||
+      turn.startedAt === null ||
+      turn.finishedAt !== null ||
+      turn.errorCode !== null ||
+      turn.errorMessage !== null ||
+      turn.resultMessageId !== null ||
+      session.currentTurnId !== turn.turnId ||
+      session.runtimeStatus !== expectedRuntimeStatus ||
+      session.queueBlockReason !== null ||
+      lease.sessionId !== turn.sessionId ||
+      lease.turnId !== turn.turnId
+    ) {
+      throw new StartupRecoveryInvariantError(
+        'persistent ownership tuple is inconsistent',
+      );
+    }
+    try {
+      recovery.assertSubexecutionsValid(turn.sessionId, turn.turnId);
+    } catch (error) {
+      if (error instanceof TurnTerminalizationInvariantError) {
+        throw new StartupRecoveryInvariantError(
+          'active subexecution ownership is inconsistent',
+        );
+      }
+      throw error;
+    }
+    const executorIdentity: LeaseExecutorIdentity = {
+      runnerInstanceId: lease.runnerInstanceId,
+      pid: lease.pid,
+      processStartIdentity: lease.processStartIdentity,
+    };
+    const identityValues = Object.values(executorIdentity);
+    const hasIdentity = identityValues.every((value) => value !== null);
+    if (!hasIdentity && identityValues.some((value) => value !== null)) {
+      throw new StartupRecoveryExecutorError();
+    }
+    return {
+      binding: {
+        slotNo: slot.slotNo as Claim['slotNo'],
+        sessionId: turn.sessionId,
+        turnId: turn.turnId,
+        leaseId: lease.leaseId,
+        daemonEpoch: lease.daemonEpoch,
+        leaseEpoch: lease.leaseEpoch,
+        executionFence: turn.executionFence,
+      },
+      executorIdentity,
+    };
+  });
 };
 
 export const recoverStartupState: StartupRecovery = (database, options) => {
   const inspect = database.transaction(() =>
     inspectStartupState(database, options.daemonEpoch),
   );
-  const inspection = inspect.immediate();
-  if (!inspection) {
+  const inspections = inspect.immediate();
+  if (inspections.length === 0) {
     return;
   }
-  const { binding } = inspection;
-  if (inspection.executorIdentity) {
-    const state = options.inspectExecutor?.(inspection.executorIdentity) ?? 'ambiguous';
-    if (state !== 'exited') throw new StartupRecoveryExecutorError();
+  const executorStates = inspections.map(({ executorIdentity }) =>
+    hasPersistedExecutorIdentity(executorIdentity)
+      ? (options.inspectExecutor?.(executorIdentity) ?? 'ambiguous')
+      : 'exited',
+  );
+  if (executorStates.some((state) => state !== 'exited')) {
+    throw new StartupRecoveryExecutorError();
   }
 
   const terminalizer = new TurnTerminalizer(database, {
     ...(options.now ? { now: options.now } : {}),
     ...(options.createId ? { createId: options.createId } : {}),
-    hooks: {
-      afterWriteGroup: (group) => {
-        if (group === 'events') {
-          options.hooks?.beforeCommit?.({
-            sessionId: binding.sessionId,
-            turnId: binding.turnId,
-          });
-        }
-      },
+    beforeCommit: () => {
+      const first = inspections[0];
+      if (!first) {
+        throw new StartupRecoveryInvariantError('recovery batch is unexpectedly empty');
+      }
+      options.hooks?.beforeCommit?.({
+        sessionId: first.binding.sessionId,
+        turnId: first.binding.turnId,
+      });
     },
   });
-  terminalizer.interrupt({
-    binding,
-    reason: 'daemon_restart',
-    executorExited: true,
-  });
+  terminalizer.interruptMany(
+    inspections.map(({ binding, executorIdentity }) => ({
+      binding,
+      reason: 'daemon_restart',
+      executorExited: true,
+      expectedExecutorIdentity: executorIdentity,
+    })),
+  );
 };
