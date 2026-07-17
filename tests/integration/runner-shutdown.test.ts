@@ -10,6 +10,10 @@ import {
   WorkspaceRegisterResultSchema,
   type RpcRequestEnvelope,
 } from '../../packages/protocol/src/index.js';
+import type {
+  RunnerBinding,
+  RunnerRequest,
+} from '../../packages/protocol/src/runner.js';
 import {
   connectRpcClient,
   type RpcClient,
@@ -23,7 +27,7 @@ import type {
   ExecutionDriver,
   ExecutionRun,
 } from '../../services/daemon/src/runtime/execution-coordinator.js';
-import { Scheduler } from '../../services/daemon/src/runtime/scheduler.js';
+import { Scheduler, type Claim } from '../../services/daemon/src/runtime/scheduler.js';
 import { SessionService } from '../../services/daemon/src/runtime/session-service.js';
 import { DaemonServer } from '../../services/daemon/src/server.js';
 
@@ -34,7 +38,6 @@ type Deferred<Value> = {
 };
 
 type BlockingModelAdapter = {
-  readonly started: Promise<void>;
   call(input: { readonly signal: AbortSignal }): Promise<never>;
 };
 
@@ -42,7 +45,7 @@ type RunnerSupervisorModule = {
   createRunnerExecutionDriver(options: {
     readonly dataDir: string;
     readonly runnerEntryPoint: string;
-    readonly modelAdapter: BlockingModelAdapter;
+    readonly modelAdapter: unknown;
     readonly provider: {
       readonly endpoint: string;
       readonly modelId: string;
@@ -52,6 +55,13 @@ type RunnerSupervisorModule = {
       readonly onPhase: (phase: string) => void;
     };
   }): ExecutionDriver;
+};
+
+type DriverWithSupervisor = ExecutionDriver & {
+  supervisor: {
+    createBinding(claim: Claim): RunnerBinding;
+    start(binding: RunnerBinding): Promise<unknown>;
+  };
 };
 
 const MODULE_PATH = '../../services/daemon/src/runtime/runner-supervisor.js';
@@ -87,6 +97,116 @@ class BlockedAdapter implements BlockingModelAdapter {
         { once: true },
       );
     });
+  }
+}
+
+class ConcurrentBlockedAdapter implements BlockingModelAdapter {
+  private readonly startedBarrier = deferred<void>();
+  private callCount = 0;
+
+  get started(): Promise<void> {
+    return this.startedBarrier.promise;
+  }
+
+  async call(input: { readonly signal: AbortSignal }): Promise<never> {
+    this.callCount += 1;
+    if (this.callCount === 2) this.startedBarrier.resolve(undefined);
+    return await new Promise<never>((_resolve, reject) => {
+      input.signal.addEventListener(
+        'abort',
+        () => reject(Object.assign(new Error('aborted'), { code: 'MODEL_STREAM_INTERRUPTED' })),
+        { once: true },
+      );
+    });
+  }
+}
+
+const runnerRequest = (
+  binding: RunnerBinding,
+  method: 'runner.ready' | 'model.call' | 'turn.complete',
+  payload: Record<string, unknown>,
+): RunnerRequest =>
+  ({
+    kind: 'request',
+    protocolVersion: 1,
+    requestId: `${binding.runnerInstanceId}-${method}`,
+    traceId: `${binding.runnerInstanceId}-trace`,
+    sessionId: binding.sessionId,
+    turnId: binding.turnId,
+    method,
+    payload,
+  }) as RunnerRequest;
+
+class DeferredRunnerExecution {
+  private readonly completionBarrier = deferred<{
+    readonly code: number | null;
+    readonly signal: NodeJS.Signals | null;
+  }>();
+  private readonly terminalCommittedBarrier = deferred<void>();
+  private readonly requests: RunnerRequest[];
+  private nextRequestResolve: ((request: RunnerRequest) => void) | undefined;
+
+  readonly ready = Promise.resolve();
+  readonly completion = this.completionBarrier.promise;
+  readonly terminalCommitted = this.terminalCommittedBarrier.promise;
+
+  constructor(private readonly binding: RunnerBinding) {
+    this.requests = [runnerRequest(binding, 'runner.ready', {})];
+  }
+
+  nextRequest(): Promise<RunnerRequest> {
+    const next = this.requests.shift();
+    if (next) return Promise.resolve(next);
+    return new Promise<RunnerRequest>((resolvePromise) => {
+      this.nextRequestResolve = resolvePromise;
+    });
+  }
+
+  respond(response: unknown): void {
+    const method =
+      typeof response === 'object' && response !== null && 'method' in response
+        ? response.method
+        : undefined;
+    if (method === 'model.call') {
+      const result =
+        typeof response === 'object' && response !== null && 'result' in response
+          ? response.result
+          : undefined;
+      const modelAttemptId =
+        typeof result === 'object' && result !== null && 'modelAttemptId' in result
+          ? result.modelAttemptId
+          : undefined;
+      if (typeof modelAttemptId === 'string') {
+        this.enqueue(runnerRequest(this.binding, 'turn.complete', { modelAttemptId }));
+      }
+    }
+    if (method === 'turn.complete') this.terminalCommittedBarrier.resolve(undefined);
+  }
+
+  beginCompletion(): void {
+    this.enqueue(runnerRequest(this.binding, 'model.call', { messages: [] }));
+  }
+
+  releaseCompletion(): void {
+    this.completionBarrier.resolve({ code: 0, signal: null });
+  }
+
+  fence(): void {}
+
+  closeDaemonInput(): void {}
+
+  kill(): void {
+    this.releaseCompletion();
+  }
+
+  private enqueue(request: RunnerRequest): void {
+    const resolvePromise = this.nextRequestResolve;
+    this.nextRequestResolve = undefined;
+    if (resolvePromise) {
+      resolvePromise(request);
+    } else {
+      this.requests.push(request);
+    }
   }
 }
 
@@ -204,12 +324,231 @@ describe('Daemon shutdown with an active Runner', () => {
     }
   });
 
-  it('quiesces, fences, aborts, reaps, atomically interrupts, then closes SQLite and the lock', async () => {
+  it('starts two distinct claims through the production Driver before either run settles', async () => {
+    const { createRunnerExecutionDriver } = await loadSupervisor();
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const workspacePath = join(runtime.rootDir, 'concurrent-driver-workspace');
+    mkdirSync(workspacePath);
+    const sessions = new SessionService(database);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'concurrent-driver-workspace',
+    );
+    sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'First driver execution',
+        prompt: 'Run with the second execution',
+      },
+      'concurrent-driver-first',
+    );
+    sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Second driver execution',
+        prompt: 'Run with the first execution',
+      },
+      'concurrent-driver-second',
+    );
+    const scheduler = new Scheduler(database, { daemonEpoch: 'concurrent-driver-daemon' });
+    const first = scheduler.claimNext();
+    const second = scheduler.claimNext();
+    database.close();
+    if (!first || !second) throw new Error('Expected two concurrent claims');
+
+    const adapter = new ConcurrentBlockedAdapter();
+    const executionDriver = createRunnerExecutionDriver({
+      dataDir: runtime.dataDir,
+      runnerEntryPoint,
+      modelAdapter: adapter,
+      provider: {
+        endpoint: 'https://provider.example.test/v1/chat/completions',
+        modelId: 'concurrent-driver-model',
+        apiKey: 'concurrent-driver-key',
+      },
+    });
+
+    try {
+      const [firstRun, secondRun] = await Promise.all([
+        executionDriver.start(first),
+        executionDriver.start(second),
+      ]);
+      await adapter.started;
+
+      expect(firstRun).toBeDefined();
+      expect(secondRun).toBeDefined();
+    } finally {
+      await executionDriver.shutdown();
+    }
+  });
+
+  it('isolates one concurrent start failure while the other run remains live', async () => {
+    const { createRunnerExecutionDriver } = await loadSupervisor();
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const workspacePath = join(runtime.rootDir, 'isolated-start-failure-workspace');
+    mkdirSync(workspacePath);
+    const sessions = new SessionService(database);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'isolated-start-failure-workspace',
+    );
+    sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Rejected driver execution',
+        prompt: 'Fail launch marker only',
+      },
+      'isolated-start-failure-first',
+    );
+    sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Live driver execution',
+        prompt: 'Remain live after the other start fails',
+      },
+      'isolated-start-failure-second',
+    );
+    const scheduler = new Scheduler(database, { daemonEpoch: 'isolated-start-failure-daemon' });
+    const first = scheduler.claimNext();
+    const second = scheduler.claimNext();
+    database.close();
+    if (!first || !second) throw new Error('Expected two concurrent claims');
+
+    const adapter = new BlockedAdapter();
+    const executionDriver = createRunnerExecutionDriver({
+      dataDir: runtime.dataDir,
+      runnerEntryPoint,
+      modelAdapter: adapter,
+      provider: {
+        endpoint: 'https://provider.example.test/v1/chat/completions',
+        modelId: 'isolated-start-failure-model',
+        apiKey: 'isolated-start-failure-key',
+      },
+    });
+
+    try {
+      const rejected = executionDriver.start({ ...first, leaseId: 'missing-lease' });
+      const live = executionDriver.start(second);
+
+      await expect(rejected).rejects.toMatchObject({
+        code: 'RUNNER_LAUNCH_MARKER_PERSIST_FAILED',
+      });
+      const liveRun = await live;
+      await adapter.started;
+      expect(liveRun).toBeDefined();
+    } finally {
+      await executionDriver.shutdown();
+    }
+  });
+
+  it('keeps a slot-reusing run registered after an older completion settles late', async () => {
+    const { createRunnerExecutionDriver } = await loadSupervisor();
+    runtime = createTempRuntime();
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const workspacePath = join(runtime.rootDir, 'late-completion-workspace');
+    mkdirSync(workspacePath);
+    const sessions = new SessionService(database);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'late-completion-workspace',
+    );
+    for (const [title, clientRequestId] of [
+      ['Delayed completion', 'late-completion-first'],
+      ['Other slot occupant', 'late-completion-second'],
+      ['Slot reuser', 'late-completion-third'],
+    ] as const) {
+      sessions.createSession(
+        { workspaceId: workspace.workspaceId, title, prompt: title },
+        clientRequestId,
+      );
+    }
+    const scheduler = new Scheduler(database, { daemonEpoch: 'late-completion-daemon' });
+    const first = scheduler.claimNext();
+    const occupiedSecondSlot = scheduler.claimNext();
+    if (!first || !occupiedSecondSlot) throw new Error('Expected two occupied slots');
+
+    const executions = new Map<string, DeferredRunnerExecution>();
+    let runnerOrdinal = 0;
+    const executionDriver = createRunnerExecutionDriver({
+      dataDir: runtime.dataDir,
+      runnerEntryPoint,
+      modelAdapter: {
+        call: async () => ({
+          finishReason: 'stop' as const,
+          content: 'done',
+          toolCalls: [],
+          providerRequestId: 'deferred-runner',
+          usage: null,
+        }),
+      },
+      provider: {
+        endpoint: 'https://provider.example.test/v1/chat/completions',
+        modelId: 'late-completion-model',
+        apiKey: 'late-completion-key',
+      },
+    }) as DriverWithSupervisor;
+    Object.defineProperty(executionDriver, 'supervisor', {
+      value: {
+        createBinding: (claim: Claim): RunnerBinding => {
+          runnerOrdinal += 1;
+          return {
+            runnerInstanceId: `deferred-runner-${String(runnerOrdinal)}`,
+            capability: 'deferred-capability',
+            daemonEpoch: claim.daemonEpoch,
+            sessionId: claim.sessionId,
+            turnId: claim.turnId,
+            leaseId: claim.leaseId,
+            leaseEpoch: claim.leaseEpoch,
+            executionFence: claim.executionFence,
+          };
+        },
+        start: async (binding: RunnerBinding) => {
+          const execution = new DeferredRunnerExecution(binding);
+          executions.set(binding.turnId, execution);
+          return execution;
+        },
+      },
+    });
+
+    try {
+      await executionDriver.start(first);
+      const firstExecution = executions.get(first.turnId);
+      if (!firstExecution) throw new Error('Expected first deferred execution');
+      firstExecution.beginCompletion();
+      await firstExecution.terminalCommitted;
+
+      const reuser = scheduler.claimNext();
+      if (!reuser) throw new Error('Expected a claim for the released first slot');
+      expect(reuser.slotNo).toBe(first.slotNo);
+      expect(reuser.turnId).not.toBe(first.turnId);
+      const reuserRun = await executionDriver.start(reuser);
+      const reuserExecution = executions.get(reuser.turnId);
+      if (!reuserExecution) throw new Error('Expected slot-reusing deferred execution');
+
+      firstExecution.releaseCompletion();
+      await Promise.resolve();
+      await expect(executionDriver.start(reuser)).rejects.toMatchObject({
+        code: 'RUNNER_START_REJECTED',
+      });
+
+      reuserExecution.beginCompletion();
+      await reuserExecution.terminalCommitted;
+      reuserExecution.releaseCompletion();
+      await reuserRun.completion;
+    } finally {
+      await executionDriver.shutdown();
+      database.close();
+    }
+  });
+
+  it('quiesces, fences, aborts, reaps, and interrupts every active Runner before closing SQLite and the lock', async () => {
     await loadSupervisor();
     const { createRunnerExecutionDriver } = await loadSupervisor();
     runtime = createTempRuntime();
     const phases: string[] = [];
-    const adapter = new BlockedAdapter();
+    const adapter = new ConcurrentBlockedAdapter();
     const executionDriver = createRunnerExecutionDriver({
       dataDir: runtime.dataDir,
       runnerEntryPoint,
@@ -244,12 +583,12 @@ describe('Daemon shutdown with an active Runner', () => {
         ).toEqual({ count: 0 });
         expect(
           database.prepare("SELECT COUNT(*) AS count FROM model_calls WHERE status = 'interrupted'").get(),
-        ).toEqual({ count: 1 });
+        ).toEqual({ count: 2 });
         expect(
           database
             .prepare("SELECT COUNT(*) AS count FROM model_attempts WHERE status = 'interrupted'")
             .get(),
-        ).toEqual({ count: 1 });
+        ).toEqual({ count: 2 });
         expect(
           database.prepare("SELECT COUNT(*) AS count FROM session_events WHERE type = 'model.failed'").get(),
         ).toEqual({ count: 0 });
@@ -293,6 +632,22 @@ describe('Daemon shutdown with an active Runner', () => {
       throw new Error('session.create failed');
     }
     const created = SessionCreateResultSchema.parse(sessionResponse.result);
+    const secondSessionResponse = await client.sendRequest(
+      mutationRequest(
+        client,
+        'session.create',
+        {
+          workspaceId: workspace.workspaceId,
+          title: 'Second Shutdown Runner',
+          prompt: 'Block alongside the first streamed model request',
+        },
+        'shutdown-session-second',
+      ),
+    );
+    if (!secondSessionResponse.ok) {
+      throw new Error('second session.create failed');
+    }
+    const secondCreated = SessionCreateResultSchema.parse(secondSessionResponse.result);
     await adapter.started;
 
     await server.stop();
@@ -301,8 +656,12 @@ describe('Daemon shutdown with an active Runner', () => {
     expect(phases).toEqual([
       'coordinator.quiesced',
       'runner.fenced',
+      'runner.fenced',
+      'model.abort_requested',
       'model.abort_requested',
       'runner.reaped',
+      'runner.reaped',
+      'turn.interrupted_committed',
       'turn.interrupted_committed',
       'database.close',
       'runtime_lock.released',
@@ -312,6 +671,9 @@ describe('Daemon shutdown with an active Runner', () => {
     try {
       expect(
         inspection.prepare('SELECT status FROM turns WHERE id = ?').get(created.turnId),
+      ).toEqual({ status: 'interrupted' });
+      expect(
+        inspection.prepare('SELECT status FROM turns WHERE id = ?').get(secondCreated.turnId),
       ).toEqual({ status: 'interrupted' });
       expect(
         inspection

@@ -141,11 +141,11 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     authenticatedConnections = 1;
     coordinator.notify();
     await waitFor(() => driver.started.length === 1, 'first authenticated claim');
-    expect(scheduler.claimCalls).toBe(1);
+    expect(scheduler.claimCalls).toBe(2);
   });
 
-  it('coalesces 100 synchronous notifications and never starts two drains', async () => {
-    const scheduler = new FakeScheduler(claim(1), claim(2));
+  it('coalesces 100 synchronous notifications into one drain', async () => {
+    const scheduler = new FakeScheduler(claim(1), null);
     const driver = new ControlledDriver();
     let concurrentStarts = 0;
     let maxConcurrentStarts = 0;
@@ -174,19 +174,19 @@ describe('ExecutionCoordinator level-triggered drain', () => {
       coordinator.notify();
     }
     await waitFor(() => driver.started.length === 1, 'coalesced execution start');
-    expect(scheduler.claimCalls).toBe(1);
+    expect(scheduler.claimCalls).toBe(2);
     expect(maxConcurrentStarts).toBe(1);
 
     coordinator.notify();
     await settleScheduledWork();
-    expect(scheduler.claimCalls).toBe(1);
+    expect(scheduler.claimCalls).toBe(3);
     expect(driver.started).toHaveLength(1);
   });
 
   it('atomically fails a pre-READY start error and accepts a later wake', async () => {
     const first = claim(1);
     const second = claim(2);
-    const scheduler = new FakeScheduler(first, second);
+    const scheduler = new FakeScheduler(first, null);
     const driver = new ControlledDriver();
     const failures: Array<{
       readonly binding: Claim;
@@ -223,13 +223,16 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     ]);
     expect(errors).toEqual([]);
 
+    scheduler.pending.push(second);
     coordinator.notify();
     await waitFor(() => driver.started.length === 2, 'second driver start');
     expect(driver.started[1]?.claim).toEqual(second);
   });
 
-  it('keeps the slot level dirty until terminal commit and Runner reap', async () => {
-    const scheduler = new FakeScheduler(claim(1), claim(2));
+  it('starts two claims before either pre-READY start settles', async () => {
+    const first = claim(1);
+    const second = claim(2);
+    const scheduler = new FakeScheduler(first, second, null);
     const driver = new ControlledDriver();
     const coordinator = track(
       new ExecutionCoordinator({
@@ -241,18 +244,113 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     );
 
     coordinator.notify();
-    await waitFor(() => driver.started.length === 1, 'first driver start');
-    const first = driver.started[0] as StartedExecution;
-    first.start.resolve({ completion: first.completion.promise });
-    await settleScheduledWork();
+    await waitFor(() => driver.started.length === 2, 'two concurrent driver starts');
+
+    expect(driver.started.map((started) => started.claim)).toEqual([first, second]);
+  });
+
+  it('terminalizes only the rejected claim while another start remains pending', async () => {
+    const first = claim(1);
+    const second = claim(2);
+    const scheduler = new FakeScheduler(first, second, null);
+    const driver = new ControlledDriver();
+    const failures: Array<{
+      readonly binding: Claim;
+      readonly errorCode: string;
+      readonly errorMessage: string;
+    }> = [];
+    const coordinator = track(
+      new ExecutionCoordinator({
+        scheduler,
+        executionDriver: driver,
+        terminalizer: {
+          fail: (failure) => {
+            failures.push(failure);
+          },
+        },
+        authenticatedControlConnectionCount: () => 1,
+      }),
+    );
 
     coordinator.notify();
-    await settleScheduledWork();
-    expect(scheduler.claimCalls).toBe(1);
+    await waitFor(() => driver.started.length === 2, 'two concurrent driver starts');
+    const firstStarted = driver.started[0] as StartedExecution;
+    const secondStarted = driver.started[1] as StartedExecution;
+    firstStarted.start.reject(new Error('first start failed'));
+    await waitFor(() => failures.length === 1, 'first start terminalization');
 
-    first.completion.resolve(undefined);
-    await waitFor(() => driver.started.length === 2, 'claim after Runner reap');
-    expect(scheduler.claimCalls).toBe(2);
+    expect(failures[0]?.binding).toEqual(first);
+    secondStarted.start.resolve({ completion: secondStarted.completion.promise });
+    await settleScheduledWork();
+    expect(failures).toHaveLength(1);
+  });
+
+  it('claims released capacity after terminalizing a failed start without another notify', async () => {
+    const first = claim(1);
+    const second = claim(2);
+    const third = claim(3);
+    const scheduler = new FakeScheduler(first, second, null);
+    const driver = new ControlledDriver();
+    const failures: Array<{
+      readonly binding: Claim;
+      readonly errorCode: string;
+      readonly errorMessage: string;
+    }> = [];
+    const coordinator = track(
+      new ExecutionCoordinator({
+        scheduler,
+        executionDriver: driver,
+        terminalizer: {
+          fail: (failure) => {
+            failures.push(failure);
+            scheduler.pending.push(third);
+          },
+        },
+        authenticatedControlConnectionCount: () => 1,
+      }),
+    );
+
+    coordinator.notify();
+    await waitFor(() => driver.started.length === 2, 'initial concurrent starts');
+    const firstStarted = driver.started[0] as StartedExecution;
+    const secondStarted = driver.started[1] as StartedExecution;
+    secondStarted.start.resolve({ completion: secondStarted.completion.promise });
+    await settleScheduledWork();
+
+    firstStarted.start.reject(new Error('first start failed'));
+    await waitFor(() => driver.started.length === 3, 'capacity refill after failure');
+
+    expect(failures[0]?.binding).toEqual(first);
+    expect(driver.started[2]?.claim).toEqual(third);
+  });
+
+  it('claims a third item after one active completion settles', async () => {
+    const first = claim(1);
+    const second = claim(2);
+    const third = claim(3);
+    const scheduler = new FakeScheduler(first, second, null);
+    const driver = new ControlledDriver();
+    const coordinator = track(
+      new ExecutionCoordinator({
+        scheduler,
+        executionDriver: driver,
+        terminalizer: { fail: () => undefined },
+        authenticatedControlConnectionCount: () => 1,
+      }),
+    );
+
+    coordinator.notify();
+    await waitFor(() => driver.started.length === 2, 'initial two starts');
+    const firstStarted = driver.started[0] as StartedExecution;
+    const secondStarted = driver.started[1] as StartedExecution;
+    firstStarted.start.resolve({ completion: firstStarted.completion.promise });
+    secondStarted.start.resolve({ completion: secondStarted.completion.promise });
+    await settleScheduledWork();
+
+    scheduler.pending.push(third);
+    firstStarted.completion.resolve(undefined);
+    await waitFor(() => driver.started.length === 3, 'third claim after completion');
+    expect(driver.started[2]?.claim).toEqual(third);
   });
 
   it('quiesce permanently prevents new claims, including an already scheduled drain', async () => {
@@ -276,8 +374,8 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     expect(driver.started).toEqual([]);
   });
 
-  it('joins only after a pending start and its active completion both settle', async () => {
-    const scheduler = new FakeScheduler(claim(1));
+  it('joins only after every pending start and active completion settles', async () => {
+    const scheduler = new FakeScheduler(claim(1), claim(2), null);
     const driver = new ControlledDriver();
     const coordinator = track(
       new ExecutionCoordinator({
@@ -289,7 +387,7 @@ describe('ExecutionCoordinator level-triggered drain', () => {
     );
 
     coordinator.notify();
-    await waitFor(() => driver.started.length === 1, 'deferred driver start');
+    await waitFor(() => driver.started.length === 2, 'deferred driver starts');
     coordinator.quiesce();
     const joining = coordinator.join();
     let joined = false;
@@ -299,12 +397,18 @@ describe('ExecutionCoordinator level-triggered drain', () => {
 
     await settleScheduledWork();
     expect(joined).toBe(false);
-    const started = driver.started[0] as StartedExecution;
-    started.start.resolve({ completion: started.completion.promise });
+    const firstStarted = driver.started[0] as StartedExecution;
+    const secondStarted = driver.started[1] as StartedExecution;
+    firstStarted.start.resolve({ completion: firstStarted.completion.promise });
+    secondStarted.start.resolve({ completion: secondStarted.completion.promise });
     await settleScheduledWork();
     expect(joined).toBe(false);
 
-    started.completion.resolve(undefined);
+    firstStarted.completion.resolve(undefined);
+    await settleScheduledWork();
+    expect(joined).toBe(false);
+
+    secondStarted.completion.resolve(undefined);
     await joining;
     expect(joined).toBe(true);
   });
@@ -354,7 +458,7 @@ describe('ExecutionCoordinator level-triggered drain', () => {
       coordinator.notify();
       await waitFor(() => driver.started.length === 1, 'retry after gate recovery');
       expect(gateCalls).toBe(2);
-      expect(scheduler.claimCalls).toBe(1);
+      expect(scheduler.claimCalls).toBe(2);
       const started = driver.started[0] as StartedExecution;
       started.start.resolve({ completion: started.completion.promise });
       started.completion.resolve(undefined);

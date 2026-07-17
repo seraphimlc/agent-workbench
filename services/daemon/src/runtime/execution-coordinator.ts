@@ -38,6 +38,18 @@ export interface ExecutionCoordinatorOptions {
   readonly onError?: (error: unknown) => void;
 }
 
+type StartingExecution = {
+  readonly claim: Claim;
+};
+
+type ActiveExecution = {
+  readonly claim: Claim;
+  readonly execution: ExecutionRun;
+};
+
+const claimKey = (claim: Claim): string =>
+  JSON.stringify([claim.turnId, claim.leaseId, claim.executionFence]);
+
 export class ExecutionCoordinator {
   private readonly scheduler: CoordinatorScheduler;
   private readonly authenticatedControlConnectionCount: () => number;
@@ -48,7 +60,8 @@ export class ExecutionCoordinator {
   private dirty = false;
   private drainScheduled = false;
   private draining = false;
-  private activeRunner = false;
+  private readonly starting = new Map<string, StartingExecution>();
+  private readonly active = new Map<string, ActiveExecution>();
   private readonly joinWaiters = new Set<() => void>();
 
   constructor(options: ExecutionCoordinatorOptions) {
@@ -103,10 +116,11 @@ export class ExecutionCoordinator {
     this.draining = true;
     let gatesPassed = false;
     try {
+      const executionDriver = this.executionDriver;
+      const terminalizer = this.terminalizer;
       if (
-        this.activeRunner ||
-        !this.executionDriver ||
-        !this.terminalizer ||
+        !executionDriver ||
+        !terminalizer ||
         this.authenticatedControlConnectionCount() <= 0 ||
         !this.running
       ) {
@@ -114,26 +128,12 @@ export class ExecutionCoordinator {
       }
       gatesPassed = true;
       this.dirty = false;
-      const claim = this.scheduler.claimNext();
-      if (!claim || !this.running) {
-        return;
-      }
-      this.activeRunner = true;
-      try {
-        const execution = await this.executionDriver.start(claim);
-        this.observeCompletion(execution);
-      } catch {
-        try {
-          this.terminalizer.fail({
-            binding: claim,
-            errorCode: 'RUNNER_START_FAILED',
-            errorMessage: 'Runner failed to start',
-          });
-        } catch (error) {
-          this.reportError(error);
-        } finally {
-          this.activeRunner = false;
+      while (this.running) {
+        const claim = this.scheduler.claimNext();
+        if (!claim) {
+          break;
         }
+        this.startClaim(claim, executionDriver, terminalizer);
       }
     } catch (error) {
       if (!gatesPassed) {
@@ -145,8 +145,7 @@ export class ExecutionCoordinator {
       if (
         gatesPassed &&
         this.running &&
-        this.dirty &&
-        !this.activeRunner
+        this.dirty
       ) {
         this.scheduleDrain();
       }
@@ -154,26 +153,102 @@ export class ExecutionCoordinator {
     }
   }
 
-  private observeCompletion(execution: ExecutionRun): void {
-    void execution.completion.then(
+  private startClaim(
+    claim: Claim,
+    executionDriver: ExecutionDriver,
+    terminalizer: StartFailureTerminalizer,
+  ): void {
+    const key = claimKey(claim);
+    const starting: StartingExecution = { claim };
+    this.starting.set(key, starting);
+    void Promise.resolve()
+      .then(() => executionDriver.start(claim))
+      .then(
+        (execution) => {
+          this.promoteStart(key, starting, execution);
+        },
+        () => {
+          this.failStart(key, starting, terminalizer);
+        },
+      )
+      .catch((error: unknown) => {
+        this.reportError(error);
+      });
+  }
+
+  private promoteStart(
+    key: string,
+    starting: StartingExecution,
+    execution: ExecutionRun,
+  ): void {
+    if (this.starting.get(key) !== starting) {
+      return;
+    }
+    this.starting.delete(key);
+    const active: ActiveExecution = { claim: starting.claim, execution };
+    this.active.set(key, active);
+    this.observeCompletion(key, active);
+    this.settleJoinWaiters();
+  }
+
+  private failStart(
+    key: string,
+    starting: StartingExecution,
+    terminalizer: StartFailureTerminalizer,
+  ): void {
+    if (this.starting.get(key) !== starting) {
+      return;
+    }
+    this.starting.delete(key);
+    let terminalized = false;
+    try {
+      terminalizer.fail({
+        binding: starting.claim,
+        errorCode: 'RUNNER_START_FAILED',
+        errorMessage: 'Runner failed to start',
+      });
+      terminalized = true;
+    } catch (error) {
+      this.reportError(error);
+    }
+    if (terminalized && this.running) {
+      this.dirty = true;
+      this.scheduleDrain();
+    }
+    this.settleJoinWaiters();
+  }
+
+  private observeCompletion(key: string, active: ActiveExecution): void {
+    void active.execution.completion.then(
       () => {
-        this.activeRunner = false;
-        if (this.running) {
-          this.dirty = true;
-          this.scheduleDrain();
-        }
-        this.settleJoinWaiters();
+        this.settleCompletion(key, active, false);
       },
       (error: unknown) => {
-        this.activeRunner = false;
-        this.reportError(error);
-        if (this.running) {
-          this.dirty = true;
-          this.scheduleDrain();
-        }
-        this.settleJoinWaiters();
+        this.settleCompletion(key, active, true, error);
       },
-    );
+    ).catch((error: unknown) => {
+      this.reportError(error);
+    });
+  }
+
+  private settleCompletion(
+    key: string,
+    active: ActiveExecution,
+    rejected: boolean,
+    error?: unknown,
+  ): void {
+    if (this.active.get(key) !== active) {
+      return;
+    }
+    this.active.delete(key);
+    if (rejected) {
+      this.reportError(error);
+    }
+    if (this.running) {
+      this.dirty = true;
+      this.scheduleDrain();
+    }
+    this.settleJoinWaiters();
   }
 
   private isJoined(): boolean {
@@ -181,7 +256,8 @@ export class ExecutionCoordinator {
       !this.running &&
       !this.drainScheduled &&
       !this.draining &&
-      !this.activeRunner
+      this.starting.size === 0 &&
+      this.active.size === 0
     );
   }
 

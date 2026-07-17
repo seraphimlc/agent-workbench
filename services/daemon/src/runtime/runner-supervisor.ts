@@ -518,6 +518,7 @@ type DriverHooks = {
 };
 
 type DriverActiveRun = {
+  readonly key: string;
   readonly claim: Claim;
   readonly binding: RunnerBinding;
   readonly execution: RunnerExecution;
@@ -529,12 +530,16 @@ type DriverActiveRun = {
 };
 
 type DriverPendingStart = {
+  readonly key: string;
   readonly claim: Claim;
   readonly completion: Deferred<void>;
   promise?: Promise<ExecutionRun>;
   execution?: RunnerExecution;
   terminalCommitted: boolean;
 };
+
+const executionKey = (claim: Claim): string =>
+  `${claim.turnId}:${claim.leaseId}:${String(claim.executionFence)}`;
 
 const successResponse = (request: RunnerRequest, result: unknown): unknown => ({
   kind: 'response',
@@ -561,8 +566,8 @@ class RunnerExecutionDriver implements ExecutionDriver {
   private readonly secrets: readonly string[];
   private databasePromise: Promise<Database.Database> | undefined;
   private database: Database.Database | undefined;
-  private pendingStart: DriverPendingStart | undefined;
-  private active: DriverActiveRun | undefined;
+  private readonly pendingStarts = new Map<string, DriverPendingStart>();
+  private readonly activeRuns = new Map<string, DriverActiveRun>();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | undefined;
 
@@ -610,15 +615,17 @@ class RunnerExecutionDriver implements ExecutionDriver {
   }
 
   start(claim: Claim): Promise<ExecutionRun> {
-    if (this.shuttingDown || this.pendingStart || this.active) {
+    const key = executionKey(claim);
+    if (this.shuttingDown || this.pendingStarts.has(key) || this.activeRuns.has(key)) {
       return Promise.reject(codedError('RUNNER_START_REJECTED'));
     }
     const pending: DriverPendingStart = {
+      key,
       claim,
       completion: deferred<void>(),
       terminalCommitted: false,
     };
-    this.pendingStart = pending;
+    this.pendingStarts.set(key, pending);
     const promise = this.performStart(pending);
     pending.promise = promise;
     return promise;
@@ -665,6 +672,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
       return await this.cancelPendingStart(pending, database);
     }
     const active: DriverActiveRun = {
+      key: pending.key,
       claim,
       binding,
       execution: pending.execution,
@@ -674,14 +682,16 @@ class RunnerExecutionDriver implements ExecutionDriver {
       fenced: false,
       terminalCommitted: false,
     };
-    this.active = active;
+    this.activeRuns.set(active.key, active);
     active.loop = this.run(active);
     return { completion: active.completion.promise };
     } catch (error) {
       pending.completion.reject(error);
       throw error;
     } finally {
-      if (this.pendingStart === pending) this.pendingStart = undefined;
+      if (this.pendingStarts.get(pending.key) === pending) {
+        this.pendingStarts.delete(pending.key);
+      }
     }
   }
 
@@ -796,51 +806,92 @@ class RunnerExecutionDriver implements ExecutionDriver {
       if (!this.shuttingDown) {
         if (active.terminalCommitted) active.completion.resolve(undefined);
         else active.completion.reject(terminalError ?? codedError('RUNNER_EXECUTION_FAILED'));
-        if (this.active === active) this.active = undefined;
+        if (this.activeRuns.get(active.key) === active) {
+          this.activeRuns.delete(active.key);
+        }
       }
     }
   }
 
   private async performShutdown(): Promise<void> {
     this.shuttingDown = true;
-    const pending = this.pendingStart;
-    let pendingError: unknown;
-    if (pending?.promise) {
+    const pending = [...this.pendingStarts.values()];
+    const active = [...this.activeRuns.values()];
+    let firstCleanupError: unknown;
+    const captureCleanupError = (error: unknown): void => {
+      firstCleanupError ??= error;
+    };
+
+    for (const activeRun of active) {
+      activeRun.fenced = true;
       try {
-        await pending.promise;
+        activeRun.execution.fence();
+        this.hooks.onPhase?.('runner.fenced');
       } catch (error) {
-        pendingError = error;
+        captureCleanupError(error);
       }
     }
-    const active = this.active;
-    if (active) {
-      active.fenced = true;
-      active.execution.fence();
-      this.hooks.onPhase?.('runner.fenced');
-      active.modelAbort?.abort();
-      this.hooks.onPhase?.('model.abort_requested');
-      active.execution.kill('SIGTERM');
-      await active.execution.completion;
+    for (const activeRun of active) {
+      try {
+        activeRun.modelAbort?.abort();
+        this.hooks.onPhase?.('model.abort_requested');
+      } catch (error) {
+        captureCleanupError(error);
+      }
+    }
+    for (const activeRun of active) {
+      try {
+        activeRun.execution.kill('SIGTERM');
+      } catch (error) {
+        captureCleanupError(error);
+      }
+    }
+
+    const settlements = await Promise.allSettled([
+      ...pending.flatMap((pendingStart) =>
+        pendingStart.promise ? [pendingStart.promise] : [],
+      ),
+      ...active.flatMap((activeRun) => [activeRun.execution.completion, activeRun.loop]),
+    ]);
+    for (const settlement of settlements) {
+      if (settlement.status === 'rejected') captureCleanupError(settlement.reason);
+    }
+    for (let remaining = active.length; remaining > 0; remaining -= 1) {
       this.hooks.onPhase?.('runner.reaped');
-      await active.loop.catch(() => undefined);
-      if (!active.terminalCommitted) {
-        const database = await this.getDatabase();
-        new TurnTerminalizer(database).interrupt({
-          binding: active.claim,
-          reason: 'daemon_shutdown',
-          executorExited: true,
-        });
-        active.terminalCommitted = true;
+    }
+    for (const activeRun of active) {
+      if (!activeRun.terminalCommitted) {
+        try {
+          const database = await this.getDatabase();
+          new TurnTerminalizer(database).interrupt({
+            binding: activeRun.claim,
+            reason: 'daemon_shutdown',
+            executorExited: true,
+          });
+          activeRun.terminalCommitted = true;
+        } catch (error) {
+          captureCleanupError(error);
+        }
       }
-      this.hooks.onPhase?.('turn.interrupted_committed');
-      active.completion.resolve(undefined);
-      this.active = undefined;
+      if (activeRun.terminalCommitted) {
+        this.hooks.onPhase?.('turn.interrupted_committed');
+      }
+      activeRun.completion.resolve(undefined);
+      if (this.activeRuns.get(activeRun.key) === activeRun) {
+        this.activeRuns.delete(activeRun.key);
+      }
     }
+    this.pendingStarts.clear();
+    this.activeRuns.clear();
     if (this.database) {
-      this.database.close();
-      this.database = undefined;
+      try {
+        this.database.close();
+        this.database = undefined;
+      } catch (error) {
+        captureCleanupError(error);
+      }
     }
-    if (pendingError !== undefined) throw pendingError;
+    if (firstCleanupError !== undefined) throw firstCleanupError;
   }
 
   private async cancelPendingStart(

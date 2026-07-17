@@ -140,6 +140,33 @@ class DeferredStartDriver implements ExecutionDriver {
   }
 }
 
+type DeferredDriverStart = {
+  readonly claim: Claim;
+  readonly start: Deferred<ExecutionRun>;
+  readonly completion: Deferred<void>;
+};
+
+class ConcurrentDeferredStartDriver implements ExecutionDriver {
+  readonly starts: DeferredDriverStart[] = [];
+  shutdownCalls = 0;
+
+  start(claim: Claim): Promise<ExecutionRun> {
+    const start = deferred<ExecutionRun>();
+    const completion = deferred<void>();
+    this.starts.push({ claim, start, completion });
+    return start.promise;
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownCalls += 1;
+    for (const started of this.starts) {
+      started.start.resolve({ completion: started.completion.promise });
+      started.completion.resolve(undefined);
+    }
+    await settleScheduledWork();
+  }
+}
+
 describe('Daemon execution wakeups', () => {
   let runtime: TempRuntime | undefined;
   let server: DaemonServer | undefined;
@@ -192,6 +219,51 @@ describe('Daemon execution wakeups', () => {
     await waitFor(() => driver.starts.length === 1, 'persisted Turn claim after auth');
     expect(driver.starts[0]?.claim.turnId).toBe(created.turnId);
     expect(driver.starts[0]?.claim.executionFence).toBe(1);
+  });
+
+  it('starts both available scheduler claims before either driver start resolves', async () => {
+    runtime = createTempRuntime();
+    const workspacePath = join(runtime.rootDir, 'concurrent-start-workspace');
+    mkdirSync(workspacePath);
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const sessions = new SessionService(database);
+    const workspace = sessions.registerWorkspace(
+      { path: workspacePath },
+      'concurrent-start-workspace',
+    );
+    const first = sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'First concurrent start',
+        prompt: 'Start alongside the second turn',
+      },
+      'concurrent-start-first',
+    );
+    const second = sessions.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Second concurrent start',
+        prompt: 'Start alongside the first turn',
+      },
+      'concurrent-start-second',
+    );
+    database.close();
+
+    const driver = new ConcurrentDeferredStartDriver();
+    server = new DaemonServer({
+      socketPath: runtime.socketPath,
+      dataDir: runtime.dataDir,
+      bootstrapSecret: BOOTSTRAP_SECRET,
+      executionDriver: driver,
+    });
+    await server.start();
+    const client = await authenticate(runtime);
+    clients.push(client);
+
+    await waitFor(() => driver.starts.length === 2, 'two concurrent persisted starts');
+    expect(driver.starts.map((started) => started.claim.turnId).sort()).toEqual(
+      [first.turnId, second.turnId].sort(),
+    );
   });
 
   it('wakes only after committed session.create and turn.enqueue mutations', async () => {
