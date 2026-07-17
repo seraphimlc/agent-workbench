@@ -6,20 +6,26 @@ import {
 import type { ZodType } from 'zod';
 
 import {
+  CancelTurnSubmissionSchema,
   PublicErrorResponseSchema,
   RuntimePublicInfoSchema,
   SessionCreatedHttpResponseSchema,
+  SessionListHttpResponseSchema,
   SessionSnapshotHttpResponseSchema,
   SessionSubmissionSchema,
   TurnSubmissionSchema,
+  TurnCanceledHttpResponseSchema,
   TurnSubmittedHttpResponseSchema,
   createSessionEventsHttpResponseSchema,
+  type CancelTurnSubmission,
   type PublicError,
   type RuntimePublicInfo,
   type SessionCreatedHttpResponse,
+  type SessionListHttpResponse,
   type SessionEventsHttpResponse,
   type SessionSubmission,
   type TurnSubmittedHttpResponse,
+  type TurnCanceledHttpResponse,
   type TurnSubmission,
 } from '../shared/contracts.js';
 
@@ -81,6 +87,11 @@ export const createLogicalSubmission = (
     prompt,
   });
 
+const createCancelTurnSubmission = (
+  uuidSource: RandomUuidSource,
+): CancelTurnSubmission =>
+  CancelTurnSubmissionSchema.parse({ submissionId: uuidSource.randomUUID() });
+
 const parseResponse = async <Output>(
   response: Response,
   schema: ZodType<Output>,
@@ -94,9 +105,11 @@ const parseResponse = async <Output>(
 };
 
 const sessionPath = (sessionId: string): string => encodeURIComponent(sessionId);
+const turnPath = (turnId: string): string => encodeURIComponent(turnId);
 
 export type ApiClient = {
   getRuntime(): Promise<RuntimePublicInfo>;
+  listSessions(): Promise<SessionListHttpResponse>;
   createSession(submission: SessionSubmission): Promise<SessionCreatedHttpResponse>;
   createSessionOperation(
     input: MutationOperationInput,
@@ -109,6 +122,15 @@ export type ApiClient = {
     sessionId: string,
     input: MutationOperationInput,
   ): MutationOperation<TurnSubmittedHttpResponse>;
+  cancelTurn(
+    sessionId: string,
+    turnId: string,
+    submission: CancelTurnSubmission,
+  ): Promise<TurnCanceledHttpResponse>;
+  createCancelTurnOperation(
+    sessionId: string,
+    turnId: string,
+  ): MutationOperation<TurnCanceledHttpResponse>;
   getSnapshot(sessionId: string): Promise<SessionSnapshot>;
   getEvents(request: EventListAfterPayload): Promise<SessionEventsHttpResponse>;
 };
@@ -133,7 +155,7 @@ export const createApiClient = (
     );
   const post = async <Output>(
     url: string,
-    body: SessionSubmission | TurnSubmission,
+    body: SessionSubmission | TurnSubmission | CancelTurnSubmission,
     schema: ZodType<Output>,
   ) =>
     parseResponse(
@@ -161,9 +183,20 @@ export const createApiClient = (
       TurnSubmissionSchema.parse(submission),
       TurnSubmittedHttpResponseSchema,
     );
+  const cancelTurn = (
+    sessionId: string,
+    turnId: string,
+    submission: CancelTurnSubmission,
+  ) =>
+    post(
+      `/api/sessions/${sessionPath(sessionId)}/turns/${turnPath(turnId)}/cancel`,
+      CancelTurnSubmissionSchema.parse(submission),
+      TurnCanceledHttpResponseSchema,
+    );
 
   return {
     getRuntime: () => get('/api/runtime', RuntimePublicInfoSchema),
+    listSessions: () => get('/api/sessions', SessionListHttpResponseSchema),
     createSession,
     createSessionOperation: (input) => {
       const submission = createLogicalSubmission(input.prompt, uuidSource);
@@ -173,6 +206,11 @@ export const createApiClient = (
     createTurnOperation: (sessionId, input) => {
       const submission = createLogicalSubmission(input.prompt, uuidSource);
       return mutationOperation(() => submitTurn(sessionId, submission));
+    },
+    cancelTurn,
+    createCancelTurnOperation: (sessionId, turnId) => {
+      const submission = createCancelTurnSubmission(uuidSource);
+      return mutationOperation(() => cancelTurn(sessionId, turnId, submission));
     },
     getSnapshot: async (sessionId) =>
       (

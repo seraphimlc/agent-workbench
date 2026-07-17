@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiPublicError,
   createApiClient,
+  type ApiClient,
 } from './api.js';
 
 const submissionId = '123e4567-e89b-42d3-a456-426614174000';
@@ -38,6 +39,19 @@ const snapshot = {
   events: [],
 } as const;
 
+const sessionList = {
+  sessions: [
+    {
+      id: 'session/1',
+      title: 'Inspect repository',
+      runtimeStatus: 'queued',
+      currentTurnId: null,
+      queuedTurnCount: 1,
+      updatedAt: '2026-07-16T00:00:00.000Z',
+    },
+  ],
+} as const;
+
 const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
     status,
@@ -54,6 +68,24 @@ afterEach(() => {
 });
 
 describe('web console client API', () => {
+  it('always exposes the session bridge methods', () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const api: ApiClient = createApiClient({
+      document: documentWithToken(),
+      fetch,
+    });
+    const sessionBridge: Required<
+      Pick<
+        ApiClient,
+        'listSessions' | 'cancelTurn' | 'createCancelTurnOperation'
+      >
+    > = api;
+
+    expect(sessionBridge.listSessions).toBeTypeOf('function');
+    expect(sessionBridge.cancelTurn).toBeTypeOf('function');
+    expect(sessionBridge.createCancelTurnOperation).toBeTypeOf('function');
+  });
+
   it('fails closed before any request when the CSRF bootstrap token is missing', () => {
     const fetch = vi.fn<typeof globalThis.fetch>();
     const document = {
@@ -90,6 +122,28 @@ describe('web console client API', () => {
     expect(fetch.mock.calls.every(([, init]) => init?.cache === 'no-store')).toBe(
       true,
     );
+  });
+
+  it('lists authoritative sessions and encodes both cancel path IDs', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(jsonResponse(sessionList))
+      .mockResolvedValueOnce(jsonResponse({ turnId: 'turn /1', status: 'canceled' }));
+    const api = createApiClient({ document: documentWithToken(), fetch });
+    const submission = { submissionId };
+
+    await expect(api.listSessions()).resolves.toEqual(sessionList);
+    await expect(api.cancelTurn('session /1', 'turn /1', submission)).resolves.toEqual({
+      turnId: 'turn /1',
+      status: 'canceled',
+    });
+
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      '/api/sessions',
+      '/api/sessions/session%20%2F1/turns/turn%20%2F1/cancel',
+    ]);
+    expect(fetch.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetch.mock.calls[1]?.[1]?.body).toBe(JSON.stringify(submission));
   });
 
   it('rejects invalid successful response bodies', async () => {
@@ -220,4 +274,36 @@ describe('web console client API', () => {
       );
     },
   );
+
+  it('creates one stable cancel operation whose retry reuses the exact submission body', async () => {
+    const randomUUID = vi.fn(() => submissionId);
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockRejectedValueOnce(new TypeError('network unavailable'))
+      .mockResolvedValueOnce(
+        jsonResponse({ turnId: 'turn /1', status: 'canceled' }),
+      );
+    const api = createApiClient({
+      document: documentWithToken(),
+      fetch,
+      uuidSource: { randomUUID },
+    });
+    const operation = api.createCancelTurnOperation('session /1', 'turn /1');
+
+    await expect(operation.execute()).rejects.toThrow('network unavailable');
+    await expect(operation.retry()).resolves.toEqual({
+      turnId: 'turn /1',
+      status: 'canceled',
+    });
+
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      '/api/sessions/session%20%2F1/turns/turn%20%2F1/cancel',
+      '/api/sessions/session%20%2F1/turns/turn%20%2F1/cancel',
+    ]);
+    expect(fetch.mock.calls.map(([, init]) => init?.body)).toEqual([
+      JSON.stringify({ submissionId }),
+      JSON.stringify({ submissionId }),
+    ]);
+  });
 });

@@ -1,7 +1,9 @@
 import {
   createEventListAfterResultSchema,
   EventListAfterResultSchema,
+  SessionListResultSchema,
   SessionSnapshotSchema,
+  TurnCancelResultSchema,
   type EventListAfterPayload,
 } from '@agent-workbench/protocol';
 import { z } from 'zod';
@@ -51,6 +53,9 @@ const SubmissionShape = {
 
 export const SessionSubmissionSchema = z.object(SubmissionShape).strict();
 export const TurnSubmissionSchema = z.object(SubmissionShape).strict();
+export const CancelTurnSubmissionSchema = z
+  .object({ submissionId: SubmissionIdSchema })
+  .strict();
 
 export const SessionCreatedHttpResponseSchema = z
   .object({
@@ -62,6 +67,10 @@ export const SessionCreatedHttpResponseSchema = z
 export const TurnSubmittedHttpResponseSchema = z
   .object({ turnId: NonEmptyStringSchema })
   .strict();
+
+export const SessionListHttpResponseSchema = SessionListResultSchema;
+
+export const TurnCanceledHttpResponseSchema = TurnCancelResultSchema;
 
 export const SessionSnapshotHttpResponseSchema = z
   .object({ snapshot: SessionSnapshotSchema })
@@ -92,11 +101,18 @@ export type DaemonRuntimePublicInfo = z.infer<
 export type RuntimePublicInfo = z.infer<typeof RuntimePublicInfoSchema>;
 export type SessionSubmission = z.infer<typeof SessionSubmissionSchema>;
 export type TurnSubmission = z.infer<typeof TurnSubmissionSchema>;
+export type CancelTurnSubmission = z.infer<typeof CancelTurnSubmissionSchema>;
 export type SessionCreatedHttpResponse = z.infer<
   typeof SessionCreatedHttpResponseSchema
 >;
 export type TurnSubmittedHttpResponse = z.infer<
   typeof TurnSubmittedHttpResponseSchema
+>;
+export type SessionListHttpResponse = z.infer<
+  typeof SessionListHttpResponseSchema
+>;
+export type TurnCanceledHttpResponse = z.infer<
+  typeof TurnCanceledHttpResponseSchema
 >;
 export type SessionSnapshotHttpResponse = z.infer<
   typeof SessionSnapshotHttpResponseSchema

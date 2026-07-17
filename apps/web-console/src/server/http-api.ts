@@ -6,18 +6,23 @@ import {
   EventListAfterPayloadSchema,
   SessionCreateResultSchema,
   SessionGetSnapshotResultSchema,
+  SessionListResultSchema,
+  TurnCancelResultSchema,
   TurnEnqueueResultSchema,
   WorkspaceRegisterResultSchema,
 } from '@agent-workbench/protocol';
 import { z } from 'zod';
 
 import {
+  CancelTurnSubmissionSchema,
   PublicErrorResponseSchema,
   RuntimePublicInfoSchema,
   createSessionEventsHttpResponseSchema,
   SessionCreatedHttpResponseSchema,
+  SessionListHttpResponseSchema,
   SessionSnapshotHttpResponseSchema,
   SessionSubmissionSchema,
+  TurnCanceledHttpResponseSchema,
   TurnSubmissionSchema,
   TurnSubmittedHttpResponseSchema,
 } from '../shared/contracts.js';
@@ -63,8 +68,12 @@ export type HttpApiHandlerOptions = {
 };
 
 const SessionPathSchema = z
+  .object({ sessionId: z.string().min(1).max(200) })
+  .strict();
+const SessionTurnPathSchema = z
   .object({
-    sessionId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/),
+    sessionId: z.string().min(1).max(200),
+    turnId: z.string().min(1).max(200),
   })
   .strict();
 const EventQuerySchema = z
@@ -137,6 +146,7 @@ type LocalRpcError = {
   readonly code: string;
   readonly message: string;
   readonly retryable: boolean;
+  readonly userAction: string | null;
 };
 
 const knownRpcError = (
@@ -149,6 +159,23 @@ const knownRpcError = (
         code: 'SESSION_NOT_FOUND',
         message: 'Session was not found',
         retryable: false,
+        userAction: 'Refresh and choose an existing session',
+      };
+    case 'TURN_NOT_FOUND':
+      return {
+        statusCode: 404,
+        code: 'TURN_NOT_FOUND',
+        message: 'Turn was not found in this session',
+        retryable: false,
+        userAction: 'Refresh the session and choose an existing turn',
+      };
+    case 'TURN_NOT_CANCELLABLE':
+      return {
+        statusCode: 409,
+        code: 'TURN_NOT_CANCELLABLE',
+        message: 'Only queued turns can be canceled',
+        retryable: false,
+        userAction: 'Wait for the current turn to finish or choose a queued turn',
       };
     case 'WORKSPACE_NOT_FOUND':
       return {
@@ -156,6 +183,7 @@ const knownRpcError = (
         code: 'WORKSPACE_NOT_FOUND',
         message: 'Workspace was not found',
         retryable: false,
+        userAction: null,
       };
     case 'WORKSPACE_PATH_INVALID':
       return {
@@ -163,6 +191,7 @@ const knownRpcError = (
         code: 'INVALID_REQUEST',
         message: 'Request was rejected',
         retryable: false,
+        userAction: null,
       };
     case 'EVENT_CURSOR_AHEAD':
       return {
@@ -170,6 +199,7 @@ const knownRpcError = (
         code: 'EVENT_CURSOR_INVALID',
         message: 'Event cursor is invalid',
         retryable: false,
+        userAction: null,
       };
     case 'IDEMPOTENCY_CONFLICT':
       return {
@@ -177,6 +207,7 @@ const knownRpcError = (
         code: 'REQUEST_CONFLICT',
         message: 'Request conflicts with an earlier submission',
         retryable: false,
+        userAction: null,
       };
     default:
       return null;
@@ -196,6 +227,7 @@ const mapRpcError = (
         code: 'INVALID_REQUEST',
         message: 'Request was rejected',
         retryable: false,
+        userAction: null,
       };
     case 'configuration':
     case 'model':
@@ -208,6 +240,7 @@ const mapRpcError = (
         code: 'RUNTIME_UNAVAILABLE',
         message: 'Runtime is unavailable',
         retryable: true,
+        userAction: null,
       };
     case 'canceled':
       return {
@@ -215,6 +248,7 @@ const mapRpcError = (
         code: 'REQUEST_CANCELED',
         message: 'Request was canceled',
         retryable: false,
+        userAction: null,
       };
     case 'interrupted':
       return {
@@ -222,6 +256,7 @@ const mapRpcError = (
         code: 'REQUEST_INTERRUPTED',
         message: 'Request was interrupted',
         retryable: true,
+        userAction: null,
       };
     case 'internal':
       return {
@@ -229,6 +264,7 @@ const mapRpcError = (
         code: 'INTERNAL',
         message: 'Request failed',
         retryable: false,
+        userAction: null,
       };
   }
 };
@@ -249,7 +285,7 @@ const callRpc = async (
         code: local.code,
         message: local.message,
         retryable: local.retryable,
-        userAction: null,
+        userAction: local.userAction,
       },
     }),
   );
@@ -333,6 +369,21 @@ const matchSessionPath = (
   if (!match?.[1]) return null;
   try {
     return SessionPathSchema.parse({ sessionId: decodeURIComponent(match[1]) });
+  } catch {
+    return null;
+  }
+};
+
+const matchSessionTurnPath = (
+  pathname: string,
+): { readonly sessionId: string; readonly turnId: string } | null => {
+  const match = /^\/api\/sessions\/([^/]+)\/turns\/([^/]+)\/cancel$/.exec(pathname);
+  if (!match?.[1] || !match[2]) return null;
+  try {
+    return SessionTurnPathSchema.parse({
+      sessionId: decodeURIComponent(match[1]),
+      turnId: decodeURIComponent(match[2]),
+    });
   } catch {
     return null;
   }
@@ -487,6 +538,27 @@ export const createHttpApiHandler = (
       return;
     }
 
+    if (request.method === 'GET' && url.pathname === '/api/sessions') {
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
+        );
+        return;
+      }
+      try {
+        const sessions = SessionListResultSchema.parse(
+          await callRpc(options.rpc, { method: 'session.list', payload: {} }),
+        );
+        sendJson(response, 200, SessionListHttpResponseSchema.parse(sessions));
+      } catch (error) {
+        sendRpcFailure(response, error);
+      }
+      return;
+    }
+
     const turnPath = matchSessionPath(url.pathname, 'turns');
     if (request.method === 'POST' && turnPath !== null) {
       if (hasInvalidEmptyQuery(url)) {
@@ -523,6 +595,41 @@ export const createHttpApiHandler = (
           202,
           TurnSubmittedHttpResponseSchema.parse(submitted),
         );
+      } catch (error) {
+        sendRpcFailure(response, error);
+      }
+      return;
+    }
+
+    const cancelPath = matchSessionTurnPath(url.pathname);
+    if (request.method === 'POST' && cancelPath !== null) {
+      if (hasInvalidEmptyQuery(url)) {
+        sendPublicError(
+          response,
+          400,
+          'WEB_REQUEST_INVALID',
+          'Request query is invalid',
+        );
+        return;
+      }
+      let submission;
+      try {
+        submission = CancelTurnSubmissionSchema.parse(await readJsonBody(request));
+      } catch (error) {
+        sendBodyFailure(response, error);
+        return;
+      }
+
+      try {
+        const canceled = TurnCancelResultSchema.parse(
+          await callRpc(options.rpc, {
+            method: 'turn.cancel',
+            payload: cancelPath,
+            sessionId: cancelPath.sessionId,
+            clientRequestId: `web:cancel:${submission.submissionId}`,
+          }),
+        );
+        sendJson(response, 200, TurnCanceledHttpResponseSchema.parse(canceled));
       } catch (error) {
         sendRpcFailure(response, error);
       }
@@ -592,7 +699,9 @@ export const createHttpApiHandler = (
     const allowedMethod =
       url.pathname === '/api/runtime'
         ? 'GET'
-        : url.pathname === '/api/sessions' || turnPath !== null
+        : url.pathname === '/api/sessions'
+          ? 'GET, POST'
+          : turnPath !== null || cancelPath !== null
           ? 'POST'
           : snapshotPath !== null || eventsPath !== null
             ? 'GET'

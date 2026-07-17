@@ -10,6 +10,15 @@ type ContractsModule = {
   TurnSubmissionSchema: {
     parse(value: unknown): unknown;
   };
+  CancelTurnSubmissionSchema: {
+    parse(value: unknown): unknown;
+  };
+  SessionListHttpResponseSchema: {
+    parse(value: unknown): unknown;
+  };
+  TurnCanceledHttpResponseSchema: {
+    parse(value: unknown): unknown;
+  };
   SessionSnapshotHttpResponseSchema: {
     parse(value: unknown): unknown;
   };
@@ -73,6 +82,19 @@ const event = (sessionId: string, seq: number) => ({
   blobId: null,
 });
 
+const sessionList = {
+  sessions: [
+    {
+      id: 'session-1',
+      title: 'Inspect repository',
+      runtimeStatus: 'queued',
+      currentTurnId: null,
+      queuedTurnCount: 1,
+      updatedAt: '2026-07-16T00:00:00.000Z',
+    },
+  ],
+};
+
 describe('web console HTTP contracts', () => {
   it('accepts only sanitized runtime public information', async () => {
     const { RuntimePublicInfoSchema } = await loadContracts();
@@ -110,6 +132,37 @@ describe('web console HTTP contracts', () => {
     });
     expect(() =>
       schema.parse({ submissionId, prompt: 'x'.repeat(64 * 1024 + 1) }),
+    ).toThrow();
+  });
+
+  it('accepts only an exact canonical cancel submission and authoritative list/cancel responses', async () => {
+    const {
+      CancelTurnSubmissionSchema,
+      SessionListHttpResponseSchema,
+      TurnCanceledHttpResponseSchema,
+    } = await loadContracts();
+
+    expect(CancelTurnSubmissionSchema.parse({ submissionId })).toEqual({
+      submissionId,
+    });
+    expect(() =>
+      CancelTurnSubmissionSchema.parse({
+        submissionId,
+        prompt: 'must not be accepted',
+      }),
+    ).toThrow();
+    expect(() =>
+      CancelTurnSubmissionSchema.parse({
+        submissionId: submissionId.toUpperCase(),
+      }),
+    ).toThrow();
+    expect(SessionListHttpResponseSchema.parse(sessionList)).toEqual(sessionList);
+    expect(TurnCanceledHttpResponseSchema.parse({
+      turnId: 'turn-1',
+      status: 'canceled',
+    })).toEqual({ turnId: 'turn-1', status: 'canceled' });
+    expect(() =>
+      TurnCanceledHttpResponseSchema.parse({ turnId: 'turn-1', status: 'queued' }),
     ).toThrow();
   });
 

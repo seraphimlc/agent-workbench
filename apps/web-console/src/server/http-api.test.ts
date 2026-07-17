@@ -81,6 +81,19 @@ const event = (seq: number) => ({
   blobId: null,
 });
 
+const sessionList = {
+  sessions: [
+    {
+      id: 'session/1',
+      title: 'Inspect repository',
+      runtimeStatus: 'queued',
+      currentTurnId: null,
+      queuedTurnCount: 1,
+      updatedAt: '2026-07-16T00:00:00.000Z',
+    },
+  ],
+};
+
 afterEach(async () => {
   await Promise.all(
     [...servers].map(
@@ -304,6 +317,59 @@ describe('web console HTTP API', () => {
     ]);
   });
 
+  it('lists authoritative sessions without requiring mutation CSRF credentials', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        return success(sessionList);
+      },
+    });
+
+    const response = await fetch(`${api.origin}/api/sessions`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(sessionList);
+    expect(calls).toEqual([{ method: 'session.list', payload: {} }]);
+  });
+
+  it('cancels an encoded queued turn with a stable cancel submission id', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        return success({ turnId: 'turn /1', status: 'canceled' });
+      },
+    });
+    const submissionId = '123e4567-e89b-42d3-a456-426614174000';
+    const sessionId = 'session /1';
+    const turnId = 'turn /1';
+
+    const response = await fetch(
+      `${api.origin}/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/cancel`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: api.origin,
+          'x-agent-workbench-csrf': 'csrf-token',
+        },
+        body: JSON.stringify({ submissionId }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ turnId, status: 'canceled' });
+    expect(calls).toEqual([
+      {
+        method: 'turn.cancel',
+        payload: { sessionId, turnId },
+        sessionId,
+        clientRequestId: `web:cancel:${submissionId}`,
+      },
+    ]);
+  });
+
   it('returns a validated authoritative session snapshot', async () => {
     const calls: RpcCall[] = [];
     const api = await startApi({
@@ -402,7 +468,14 @@ describe('web console HTTP API', () => {
     });
 
     const missing = await fetch(`${api.origin}/api/private/socket`);
-    const wrongMethod = await fetch(`${api.origin}/api/sessions`);
+    const wrongMethod = await fetch(`${api.origin}/api/sessions`, {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/json',
+        origin: api.origin,
+        'x-agent-workbench-csrf': 'csrf-token',
+      },
+    });
 
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({
@@ -414,7 +487,7 @@ describe('web console HTTP API', () => {
       },
     });
     expect(wrongMethod.status).toBe(405);
-    expect(wrongMethod.headers.get('allow')).toBe('POST');
+    expect(wrongMethod.headers.get('allow')).toBe('GET, POST');
     expect(await wrongMethod.json()).toEqual({
       error: {
         code: 'WEB_METHOD_NOT_ALLOWED',
@@ -480,15 +553,106 @@ describe('web console HTTP API', () => {
     const invalidQuery = await fetch(
       `${api.origin}/api/sessions/session-1/events?afterSeq=-1&limit=2`,
     );
-    const invalidPath = await fetch(
-      `${api.origin}/api/sessions/%2F/snapshot`,
-    );
+    const invalidPath = await fetch(`${api.origin}/api/sessions/%E0/snapshot`);
 
     expect(invalidBody.status).toBe(400);
     expect(invalidQuery.status).toBe(400);
     expect(invalidPath.status).toBe(404);
     expect(calls).toEqual([]);
   });
+
+  it('rejects invalid cancel bodies and malformed paths before RPC', async () => {
+    const calls: RpcCall[] = [];
+    const api = await startApi({
+      call: async (input) => {
+        calls.push(input);
+        throw new Error('RPC must not be called');
+      },
+    });
+
+    const invalidBody = await fetch(
+      `${api.origin}/api/sessions/session-1/turns/turn-1/cancel`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: api.origin,
+          'x-agent-workbench-csrf': 'csrf-token',
+        },
+        body: JSON.stringify({
+          submissionId: '123e4567-e89b-42d3-a456-426614174000',
+          extra: true,
+        }),
+      },
+    );
+    const malformedPath = await fetch(
+      `${api.origin}/api/sessions/%E0/turns/turn-1/cancel`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          origin: api.origin,
+          'x-agent-workbench-csrf': 'csrf-token',
+        },
+        body: JSON.stringify({
+          submissionId: '123e4567-e89b-42d3-a456-426614174000',
+        }),
+      },
+    );
+
+    expect(invalidBody.status).toBe(400);
+    expect(malformedPath.status).toBe(404);
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['SESSION_NOT_FOUND', 404, 'Session was not found', 'Refresh and choose an existing session'],
+    ['TURN_NOT_FOUND', 404, 'Turn was not found in this session', 'Refresh the session and choose an existing turn'],
+    ['TURN_NOT_CANCELLABLE', 409, 'Only queued turns can be canceled', 'Wait for the current turn to finish or choose a queued turn'],
+  ] as const)(
+    'preserves the sanitized public %s cancellation error',
+    async (code, status, message, userAction) => {
+      const api = await startApi({
+        call: async () => ({
+          ok: false,
+          error: {
+            code,
+            category: 'validation',
+            message,
+            retryable: true,
+            userAction,
+            detailsRef: 'private-details',
+            traceId: 'private-trace',
+          },
+        }),
+      });
+
+      const response = await fetch(
+        `${api.origin}/api/sessions/session-1/turns/turn-1/cancel`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            origin: api.origin,
+            'x-agent-workbench-csrf': 'csrf-token',
+          },
+          body: JSON.stringify({
+            submissionId: '123e4567-e89b-42d3-a456-426614174000',
+          }),
+        },
+      );
+
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({
+        error: {
+          code,
+          message,
+          retryable: false,
+          userAction,
+        },
+      });
+    },
+  );
 
   it('returns 413 for an oversized JSON body without reflecting its content', async () => {
     const calls: RpcCall[] = [];

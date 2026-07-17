@@ -169,10 +169,13 @@ const unusedOperation = (): MutationOperation<never> => ({
 
 const fakeApi = (overrides: Partial<ApiClient> = {}): ApiClient => ({
   getRuntime: async () => runtime,
+  listSessions: unused,
   createSession: unused,
   createSessionOperation: unusedOperation,
   submitTurn: unused,
   createTurnOperation: unusedOperation,
+  cancelTurn: unused,
+  createCancelTurnOperation: unusedOperation,
   getSnapshot: unused,
   getEvents: unused,
   ...overrides,
