@@ -1,39 +1,51 @@
-import type { SessionRow } from '@agent-workbench/protocol';
+import type { SessionRow, SessionRuntimeStatus } from '@agent-workbench/protocol';
+import type { Ref } from 'react';
 
 type SessionHeaderProps = Readonly<{
   compactInspector: boolean;
   inspectorOpen: boolean;
+  loading: boolean;
   modelId: string;
-  onToggleInspector(): void;
+  onToggleInspector(trigger: HTMLButtonElement): void;
   session: SessionRow | null;
+  sessionStatus: SessionRuntimeStatus | null;
   statusOverride: 'Unavailable' | null;
+  titleRef: Ref<HTMLHeadingElement>;
   workspaceName: string;
 }>;
 
-const statusLabel = (status: SessionRow['runtimeStatus']): string =>
-  status.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase());
+const statusLabel = (status: SessionRow['runtimeStatus']): string => {
+  if (status === 'idle') return 'Ready';
+  if (status === 'waiting_for_user') return 'Waiting for input';
+  return status.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase());
+};
 
 export function SessionHeader({
   compactInspector,
   inspectorOpen,
+  loading,
   modelId,
   onToggleInspector,
   session,
+  sessionStatus,
   statusOverride,
+  titleRef,
   workspaceName,
 }: SessionHeaderProps) {
   const displayedStatus =
     statusOverride ??
-    (session === null ? 'Ready' : statusLabel(session.runtimeStatus));
+    (sessionStatus === null ? 'Ready' : statusLabel(sessionStatus));
   const statusData = statusOverride === null
-    ? (session?.runtimeStatus ?? 'idle')
+    ? (sessionStatus ?? 'idle')
     : 'unavailable';
 
   return (
     <header className="session-header">
       <div>
         <p>Workspace · {workspaceName}</p>
-        <h1>{session?.title || 'New task'}</h1>
+        <h1 ref={titleRef} tabIndex={-1}>
+          {loading ? 'Loading Session…' : session?.title || 'New task'}
+        </h1>
       </div>
       <div className="session-header-actions">
         <ul className="session-metadata" aria-label="Session configuration">
@@ -60,7 +72,7 @@ export function SessionHeader({
             className="inspector-toggle"
             aria-controls="timeline-inspector"
             aria-expanded={inspectorOpen}
-            onClick={onToggleInspector}
+            onClick={(event) => onToggleInspector(event.currentTarget)}
           >
             <svg aria-hidden="true" viewBox="0 0 20 20" width="17" height="17">
               <rect x="2.5" y="3" width="15" height="14" rx="2" fill="none" stroke="currentColor" strokeWidth="1.4" />

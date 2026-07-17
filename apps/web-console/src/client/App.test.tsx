@@ -6,6 +6,7 @@ import {
   type RendererSessionEventEnvelope,
   type SessionRuntimeStatus,
   type SessionSnapshot,
+  type SessionSummary,
   type TurnRow,
   type TurnStatus,
 } from '@agent-workbench/protocol';
@@ -158,6 +159,19 @@ const snapshot = (
   };
 };
 
+const sessionSummary = (
+  id: string,
+  runtimeStatus: SessionRuntimeStatus,
+  queuedTurnCount = 0,
+): SessionSummary => ({
+  id,
+  title: `Task ${id}`,
+  runtimeStatus,
+  currentTurnId: runtimeStatus === 'running' ? `turn-${id}` : null,
+  queuedTurnCount,
+  updatedAt: timestamp(1),
+});
+
 const unused = async (): Promise<never> => {
   throw new Error('Unexpected API call');
 };
@@ -230,6 +244,368 @@ afterEach(() => {
 });
 
 describe('professional web workbench', () => {
+  it('renders authoritative Session status labels and summary counts', async () => {
+    render(
+      <App
+        api={fakeApi({
+          listSessions: async () => ({
+            sessions: [
+              sessionSummary('a', 'running', 2),
+              sessionSummary('b', 'running'),
+              sessionSummary('c', 'queued', 1),
+              sessionSummary('d', 'waiting_for_user'),
+            ],
+          }),
+        })}
+      />,
+    );
+
+    expect(await screen.findByText('2 running · 1 queued')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Task a/i }).textContent).toContain(
+      'Running · 2 queued',
+    );
+    expect(screen.getByRole('button', { name: /Task b/i }).textContent).toContain('Running');
+    expect(screen.getByRole('button', { name: /Task c/i }).textContent).toContain('Queued');
+    expect(screen.getByRole('button', { name: /Task d/i }).textContent).toContain(
+      'Waiting for input',
+    );
+  });
+
+  it('renders exact Session list loading, empty, and initial failure copy', async () => {
+    const pendingList = deferred<Awaited<ReturnType<ApiClient['listSessions']>>>();
+    const loading = render(<App api={fakeApi({ listSessions: () => pendingList.promise })} />);
+
+    expect(await screen.findByText('Loading Sessions…')).toBeTruthy();
+    await act(async () => {
+      pendingList.resolve({ sessions: [] });
+      await pendingList.promise;
+    });
+    expect(await screen.findByText('No Sessions yet.')).toBeTruthy();
+    expect(screen.getByText('Start a task to create one.')).toBeTruthy();
+    loading.unmount();
+
+    render(
+      <App
+        api={fakeApi({ listSessions: async () => Promise.reject(new Error('offline')) })}
+      />,
+    );
+    expect(await screen.findByText('Couldn’t load Sessions.')).toBeTruthy();
+  });
+
+  it('preserves the last Session list after a refresh failure', async () => {
+    const listSessions = vi
+      .fn<ApiClient['listSessions']>()
+      .mockResolvedValueOnce({ sessions: [sessionSummary('a', 'running')] })
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockImplementation(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({ listSessions })}
+        pollIntervals={{ activeMs: 1, idleMs: 1, runtimeMs: 60_000 }}
+      />,
+    );
+
+    expect(await screen.findByRole('button', { name: /Task a/i })).toBeTruthy();
+    expect(await screen.findByText('Couldn’t refresh Sessions.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Task a/i })).toBeTruthy();
+  });
+
+  it('keeps a mutation list success when a later poll fails first', async () => {
+    const mutationRefresh = deferred<Awaited<ReturnType<ApiClient['listSessions']>>>();
+    const listSessions = vi
+      .fn<ApiClient['listSessions']>()
+      .mockResolvedValueOnce({ sessions: [sessionSummary('existing', 'running')] })
+      .mockImplementationOnce(() => mutationRefresh.promise)
+      .mockRejectedValueOnce(new Error('poll failed'))
+      .mockImplementation(() => new Promise(() => undefined));
+    const createSessionOperation = vi.fn<ApiClient['createSessionOperation']>(() =>
+      operation(async () => ({ sessionId: 'new', turnId: 'turn-new' })),
+    );
+    const createdSnapshot = {
+      ...snapshot({ title: 'New task' }),
+      session: { ...snapshot().session, id: 'new', title: 'New task' },
+    };
+    const api = fakeApi({
+      createSessionOperation,
+      getSnapshot: async () => createdSnapshot,
+      listSessions,
+    });
+    const user = userEvent.setup();
+    const rendered = render(
+      <App
+        api={api}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000 }}
+      />,
+    );
+
+    await user.type(await screen.findByLabelText('Task prompt'), 'Create task');
+    await user.click(screen.getByRole('button', { name: 'Run task' }));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+
+    rendered.rerender(
+      <App
+        api={api}
+        pollIntervals={{ activeMs: 1, idleMs: 60_000 }}
+      />,
+    );
+    expect(await screen.findByText('Couldn’t refresh Sessions.')).toBeTruthy();
+
+    await act(async () => {
+      mutationRefresh.resolve({ sessions: [sessionSummary('new', 'queued')] });
+      await mutationRefresh.promise;
+    });
+
+    expect(await screen.findByRole('button', { name: /Task new/i })).toBeTruthy();
+    expect(screen.queryByText('Couldn’t refresh Sessions.')).toBeNull();
+  });
+
+  it('keeps a newer Session list success over an older delayed success', async () => {
+    const olderSuccess = deferred<Awaited<ReturnType<ApiClient['listSessions']>>>();
+    const newerSuccess = deferred<Awaited<ReturnType<ApiClient['listSessions']>>>();
+    const listSessions = vi
+      .fn<ApiClient['listSessions']>()
+      .mockResolvedValueOnce({ sessions: [sessionSummary('existing', 'running')] })
+      .mockImplementationOnce(() => olderSuccess.promise)
+      .mockImplementationOnce(() => newerSuccess.promise)
+      .mockImplementation(() => new Promise(() => undefined));
+    const createSessionOperation = vi.fn<ApiClient['createSessionOperation']>(() =>
+      operation(async () => ({ sessionId: 'new', turnId: 'turn-new' })),
+    );
+    const createdSnapshot = {
+      ...snapshot({ title: 'New task' }),
+      session: { ...snapshot().session, id: 'new', title: 'New task' },
+    };
+    const api = fakeApi({
+      createSessionOperation,
+      getSnapshot: async () => createdSnapshot,
+      listSessions,
+    });
+    const user = userEvent.setup();
+    const rendered = render(
+      <App
+        api={api}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000 }}
+      />,
+    );
+
+    await user.type(await screen.findByLabelText('Task prompt'), 'Create task');
+    await user.click(screen.getByRole('button', { name: 'Run task' }));
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(2));
+    rendered.rerender(
+      <App
+        api={api}
+        pollIntervals={{ activeMs: 1, idleMs: 60_000 }}
+      />,
+    );
+    await waitFor(() => expect(listSessions).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      newerSuccess.resolve({ sessions: [sessionSummary('newer', 'queued')] });
+      await newerSuccess.promise;
+    });
+    await act(async () => {
+      olderSuccess.resolve({ sessions: [sessionSummary('older', 'queued')] });
+      await olderSuccess.promise;
+    });
+
+    expect(await screen.findByRole('button', { name: /Task newer/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Task older/i })).toBeNull();
+  });
+
+  it('adopts only the latest Snapshot during rapid Session switching', async () => {
+    const pending = new Map([
+      ['a', deferred<SessionSnapshot>()],
+      ['b', deferred<SessionSnapshot>()],
+      ['c', deferred<SessionSnapshot>()],
+    ]);
+    const getSnapshot = vi.fn<ApiClient['getSnapshot']>((sessionId) =>
+      pending.get(sessionId)?.promise ?? Promise.reject(new Error('Unknown Session')),
+    );
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({
+          getSnapshot,
+          listSessions: async () => ({
+            sessions: [
+              sessionSummary('a', 'running'),
+              sessionSummary('b', 'queued'),
+              sessionSummary('c', 'idle'),
+            ],
+          }),
+        })}
+      />,
+    );
+
+    await user.click(await screen.findByRole('button', { name: /Task a/i }));
+    await user.click(screen.getByRole('button', { name: /Task b/i }));
+    await user.click(screen.getByRole('button', { name: /Task c/i }));
+    expect(screen.getAllByText('Loading Session…').length).toBeGreaterThan(0);
+
+    await act(async () => {
+      pending.get('a')?.resolve({
+        ...snapshot({ title: 'A stale title' }),
+        session: { ...snapshot().session, id: 'a', title: 'A stale title' },
+      });
+      pending.get('b')?.resolve({
+        ...snapshot({ title: 'B stale title' }),
+        session: { ...snapshot().session, id: 'b', title: 'B stale title' },
+      });
+      pending.get('c')?.resolve({
+        ...snapshot({ title: 'C current title' }),
+        session: { ...snapshot().session, id: 'c', title: 'C current title' },
+      });
+      await Promise.all([...pending.values()].map(({ promise }) => promise));
+    });
+
+    expect(await screen.findByText('C current title')).toBeTruthy();
+    expect(screen.queryByText('A stale title')).toBeNull();
+    expect(screen.queryByText('B stale title')).toBeNull();
+    expect(window.localStorage.getItem(CURRENT_SESSION_STORAGE_KEY)).toBe('c');
+  });
+
+  it('cancels an authoritative queued Turn without nesting the inspect control', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const queuedSnapshot = snapshot({
+      events: [event(1, 'turn.queued', { payload: { ordinal: 1 } })],
+      runtimeStatus: 'queued',
+      turns: [turn('queued')],
+    });
+    const canceledSnapshot = snapshot({
+      events: [event(1, 'turn.canceled', { payload: { ordinal: 1 } })],
+      runtimeStatus: 'idle',
+      turns: [{ ...turn('canceled'), startedAt: null, finishedAt: timestamp(2) }],
+    });
+    const completion = deferred<{ turnId: string; status: 'canceled' }>();
+    const execute = vi.fn(() => completion.promise);
+    const cancelOperation = operation(execute);
+    const createCancelTurnOperation = vi.fn<ApiClient['createCancelTurnOperation']>(
+      () => cancelOperation,
+    );
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockResolvedValueOnce(queuedSnapshot)
+      .mockResolvedValueOnce(canceledSnapshot);
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({ createCancelTurnOperation, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000 }}
+      />,
+    );
+
+    const cancelButton = (await screen.findByRole('button', {
+      name: 'Cancel queued Turn 1',
+    })) as HTMLButtonElement;
+    const card = cancelButton.closest('article');
+    expect(card?.querySelector('button button')).toBeNull();
+    expect(within(card as HTMLElement).getByRole('button', { name: 'Turn queued queued' })).toBeTruthy();
+
+    await user.click(cancelButton);
+    expect(screen.getByRole('button', { name: 'Cancel queued Turn 1' }).textContent).toBe(
+      'Canceling…',
+    );
+    await act(async () => {
+      completion.resolve({ turnId: 'turn-1', status: 'canceled' });
+      await completion.promise;
+    });
+
+    expect(await screen.findByText('Canceled before start.')).toBeTruthy();
+    expect(createCancelTurnOperation).toHaveBeenCalledWith('session-1', 'turn-1');
+  });
+
+  it('disables queued cancellation after an Event poll failure until polling recovers', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const queuedSnapshot = snapshot({
+      events: [event(1, 'turn.queued', { payload: { ordinal: 1 } })],
+      runtimeStatus: 'queued',
+      turns: [turn('queued')],
+    });
+    const recoveredPage = deferred<Awaited<ReturnType<ApiClient['getEvents']>>>();
+    const getEvents = vi
+      .fn<ApiClient['getEvents']>()
+      .mockRejectedValueOnce(new TypeError('RPC disconnected'))
+      .mockImplementationOnce(() => recoveredPage.promise)
+      .mockImplementation(() => new Promise(() => undefined));
+
+    render(
+      <App
+        api={fakeApi({ getEvents, getSnapshot: async () => queuedSnapshot })}
+        pollIntervals={{ activeMs: 1, idleMs: 1, runtimeMs: 60_000 }}
+      />,
+    );
+
+    const cancelButton = (await screen.findByRole('button', {
+      name: 'Cancel queued Turn 1',
+    })) as HTMLButtonElement;
+    expect(await screen.findByText('Live updates unavailable')).toBeTruthy();
+    expect(cancelButton.disabled).toBe(true);
+    expect(screen.getByText('Reconnect to cancel this queued turn.')).toBeTruthy();
+
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      recoveredPage.resolve({ events: [], highWaterSeq: 1 });
+      await recoveredPage.promise;
+    });
+
+    await waitFor(() => expect(screen.queryByText('Live updates unavailable')).toBeNull());
+    expect(cancelButton.disabled).toBe(false);
+    expect(screen.queryByText('Reconnect to cancel this queued turn.')).toBeNull();
+  });
+
+  it('restores Header Inspector trigger focus after drawer Escape and backdrop close', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 700,
+      writable: true,
+    });
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    const trigger = await screen.findByRole('button', { name: 'Open inspector' });
+    await user.click(trigger);
+    expect(screen.getByRole('dialog', { name: 'Inspector' })).toBeTruthy();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Inspector' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    await user.click(trigger);
+    fireEvent.click(document.querySelector('.inspector-backdrop') as HTMLElement);
+    expect(screen.queryByRole('dialog', { name: 'Inspector' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('keeps Session and Inspector drawers mutually exclusive and restores trigger focus', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 700,
+      writable: true,
+    });
+    const user = userEvent.setup();
+    render(
+      <App
+        api={fakeApi({
+          listSessions: async () => ({ sessions: [sessionSummary('a', 'idle')] }),
+        })}
+      />,
+    );
+
+    const trigger = await screen.findByRole('button', { name: 'Sessions' });
+    await user.click(trigger);
+    expect(screen.getByRole('dialog', { name: 'Sessions' })).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Open inspector' }));
+    expect(screen.queryByRole('dialog', { name: 'Sessions' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Inspector' })).toBeTruthy();
+
+    await user.click(trigger);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Sessions' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('loads sanitized runtime metadata and renders the empty workbench', async () => {
     const api = fakeApi({
       getRuntime: async () =>
@@ -329,6 +705,40 @@ describe('professional web workbench', () => {
 
     expect(await screen.findByText('Recovered saved task')).toBeTruthy();
     await waitFor(() => expect(screen.queryByText('Runtime unavailable')).toBeNull());
+  });
+
+  it('does not adopt a delayed heartbeat recovery after Retry starts a new lifecycle', async () => {
+    window.localStorage.setItem(CURRENT_SESSION_STORAGE_KEY, 'session-1');
+    const delayedRecovery = deferred<SessionSnapshot>();
+    const getRuntime = vi
+      .fn<ApiClient['getRuntime']>()
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockResolvedValueOnce(runtime)
+      .mockResolvedValueOnce(unavailableRuntime)
+      .mockImplementation(() => new Promise(() => undefined));
+    const getSnapshot = vi
+      .fn<ApiClient['getSnapshot']>()
+      .mockImplementation(() => delayedRecovery.promise);
+    const user = userEvent.setup();
+
+    render(
+      <App
+        api={fakeApi({ getRuntime, getSnapshot })}
+        pollIntervals={{ activeMs: 60_000, idleMs: 60_000, runtimeMs: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+    await waitFor(() => expect(getSnapshot).toHaveBeenCalledWith('session-1'));
+    await user.click(screen.getByRole('button', { name: 'Retry connection' }));
+    expect(await screen.findByText('Runtime unavailable')).toBeTruthy();
+
+    await act(async () => {
+      delayedRecovery.resolve(snapshot({ title: 'Late recovery must not adopt' }));
+      await delayedRecovery.promise;
+    });
+
+    expect(screen.queryByText('Late recovery must not adopt')).toBeNull();
   });
 
   it('clears a missing saved Session and recovers to an empty ready workbench', async () => {

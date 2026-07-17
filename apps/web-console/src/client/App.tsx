@@ -1,4 +1,9 @@
-import type { SessionRuntimeStatus, SessionSnapshot } from '@agent-workbench/protocol';
+import type {
+  SessionRuntimeStatus,
+  SessionSnapshot,
+  SessionSummary,
+  TurnRow,
+} from '@agent-workbench/protocol';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ZodError } from 'zod';
 
@@ -15,6 +20,7 @@ import {
   Timeline,
   buildToolPresentationIndex,
   getToolPresentation,
+  type CancelMutationDisplayState,
 } from './components/Timeline.js';
 import {
   EventSequenceConflictError,
@@ -71,11 +77,25 @@ type MutationFailure = Readonly<{
   retryable: boolean;
 }>;
 
+type SessionViewState = 'empty' | 'loading' | 'ready' | 'error';
+
+type CancelMutationState = Readonly<{
+  operation: ReturnType<ApiClient['createCancelTurnOperation']>;
+  status: 'pending' | 'error' | 'conflict';
+}>;
+
 const DEFAULT_POLL_INTERVALS: PollIntervals = {
   activeMs: 500,
   idleMs: 2_000,
   runtimeMs: 1_000,
 };
+
+const activeStatuses = new Set<SessionRuntimeStatus>([
+  'queued',
+  'running',
+  'canceling',
+  'recovering',
+]);
 
 const runtimeInfoEqual = (
   left: Awaited<ReturnType<ApiClient['getRuntime']>>,
@@ -88,17 +108,18 @@ const runtimeInfoEqual = (
   left.provider.modelId === right.provider.modelId &&
   left.workspace.name === right.workspace.name;
 
-const activeStatuses = new Set<SessionRuntimeStatus>([
-  'queued',
-  'running',
-  'canceling',
-  'recovering',
-]);
-
 const pollDelay = (
   status: SessionRuntimeStatus,
   intervals: PollIntervals,
 ): number => (activeStatuses.has(status) ? intervals.activeMs : intervals.idleMs);
+
+const sessionListPollDelay = (
+  sessions: readonly SessionSummary[] | null,
+  intervals: PollIntervals,
+): number =>
+  sessions?.some(({ runtimeStatus }) => activeStatuses.has(runtimeStatus))
+    ? intervals.activeMs
+    : intervals.idleMs;
 
 const errorDetails = (
   error: unknown,
@@ -163,21 +184,42 @@ export function App({
   const [bootstrap, setBootstrap] = useState<BootstrapState>({
     status: 'loading',
   });
+  const [sessions, setSessions] = useState<readonly SessionSummary[] | null>(null);
+  const [sessionListError, setSessionListError] = useState<
+    'initial' | 'refresh' | null
+  >(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [sessionViewState, setSessionViewState] = useState<SessionViewState>('empty');
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [eventState, setEventState] = useState<EventPageState | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
-  const [mutationFailure, setMutationFailure] =
-    useState<MutationFailure | null>(null);
+  const [mutationFailure, setMutationFailure] = useState<MutationFailure | null>(null);
   const [mutationPending, setMutationPending] = useState(false);
+  const [cancelMutations, setCancelMutations] = useState<
+    ReadonlyMap<string, CancelMutationState>
+  >(new Map());
   const [composerResetSignal, setComposerResetSignal] = useState(0);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorOverlayOpen, setInspectorOverlayOpen] = useState(false);
+  const [activeDrawer, setActiveDrawer] = useState<
+    'sessions' | 'inspector' | null
+  >(null);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const inspectorTrigger = useRef<HTMLElement | null>(null);
+  const sessionTitleRef = useRef<HTMLHeadingElement>(null);
   const mutationInFlight = useRef(false);
   const snapshotRef = useRef<SessionSnapshot | null>(null);
   const eventStateRef = useRef<EventPageState | null>(null);
   const stateGenerationRef = useRef(0);
+  const selectionGenerationRef = useRef(0);
+  const selectedSessionIdRef = useRef<string | null>(null);
+  const sessionsRef = useRef<readonly SessionSummary[] | null>(null);
+  const sessionListRequestRef = useRef(0);
+  const sessionListSuccessRef = useRef(0);
+  const runtimeLifecycleGenerationRef = useRef(0);
+  const cancelOperationsRef = useRef(
+    new Map<string, ReturnType<ApiClient['createCancelTurnOperation']>>(),
+  );
 
   const adoptSnapshot = useCallback((nextSnapshot: SessionSnapshot): void => {
     const nextEventState = createEventPageState(nextSnapshot);
@@ -186,55 +228,130 @@ export function App({
     eventStateRef.current = nextEventState;
     setSnapshot(nextSnapshot);
     setEventState(nextEventState);
+    setSessionViewState('ready');
   }, []);
 
-  const clearSession = useCallback((): void => {
+  const clearAdoptedSession = useCallback((): void => {
     stateGenerationRef.current += 1;
     snapshotRef.current = null;
     eventStateRef.current = null;
     setSnapshot(null);
     setEventState(null);
     setSelectedItemId(null);
-    setInspectorOpen(false);
+    setInspectorOverlayOpen(false);
     setPollError(null);
     setMutationFailure(null);
   }, []);
 
+  const refreshSessions = useCallback(async (
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> => {
+    const requestId = ++sessionListRequestRef.current;
+    try {
+      const result = await api.listSessions();
+      if (!isCurrent() || requestId < sessionListSuccessRef.current) return;
+      sessionListSuccessRef.current = requestId;
+      sessionsRef.current = result.sessions;
+      setSessions(result.sessions);
+      setSessionListError(null);
+    } catch {
+      if (!isCurrent() || requestId < sessionListSuccessRef.current) return;
+      setSessionListError(sessionsRef.current === null ? 'initial' : 'refresh');
+    }
+  }, [api]);
+
+  const openSession = useCallback(
+    async (
+      sessionId: string,
+      clearMissing = false,
+      isCurrent: () => boolean = () => true,
+    ): Promise<boolean> => {
+      if (!isCurrent()) return true;
+      const selectionGeneration = ++selectionGenerationRef.current;
+      selectedSessionIdRef.current = sessionId;
+      setSelectedSessionId(sessionId);
+      storeSessionId(storage, sessionId);
+      clearAdoptedSession();
+      setSessionViewState('loading');
+
+      try {
+        const nextSnapshot = await api.getSnapshot(sessionId);
+        if (
+          !isCurrent() ||
+          selectionGeneration !== selectionGenerationRef.current ||
+          selectedSessionIdRef.current !== sessionId
+        ) {
+          return true;
+        }
+        adoptSnapshot(nextSnapshot);
+        return true;
+      } catch (error) {
+        if (
+          !isCurrent() ||
+          selectionGeneration !== selectionGenerationRef.current ||
+          selectedSessionIdRef.current !== sessionId
+        ) {
+          return true;
+        }
+        if (clearMissing && isMissingSession(error)) {
+          selectedSessionIdRef.current = null;
+          setSelectedSessionId(null);
+          clearStoredSessionId(storage);
+          clearAdoptedSession();
+          setSessionViewState('empty');
+          return true;
+        }
+        setSessionViewState('error');
+        return false;
+      }
+    },
+    [adoptSnapshot, api, clearAdoptedSession, storage],
+  );
+
   useEffect(() => {
-    const updateViewport = (): void => setViewportWidth(window.innerWidth);
+    const updateViewport = (): void => {
+      setViewportWidth(window.innerWidth);
+      if (window.innerWidth >= 820) setActiveDrawer(null);
+    };
     window.addEventListener('resize', updateViewport);
     return () => window.removeEventListener('resize', updateViewport);
   }, []);
 
   useEffect(() => {
-    let canceled = false;
+    const controller = new AbortController();
+    const lifecycleGeneration = ++runtimeLifecycleGenerationRef.current;
+    const isCurrent = (): boolean =>
+      !controller.signal.aborted &&
+      runtimeLifecycleGenerationRef.current === lifecycleGeneration;
     setBootstrap({ status: 'loading' });
-    setPollError(null);
+    setSessionListError(null);
+    sessionsRef.current = null;
+    setSessions(null);
 
     void (async () => {
       try {
         const runtime = await api.getRuntime();
-        if (canceled) return;
-
-        const storedSessionId = readStoredSessionId(storage);
-        if (runtime.daemon.status === 'ready' && storedSessionId !== null) {
-          try {
-            const restoredSnapshot = await api.getSnapshot(storedSessionId);
-            if (canceled) return;
-            adoptSnapshot(restoredSnapshot);
-          } catch (error) {
-            if (!isMissingSession(error)) throw error;
-            clearStoredSessionId(storage);
-            clearSession();
+        if (!isCurrent()) return;
+        if (runtime.daemon.status === 'ready') {
+          void refreshSessions(isCurrent);
+          const storedSessionId = readStoredSessionId(storage);
+          if (storedSessionId !== null) {
+            await openSession(storedSessionId, true, isCurrent);
+          } else {
+            if (!isCurrent()) return;
+            clearAdoptedSession();
+            setSessionViewState('empty');
           }
         } else {
-          clearSession();
+          if (!isCurrent()) return;
+          clearAdoptedSession();
+          setSessionViewState('empty');
         }
-
-        if (!canceled) setBootstrap({ status: 'ready', runtime });
+        if (isCurrent()) setBootstrap({ status: 'ready', runtime });
       } catch {
-        if (!canceled) {
-          clearSession();
+        if (isCurrent()) {
+          clearAdoptedSession();
+          setSessionViewState('empty');
           setBootstrap({
             status: 'error',
             message: 'The local workbench could not connect.',
@@ -244,14 +361,20 @@ export function App({
     })();
 
     return () => {
-      canceled = true;
+      controller.abort();
+      if (runtimeLifecycleGenerationRef.current === lifecycleGeneration) {
+        runtimeLifecycleGenerationRef.current += 1;
+      }
     };
-  }, [adoptSnapshot, api, bootstrapAttempt, clearSession, storage]);
+  }, [api, bootstrapAttempt, clearAdoptedSession, openSession, refreshSessions, storage]);
 
   useEffect(() => {
     if (bootstrap.status !== 'ready') return;
-
-    let canceled = false;
+    const controller = new AbortController();
+    const lifecycleGeneration = runtimeLifecycleGenerationRef.current;
+    const isCurrent = (): boolean =>
+      !controller.signal.aborted &&
+      runtimeLifecycleGenerationRef.current === lifecycleGeneration;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const runtimeDelay = Math.max(
       1,
@@ -259,8 +382,7 @@ export function App({
     );
 
     const schedule = (): void => {
-      if (canceled) return;
-      timer = setTimeout(() => void heartbeat(), runtimeDelay);
+      if (isCurrent()) timer = setTimeout(() => void heartbeat(), runtimeDelay);
     };
 
     const heartbeat = async (): Promise<void> => {
@@ -271,36 +393,23 @@ export function App({
       } catch {
         nextRuntime = null;
       }
-      if (canceled) return;
-
+      if (!isCurrent()) return;
       if (nextRuntime?.daemon.status === 'ready' && snapshotRef.current === null) {
         const storedSessionId = readStoredSessionId(storage);
         if (storedSessionId !== null) {
-          const recoveryGeneration = stateGenerationRef.current;
-          const recoveryIsCurrent = (): boolean =>
-            stateGenerationRef.current === recoveryGeneration &&
-            snapshotRef.current === null &&
-            readStoredSessionId(storage) === storedSessionId;
-          try {
-            const restoredSnapshot = await api.getSnapshot(storedSessionId);
-            if (canceled) return;
-            if (recoveryIsCurrent()) adoptSnapshot(restoredSnapshot);
-          } catch (error) {
-            if (canceled) return;
-            if (recoveryIsCurrent()) {
-              if (isMissingSession(error)) clearStoredSessionId(storage);
-              else recoveryFailed = true;
-            }
-          }
+          recoveryFailed = !(await openSession(storedSessionId, true, isCurrent));
         }
       }
-      if (canceled) return;
-      if (recoveryFailed) nextRuntime = null;
-
+      if (!isCurrent()) return;
       setBootstrap((current) => {
         if (current.status !== 'ready') return current;
         const runtime =
-          nextRuntime ??
+          recoveryFailed
+            ? ({
+                ...current.runtime,
+                daemon: { status: 'unavailable', protocolVersion: null, pid: null },
+              } as const)
+            : nextRuntime ??
           ({
             ...current.runtime,
             daemon: { status: 'unavailable', protocolVersion: null, pid: null },
@@ -314,10 +423,35 @@ export function App({
 
     schedule();
     return () => {
-      canceled = true;
+      controller.abort();
       if (timer !== null) clearTimeout(timer);
     };
-  }, [adoptSnapshot, api, bootstrap.status, pollIntervals.runtimeMs, storage]);
+  }, [api, bootstrap.status, openSession, pollIntervals.runtimeMs, storage]);
+
+  useEffect(() => {
+    if (bootstrap.status !== 'ready' || bootstrap.runtime.daemon.status !== 'ready') {
+      return;
+    }
+    const controller = new AbortController();
+    const isCurrent = (): boolean => !controller.signal.aborted;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async (): Promise<void> => {
+      await refreshSessions(isCurrent);
+      if (isCurrent()) schedule();
+    };
+    const schedule = (): void => {
+      if (!isCurrent()) return;
+      timer = setTimeout(
+        () => void poll(),
+        sessionListPollDelay(sessionsRef.current, pollIntervals),
+      );
+    };
+    schedule();
+    return () => {
+      controller.abort();
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [bootstrap, pollIntervals, refreshSessions]);
 
   const sessionId = snapshot?.session.id ?? null;
 
@@ -329,15 +463,11 @@ export function App({
     ) {
       return;
     }
-
     let canceled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-
     const schedule = (delay: number): void => {
-      if (canceled) return;
-      timer = setTimeout(() => void poll(), delay);
+      if (!canceled) timer = setTimeout(() => void poll(), delay);
     };
-
     const poll = async (): Promise<void> => {
       const currentSnapshot = snapshotRef.current;
       const currentEvents = eventStateRef.current;
@@ -349,36 +479,23 @@ export function App({
       ) {
         return;
       }
-
-      let nextDelay = pollDelay(
-        currentSnapshot.session.runtimeStatus,
-        pollIntervals,
-      );
+      let nextDelay = pollDelay(currentSnapshot.session.runtimeStatus, pollIntervals);
       const pollGeneration = stateGenerationRef.current;
-      const generationChanged = (): boolean =>
-        stateGenerationRef.current !== pollGeneration;
+      const generationChanged = (): boolean => stateGenerationRef.current !== pollGeneration;
       const scheduleFromCurrentState = (): void => {
         const latestSnapshot = snapshotRef.current;
-        if (latestSnapshot !== null && latestSnapshot.session.id === sessionId) {
-          schedule(
-            pollDelay(latestSnapshot.session.runtimeStatus, pollIntervals),
-          );
+        if (latestSnapshot?.session.id === sessionId) {
+          schedule(pollDelay(latestSnapshot.session.runtimeStatus, pollIntervals));
         }
       };
-
       try {
-        const request = {
-          sessionId,
-          afterSeq: currentEvents.cursor,
-          limit: 100,
-        } as const;
+        const request = { sessionId, afterSeq: currentEvents.cursor, limit: 100 } as const;
         let page: Awaited<ReturnType<ApiClient['getEvents']>>;
         let nextEvents: EventPageState;
         try {
           page = await api.getEvents(request);
-          if (canceled) return;
-          if (generationChanged()) {
-            scheduleFromCurrentState();
+          if (canceled || generationChanged()) {
+            if (!canceled) scheduleFromCurrentState();
             return;
           }
           nextEvents = applyEventPage(currentEvents, request, page);
@@ -389,37 +506,28 @@ export function App({
           }
           if (!isIncrementalResponseInvalid(error)) throw error;
           const resyncedSnapshot = await api.getSnapshot(sessionId);
-          if (canceled) return;
-          if (generationChanged()) {
-            scheduleFromCurrentState();
+          if (canceled || generationChanged()) {
+            if (!canceled) scheduleFromCurrentState();
             return;
           }
           adoptSnapshot(resyncedSnapshot);
+          void refreshSessions();
           setPollError(null);
-          nextDelay = pollDelay(
-            resyncedSnapshot.session.runtimeStatus,
-            pollIntervals,
-          );
-          schedule(nextDelay);
+          schedule(pollDelay(resyncedSnapshot.session.runtimeStatus, pollIntervals));
           return;
         }
-
         eventStateRef.current = nextEvents;
         setEventState(nextEvents);
         setPollError(null);
-
         if (page.events.length > 0) {
           const refreshedSnapshot = await api.getSnapshot(sessionId);
-          if (canceled) return;
-          if (generationChanged()) {
-            scheduleFromCurrentState();
+          if (canceled || generationChanged()) {
+            if (!canceled) scheduleFromCurrentState();
             return;
           }
           adoptSnapshot(refreshedSnapshot);
-          nextDelay = pollDelay(
-            refreshedSnapshot.session.runtimeStatus,
-            pollIntervals,
-          );
+          void refreshSessions();
+          nextDelay = pollDelay(refreshedSnapshot.session.runtimeStatus, pollIntervals);
         }
       } catch (error) {
         if (generationChanged()) {
@@ -429,26 +537,21 @@ export function App({
         if (!canceled) setPollError(errorDetails(error).message);
         nextDelay = pollIntervals.idleMs;
       }
-
       schedule(nextDelay);
     };
-
-    const currentSnapshot = snapshotRef.current;
-    if (currentSnapshot !== null) {
-      schedule(pollDelay(currentSnapshot.session.runtimeStatus, pollIntervals));
+    if (snapshotRef.current !== null) {
+      schedule(pollDelay(snapshotRef.current.session.runtimeStatus, pollIntervals));
     }
-
     return () => {
       canceled = true;
       if (timer !== null) clearTimeout(timer);
     };
-  }, [adoptSnapshot, api, bootstrap, pollIntervals, sessionId]);
+  }, [adoptSnapshot, api, bootstrap, pollIntervals, refreshSessions, sessionId]);
 
   const timeline = useMemo<readonly TimelineItem[]>(() => {
     if (snapshot === null || eventState === null) return [];
     return projectTimeline(snapshot, eventState.events);
   }, [eventState, snapshot]);
-
   const selectedItem = useMemo(
     () => timeline.find(({ id }) => id === selectedItemId) ?? null,
     [selectedItemId, timeline],
@@ -464,6 +567,25 @@ export function App({
         : getToolPresentation(selectedItem, toolPresentationIndex),
     [selectedItem, toolPresentationIndex],
   );
+  const queuedTurns = useMemo(
+    () =>
+      new Map<string, TurnRow>(
+        (snapshot?.turns ?? [])
+          .filter((turn) => turn.status === 'queued')
+          .map((turn) => [turn.id, turn]),
+      ),
+    [snapshot],
+  );
+  const cancelDisplayStates = useMemo<ReadonlyMap<string, CancelMutationDisplayState>>(
+    () =>
+      new Map(
+        [...cancelMutations.entries()].map(([turnId, state]) => [
+          turnId,
+          { status: state.status },
+        ]),
+      ),
+    [cancelMutations],
+  );
 
   const completeMutation = useCallback(
     async (
@@ -474,18 +596,22 @@ export function App({
       mutationInFlight.current = true;
       setMutationPending(true);
       setMutationFailure(null);
-
       try {
         if (context.kind === 'session') {
           const result = await context.operation[method]();
-          storeSessionId(storage, result.sessionId);
-          const nextSnapshot = await api.getSnapshot(result.sessionId);
-          adoptSnapshot(nextSnapshot);
+          await openSession(result.sessionId);
         } else {
           await context.operation[method]();
+          const selectionGeneration = selectionGenerationRef.current;
           const nextSnapshot = await api.getSnapshot(context.sessionId);
-          adoptSnapshot(nextSnapshot);
+          if (
+            selectionGeneration === selectionGenerationRef.current &&
+            selectedSessionIdRef.current === context.sessionId
+          ) {
+            adoptSnapshot(nextSnapshot);
+          }
         }
+        await refreshSessions();
         setComposerResetSignal((value) => value + 1);
         setMutationFailure(null);
         return true;
@@ -498,7 +624,7 @@ export function App({
         setMutationPending(false);
       }
     },
-    [adoptSnapshot, api, storage],
+    [adoptSnapshot, api, openSession, refreshSessions],
   );
 
   const submitPrompt = useCallback(
@@ -522,28 +648,123 @@ export function App({
   );
 
   const retryMutation = useCallback(async (): Promise<void> => {
-    if (mutationFailure === null) return;
-    await completeMutation(mutationFailure.context, 'retry');
+    if (mutationFailure !== null) {
+      await completeMutation(mutationFailure.context, 'retry');
+    }
   }, [completeMutation, mutationFailure]);
+
+  const cancelTurn = useCallback(
+    async (turnId: string): Promise<void> => {
+      const currentSnapshot = snapshotRef.current;
+      if (
+        currentSnapshot === null ||
+        bootstrap.status !== 'ready' ||
+        bootstrap.runtime.daemon.status !== 'ready' ||
+        pollError !== null ||
+        !queuedTurns.has(turnId)
+      ) {
+        return;
+      }
+      const sessionId = currentSnapshot.session.id;
+      const existing = cancelMutations.get(turnId);
+      const operation =
+        existing?.operation ??
+        cancelOperationsRef.current.get(turnId) ??
+        api.createCancelTurnOperation(sessionId, turnId);
+      cancelOperationsRef.current.set(turnId, operation);
+      setCancelMutations((current) =>
+        new Map(current).set(turnId, { operation, status: 'pending' }),
+      );
+      const selectionGeneration = selectionGenerationRef.current;
+      try {
+        await operation[existing?.status === 'error' ? 'retry' : 'execute']();
+        const nextSnapshot = await api.getSnapshot(sessionId);
+        if (
+          selectionGeneration === selectionGenerationRef.current &&
+          selectedSessionIdRef.current === sessionId
+        ) {
+          adoptSnapshot(nextSnapshot);
+          setCancelMutations((current) => {
+            const next = new Map(current);
+            next.delete(turnId);
+            return next;
+          });
+          requestAnimationFrame(() =>
+            document
+              .querySelector<HTMLButtonElement>(
+                `[data-turn-inspect-id="${turnId}"]`,
+              )
+              ?.focus(),
+          );
+        }
+        await refreshSessions();
+      } catch (error) {
+        const details = errorDetails(error);
+        const conflict = details.code === 'TURN_NOT_CANCELLABLE';
+        setCancelMutations((current) =>
+          new Map(current).set(turnId, {
+            operation,
+            status: conflict ? 'conflict' : 'error',
+          }),
+        );
+        if (conflict) {
+          try {
+            const nextSnapshot = await api.getSnapshot(sessionId);
+            if (
+              selectionGeneration === selectionGenerationRef.current &&
+              selectedSessionIdRef.current === sessionId
+            ) {
+              adoptSnapshot(nextSnapshot);
+            }
+          } catch {
+            await refreshSessions();
+            return;
+          }
+          await refreshSessions();
+        }
+      }
+    },
+    [
+      adoptSnapshot,
+      api,
+      bootstrap,
+      cancelMutations,
+      pollError,
+      queuedTurns,
+      refreshSessions,
+    ],
+  );
 
   const startNewTask = (): void => {
     if (mutationPending) return;
+    selectionGenerationRef.current += 1;
+    selectedSessionIdRef.current = null;
+    setSelectedSessionId(null);
     clearStoredSessionId(storage);
-    clearSession();
+    clearAdoptedSession();
+    setSessionViewState('empty');
+    setActiveDrawer(null);
     setComposerResetSignal((value) => value + 1);
+  };
+
+  const selectSession = (nextSessionId: string): void => {
+    void openSession(nextSessionId);
+    if (viewportWidth < 820) {
+      sessionTitleRef.current?.focus();
+    }
   };
 
   const selectTimelineItem = (item: TimelineItem): void => {
     inspectorTrigger.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedItemId(item.id);
-    setInspectorOpen(true);
+    if (viewportWidth < 820) setActiveDrawer('inspector');
+    else setInspectorOverlayOpen(true);
   };
 
   const closeInspector = (): void => {
-    setInspectorOpen(false);
+    if (viewportWidth < 820) setActiveDrawer(null);
+    else setInspectorOverlayOpen(false);
     inspectorTrigger.current?.focus();
   };
 
@@ -554,17 +775,13 @@ export function App({
       </main>
     );
   }
-
   if (bootstrap.status === 'error') {
     return (
       <main className="boot-state">
         <section role="alert">
           <h1>Agent Workbench</h1>
           <p>{bootstrap.message}</p>
-          <button
-            type="button"
-            onClick={() => setBootstrapAttempt((value) => value + 1)}
-          >
+          <button type="button" onClick={() => setBootstrapAttempt((value) => value + 1)}>
             Retry connection
           </button>
         </section>
@@ -574,25 +791,39 @@ export function App({
 
   const daemonUnavailable = bootstrap.runtime.daemon.status !== 'ready';
   const runtimeUnavailable = daemonUnavailable || pollError !== null;
+  const narrowViewport = viewportWidth < 820;
   const compactInspector = viewportWidth < 1_100;
-  const inspectorPresentation =
-    viewportWidth < 820
-      ? 'drawer'
-      : compactInspector
-        ? 'overlay'
-        : 'panel';
+  const inspectorPresentation = narrowViewport
+    ? 'drawer'
+    : compactInspector
+      ? 'overlay'
+      : 'panel';
+  const inspectorOpen = !compactInspector
+    ? true
+    : narrowViewport
+      ? activeDrawer === 'inspector'
+      : inspectorOverlayOpen;
+  const selectedSummary = sessions?.find(({ id }) => id === selectedSessionId) ?? null;
+  const sessionStatus = selectedSummary?.runtimeStatus ?? snapshot?.session.runtimeStatus ?? null;
 
   return (
     <div className="workbench-shell">
-      <a className="skip-link" href="#task-workspace">
-        Skip to task workspace
-      </a>
+      <a className="skip-link" href="#task-workspace">Skip to task workspace</a>
       <NavigationRail
+        currentSession={snapshot?.session ?? null}
         daemonStatus={bootstrap.runtime.daemon.status}
         newTaskDisabled={mutationPending}
+        onCloseSessions={() => setActiveDrawer(null)}
         onNewTask={startNewTask}
-        session={snapshot?.session ?? null}
+        onOpenSessions={() =>
+          setActiveDrawer((current) => current === 'sessions' ? null : 'sessions')
+        }
+        onSelectSession={selectSession}
+        selectedSessionId={selectedSessionId}
+        sessionDrawerOpen={narrowViewport && activeDrawer === 'sessions'}
+        sessionListError={sessionListError}
         sessionStatusOverride={runtimeUnavailable ? 'disconnected' : null}
+        sessions={sessions}
         workspaceName={bootstrap.runtime.workspace.name}
       />
 
@@ -600,51 +831,69 @@ export function App({
         <SessionHeader
           compactInspector={compactInspector}
           inspectorOpen={inspectorOpen}
+          loading={sessionViewState === 'loading'}
           modelId={bootstrap.runtime.provider.modelId}
-          onToggleInspector={() => setInspectorOpen((value) => !value)}
+          onToggleInspector={(trigger) => {
+            inspectorTrigger.current = trigger;
+            if (narrowViewport) {
+              setActiveDrawer((current) => current === 'inspector' ? null : 'inspector');
+            } else {
+              setInspectorOverlayOpen((current) => !current);
+            }
+          }}
           session={snapshot?.session ?? null}
+          sessionStatus={sessionStatus}
           statusOverride={runtimeUnavailable ? 'Unavailable' : null}
+          titleRef={sessionTitleRef}
           workspaceName={bootstrap.runtime.workspace.name}
         />
 
         {runtimeUnavailable ? (
-          <div
-            className="runtime-status"
-            role="status"
-            aria-atomic="true"
-            aria-live="polite"
-          >
-            <strong>
-              {daemonUnavailable
-                ? 'Runtime unavailable'
-                : 'Live updates unavailable'}
-            </strong>
-            <span>
-              {daemonUnavailable
-                ? 'The local daemon is not ready.'
-                : pollError}
-            </span>
+          <div className="runtime-status" role="status" aria-atomic="true" aria-live="polite">
+            <strong>{daemonUnavailable ? 'Runtime unavailable' : 'Live updates unavailable'}</strong>
+            <span>{daemonUnavailable ? 'The local daemon is not ready.' : pollError}</span>
             {daemonUnavailable ? (
-              <button
-                type="button"
-                onClick={() => setBootstrapAttempt((value) => value + 1)}
-              >
+              <button type="button" onClick={() => setBootstrapAttempt((value) => value + 1)}>
                 Retry connection
               </button>
             ) : null}
           </div>
         ) : null}
 
-        <Timeline
-          items={timeline}
-          onSelect={selectTimelineItem}
-          runtimeUnavailable={runtimeUnavailable}
-          selectedItemId={selectedItemId}
-          toolPresentationIndex={toolPresentationIndex}
-        />
+        {sessionViewState === 'loading' ? (
+          <section className="session-view-state" aria-live="polite" aria-busy="true">
+            Loading Session…
+          </section>
+        ) : sessionViewState === 'error' ? (
+          <section className="session-view-state" role="alert">
+            <p>Couldn’t open this Session.</p>
+            <button type="button" onClick={() => selectedSessionId && void openSession(selectedSessionId)}>
+              Try again
+            </button>
+          </section>
+        ) : null}
 
+        {sessionViewState === 'loading' || sessionViewState === 'error' ? null : (
+          <>
+            <Timeline
+              cancelStates={cancelDisplayStates}
+              onCancel={cancelTurn}
+              items={timeline}
+              onSelect={selectTimelineItem}
+              queuedTurns={queuedTurns}
+              runtimeReady={!runtimeUnavailable}
+              runtimeUnavailable={runtimeUnavailable}
+              selectedItemId={selectedItemId}
+              toolPresentationIndex={toolPresentationIndex}
+            />
+          </>
+        )}
         <Composer
-          disabled={runtimeUnavailable}
+          disabled={
+            runtimeUnavailable ||
+            sessionViewState === 'loading' ||
+            sessionViewState === 'error'
+          }
           error={mutationFailure}
           hasSession={snapshot !== null}
           onRetry={() => void retryMutation()}
@@ -657,7 +906,7 @@ export function App({
       <Inspector
         item={selectedItem}
         onClose={closeInspector}
-        open={!compactInspector || inspectorOpen}
+        open={inspectorOpen}
         presentation={inspectorPresentation}
         tool={selectedTool}
       />

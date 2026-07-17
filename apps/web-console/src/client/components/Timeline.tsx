@@ -17,11 +17,19 @@ export type ToolPresentationIndex = Readonly<{
 }>;
 
 type TimelineProps = Readonly<{
+  cancelStates: ReadonlyMap<string, CancelMutationDisplayState>;
   items: readonly TimelineItem[];
+  onCancel(turnId: string): void;
   onSelect(item: TimelineItem): void;
+  queuedTurns: ReadonlyMap<string, { readonly ordinal: number }>;
+  runtimeReady: boolean;
   runtimeUnavailable: boolean;
   selectedItemId: string | null;
   toolPresentationIndex: ToolPresentationIndex;
+}>;
+
+export type CancelMutationDisplayState = Readonly<{
+  status: 'pending' | 'error' | 'conflict';
 }>;
 
 const activeItemStatuses = new Set<TimelineItem['status']>([
@@ -158,14 +166,22 @@ function TimelineIcon({ kind }: Readonly<{ kind: TimelineItem['kind'] }>) {
 }
 
 function TimelineCard({
+  cancelStates,
   item,
+  onCancel,
   onSelect,
+  queuedTurns,
+  runtimeReady,
   runtimeUnavailable,
   selected,
   toolPresentationIndex,
 }: Readonly<{
+  cancelStates: ReadonlyMap<string, CancelMutationDisplayState>;
   item: TimelineItem;
+  onCancel(turnId: string): void;
   onSelect(item: TimelineItem): void;
+  queuedTurns: ReadonlyMap<string, { readonly ordinal: number }>;
+  runtimeReady: boolean;
   runtimeUnavailable: boolean;
   selected: boolean;
   toolPresentationIndex: ToolPresentationIndex;
@@ -180,17 +196,25 @@ function TimelineCard({
     tool === null
       ? `${showLastKnownState ? 'Last known state' : item.title} ${displayedStatus}`
       : `Tool ${tool.toolId} ${displayedStatus}`;
+  const queuedTurn = item.kind === 'turn' && item.turnId !== null
+    ? queuedTurns.get(item.turnId) ?? null
+    : null;
+  const cancelState = item.turnId === null ? null : cancelStates.get(item.turnId) ?? null;
 
   return (
-    <button
-      type="button"
+    <article
       className="timeline-card"
-      aria-label={label}
-      aria-pressed={selected}
       data-kind={item.kind}
       data-status={showLastKnownState ? 'unavailable' : item.status}
-      onClick={() => onSelect(item)}
     >
+      <button
+        type="button"
+        className="timeline-inspect"
+        data-turn-inspect-id={item.kind === 'turn' ? item.turnId ?? undefined : undefined}
+        aria-label={label}
+        aria-pressed={selected}
+        onClick={() => onSelect(item)}
+      >
       {item.kind === 'message' ? (
         <>
           <span className="timeline-card-heading">
@@ -292,13 +316,53 @@ function TimelineCard({
           <span className="status-chip">redacted</span>
         </span>
       ) : null}
-    </button>
+      </button>
+
+      {queuedTurn !== null || cancelState?.status === 'conflict' ? (
+        <div className="timeline-card-actions">
+          {cancelState?.status === 'conflict' ? (
+            <p role="status">This turn started before it could be canceled.</p>
+          ) : null}
+          {queuedTurn === null ? null : cancelState?.status === 'error' ? (
+            <>
+              <p role="alert">Couldn’t cancel this queued turn.</p>
+              <button type="button" onClick={() => onCancel(item.turnId as string)}>
+                Try again
+              </button>
+            </>
+          ) : (
+            <>
+              {runtimeReady ? null : (
+                <p id={`cancel-turn-${queuedTurn.ordinal}-unavailable`}>
+                  Reconnect to cancel this queued turn.
+                </p>
+              )}
+              <button
+                type="button"
+                aria-describedby={
+                  runtimeReady ? undefined : `cancel-turn-${queuedTurn.ordinal}-unavailable`
+                }
+                aria-label={`Cancel queued Turn ${queuedTurn.ordinal}`}
+                disabled={!runtimeReady || cancelState?.status === 'pending'}
+                onClick={() => onCancel(item.turnId as string)}
+              >
+                {cancelState?.status === 'pending' ? 'Canceling…' : 'Cancel queued turn'}
+              </button>
+            </>
+          )}
+        </div>
+      ) : null}
+    </article>
   );
 }
 
 export function Timeline({
+  cancelStates,
   items,
+  onCancel,
   onSelect,
+  queuedTurns,
+  runtimeReady,
   runtimeUnavailable,
   selectedItemId,
   toolPresentationIndex,
@@ -326,8 +390,12 @@ export function Timeline({
           {visibleItems.map((item) => (
             <li key={item.id}>
               <TimelineCard
+                cancelStates={cancelStates}
                 item={item}
+                onCancel={onCancel}
                 onSelect={onSelect}
+                queuedTurns={queuedTurns}
+                runtimeReady={runtimeReady}
                 runtimeUnavailable={runtimeUnavailable}
                 selected={selectedItemId === item.id}
                 toolPresentationIndex={toolPresentationIndex}

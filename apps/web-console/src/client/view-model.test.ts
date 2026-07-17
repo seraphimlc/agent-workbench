@@ -289,6 +289,50 @@ describe('authoritative timeline projection', () => {
     );
   });
 
+  it('projects canceled events and canceled Turn fallbacks as stable canceled cards', () => {
+    const canceledTurn = {
+      ...turn(1, 'canceled'),
+      startedAt: null,
+      finishedAt: timestamp(2),
+    };
+    const canceledEvent = visibleEvent(1, 'turn.canceled', {
+      turnId: canceledTurn.id,
+      payload: { ordinal: 1, queueKind: 'normal' },
+    });
+    const canceledSnapshot = {
+      ...snapshot,
+      events: [canceledEvent],
+      highWaterSeq: 1,
+      messages: [],
+      turns: [canceledTurn],
+    };
+
+    expect(projectTimeline(canceledSnapshot)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'event:event-1',
+          kind: 'turn',
+          status: 'canceled',
+          title: 'Canceled',
+          summary: 'Canceled before start.',
+        }),
+      ]),
+    );
+    expect(
+      projectTimeline({ ...canceledSnapshot, events: [], highWaterSeq: 0 }),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'turn:turn-1',
+          kind: 'turn',
+          status: 'canceled',
+          title: 'Canceled',
+          summary: 'Canceled before start.',
+        }),
+      ]),
+    );
+  });
+
   it('keeps immutable inspector detail for visible and redacted items', () => {
     const timeline = projectTimeline(snapshot, events);
     const tool = timeline.find(({ id }) => id === 'event:event-5');

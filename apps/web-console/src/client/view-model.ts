@@ -39,6 +39,7 @@ export type TimelineItemStatus =
   | MessageRow['status']
   | 'queued'
   | 'started'
+  | 'canceled'
   | 'succeeded'
   | 'failed'
   | 'observed'
@@ -53,6 +54,10 @@ export type TimelineItemDetail =
   | {
       readonly source: 'event';
       readonly event: RendererSessionEventEnvelope;
+    }
+  | {
+      readonly source: 'turn';
+      readonly turn: TurnRow;
     }
   | {
       readonly source: 'redacted';
@@ -196,6 +201,7 @@ const itemFromEvent = (
 
   const display = {
     'turn.queued': ['turn', 'queued', 'Turn queued'],
+    'turn.canceled': ['turn', 'canceled', 'Canceled'],
     'turn.succeeded': ['turn', 'succeeded', 'Turn succeeded'],
     'turn.failed': ['turn', 'failed', 'Turn failed'],
     'turn.interrupted': ['turn', 'interrupted', 'Turn interrupted'],
@@ -229,7 +235,10 @@ const itemFromEvent = (
     status,
     role: null,
     title,
-    summary: eventSummary(event),
+    summary:
+      event.type === 'turn.canceled'
+        ? 'Canceled before start.'
+        : eventSummary(event),
     createdAt: event.createdAt,
     turnId: event.turnId,
     seq: event.seq,
@@ -237,7 +246,22 @@ const itemFromEvent = (
   });
 };
 
+const itemFromCanceledTurn = (turn: TurnRow): TimelineItem =>
+  Object.freeze({
+    id: `turn:${turn.id}`,
+    kind: 'turn',
+    status: 'canceled',
+    role: null,
+    title: 'Canceled',
+    summary: 'Canceled before start.',
+    createdAt: turn.finishedAt ?? turn.queuedAt,
+    turnId: turn.id,
+    seq: null,
+    detail: cloneAndFreeze({ source: 'turn', turn } as const),
+  });
+
 const terminalTurnEvents = new Set([
+  'turn.canceled',
   'turn.succeeded',
   'turn.failed',
   'turn.interrupted',
@@ -321,6 +345,7 @@ export const projectTimeline = (
     snapshot.messages.map((message) => [message.id, message]),
   );
   const placedMessages = new Set<string>();
+  const canceledTurnEventIds = new Set<string>();
   const items: TimelineItem[] = [];
 
   const appendMessage = (messageId: string | null | undefined): void => {
@@ -342,6 +367,9 @@ export const projectTimeline = (
   for (const event of orderedEvents) {
     const turn = event.turnId ? turns.get(event.turnId) : undefined;
     if (event.type === 'turn.queued') appendMessage(turn?.inputMessageId);
+    if (event.type === 'turn.canceled' && event.turnId !== null) {
+      canceledTurnEventIds.add(event.turnId);
+    }
 
     items.push(itemFromEvent(event));
 
@@ -354,6 +382,9 @@ export const projectTimeline = (
     (left, right) => left.ordinal - right.ordinal,
   )) {
     appendMessage(turn.inputMessageId);
+    if (turn.status === 'canceled' && !canceledTurnEventIds.has(turn.id)) {
+      items.push(itemFromCanceledTurn(turn));
+    }
     appendMessage(turn.resultMessageId);
   }
 
