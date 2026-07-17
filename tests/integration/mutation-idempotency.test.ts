@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   SessionCreateResultSchema,
+  SessionListResultSchema,
   SessionSnapshotSchema,
+  TurnCancelResultSchema,
   TurnEnqueueResultSchema,
   WorkspaceRegisterResultSchema,
   type RpcRequestEnvelope,
@@ -48,7 +50,7 @@ const waitForCondition = async (
 
 const mutationRequest = (
   client: RpcClient,
-  method: 'workspace.register' | 'session.create' | 'turn.enqueue',
+  method: 'workspace.register' | 'session.create' | 'turn.enqueue' | 'turn.cancel',
   payload: unknown,
   clientRequestId: string,
   sessionId: string | null = null,
@@ -812,4 +814,115 @@ describe('mutation idempotency', () => {
       afterRetry.close();
     }
   }, 15_000);
+
+  it('lists active Sessions and cancels queued Turns idempotently over authenticated RPC', async () => {
+    runtime = createTempRuntime();
+    const workspacePath = join(runtime.rootDir, 'workspace');
+    mkdirSync(workspacePath);
+    const daemon = runtime.spawnDaemon();
+    await daemon.waitForReady();
+    const client = await connect(daemon);
+    const workspaceId = await registerWorkspace(client, workspacePath, 'list-cancel-workspace');
+    const created = await createSession(client, workspaceId, 'list-cancel-session');
+    const queued = await client.sendRequest(
+      mutationRequest(
+        client,
+        'turn.enqueue',
+        { sessionId: created.sessionId, prompt: 'Cancel this queued Turn' },
+        'list-cancel-enqueue',
+        created.sessionId,
+      ),
+    );
+    expect(queued.ok).toBe(true);
+    if (!queued.ok) {
+      throw new Error('turn.enqueue failed');
+    }
+    const queuedTurn = TurnEnqueueResultSchema.parse(queued.result);
+
+    const listedRequest = client.createRequest('session.list', {});
+    const listed = await client.sendRequest(listedRequest);
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) {
+      throw new Error('session.list failed');
+    }
+    expect(SessionListResultSchema.parse(listed.result)).toEqual({
+      sessions: [
+        expect.objectContaining({
+          id: created.sessionId,
+          queuedTurnCount: 2,
+          currentTurnId: null,
+          runtimeStatus: 'queued',
+        }),
+      ],
+    });
+
+    const firstRequest = mutationRequest(
+      client,
+      'turn.cancel',
+      { sessionId: created.sessionId, turnId: queuedTurn.turnId },
+      'list-cancel-key',
+      created.sessionId,
+    );
+    const first = await client.sendRequest(firstRequest);
+    expect(first.ok).toBe(true);
+    if (!first.ok) {
+      throw new Error('turn.cancel failed');
+    }
+    const expected = TurnCancelResultSchema.parse(first.result);
+    const replay = await client.sendRequest({
+      ...mutationRequest(
+        client,
+        'turn.cancel',
+        { sessionId: created.sessionId, turnId: queuedTurn.turnId },
+        'list-cancel-key',
+        created.sessionId,
+      ),
+    });
+    expect(replay).toMatchObject({ ok: true, result: expected });
+    const retry = await client.sendRequest(
+      mutationRequest(
+        client,
+        'turn.cancel',
+        { sessionId: created.sessionId, turnId: queuedTurn.turnId },
+        'list-cancel-retry-key',
+        created.sessionId,
+      ),
+    );
+    expect(retry).toMatchObject({ ok: true, result: expected });
+
+    const conflict = await client.sendRequest(
+      mutationRequest(
+        client,
+        'turn.cancel',
+        { sessionId: created.sessionId, turnId: created.turnId },
+        'list-cancel-key',
+        created.sessionId,
+      ),
+    );
+    expectIdempotencyConflict(conflict, {
+      ...firstRequest,
+      requestId: conflict.requestId,
+      traceId: conflict.traceId,
+    });
+
+    const snapshotResponse = await client.sendRequest({
+      ...client.createRequest('session.getSnapshot', { sessionId: created.sessionId }),
+      sessionId: created.sessionId,
+    });
+    expect(snapshotResponse.ok).toBe(true);
+    if (!snapshotResponse.ok) {
+      throw new Error('session.getSnapshot failed');
+    }
+    const snapshot = SessionSnapshotSchema.parse(snapshotResponse.result);
+    expect(snapshot.turns.map((turn) => [turn.id, turn.ordinal, turn.status])).toEqual([
+      [created.turnId, 1, 'queued'],
+      [queuedTurn.turnId, 2, 'canceled'],
+    ]);
+    expect(snapshot.events.filter((event) => event.type === 'turn.canceled')).toEqual([
+      expect.objectContaining({
+        turnId: queuedTurn.turnId,
+        payload: { ordinal: 2, queueKind: 'normal' },
+      }),
+    ]);
+  });
 });

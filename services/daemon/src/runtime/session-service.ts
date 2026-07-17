@@ -1,16 +1,21 @@
 import {
   EventListAfterResultSchema,
   SessionCreateResultSchema,
+  SessionListResultSchema,
   SessionSnapshotSchema,
+  TurnCancelResultSchema,
   TurnEnqueueResultSchema,
   WorkspaceRegisterResultSchema,
   type EventListAfterPayload,
   type EventListAfterResult,
   type SessionCreatePayload,
   type SessionCreateResult,
+  type SessionListResult,
   type SessionSnapshot,
   type TurnEnqueuePayload,
   type TurnEnqueueResult,
+  type TurnCancelPayload,
+  type TurnCancelResult,
   type WorkspaceRegisterPayload,
   type WorkspaceRegisterResult,
 } from '@agent-workbench/protocol';
@@ -26,7 +31,7 @@ import { DomainError, domainErrors } from '../db/errors.js';
 import { IdempotencyRepository } from '../db/idempotency-repository.js';
 import { SessionRepository } from '../db/session-repository.js';
 
-type MutationMethod = 'workspace.register' | 'session.create' | 'turn.enqueue';
+type MutationMethod = 'workspace.register' | 'session.create' | 'turn.enqueue' | 'turn.cancel';
 
 export interface SessionServiceHooks {
   readonly afterIdempotencyMiss?: (context: {
@@ -152,6 +157,32 @@ export class SessionService {
     );
   }
 
+  listSessions(): SessionListResult {
+    return SessionListResultSchema.parse(this.sessions.listActiveSessions());
+  }
+
+  cancelTurn(
+    payload: TurnCancelPayload,
+    clientRequestId: string,
+  ): TurnCancelResult {
+    return this.mutate(
+      'turn.cancel',
+      payload,
+      clientRequestId,
+      TurnCancelResultSchema,
+      (now) => {
+        this.sessions.cancelQueuedTurn({
+          eventId: uuidv7(),
+          sessionId: payload.sessionId,
+          turnId: payload.turnId,
+          now,
+        });
+        return { turnId: payload.turnId, status: 'canceled' };
+      },
+      () => this.sessions.verifyCanceledTurnCanReplay(payload.sessionId, payload.turnId),
+    );
+  }
+
   getSnapshot(sessionId: string): SessionSnapshot {
     return SessionSnapshotSchema.parse(this.sessions.getSnapshot(sessionId));
   }
@@ -166,6 +197,7 @@ export class SessionService {
     clientRequestId: string,
     resultSchema: ZodType<Result>,
     createResult: (now: string) => Result,
+    validateReplay?: () => void,
   ): Result {
     const normalizedPayloadHash = hashCanonicalJson(payload);
     const transaction = this.database.transaction(() => {
@@ -176,6 +208,7 @@ export class SessionService {
         resultSchema,
       );
       if (replay.hit) {
+        validateReplay?.();
         return replay.result;
       }
 

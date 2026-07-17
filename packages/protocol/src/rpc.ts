@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { RendererSessionEventEnvelopeSchema } from './events.js';
-import { SessionSnapshotSchema } from './runtime.js';
+import { SessionRuntimeStatusSchema, SessionSnapshotSchema } from './runtime.js';
 
 const NonEmptyStringSchema = z.string().min(1);
 const NonNegativeIntegerSchema = z.number().int().nonnegative();
@@ -12,8 +12,10 @@ export const RpcMethodSchema = z.enum([
   'app.health',
   'workspace.register',
   'session.create',
+  'session.list',
   'session.getSnapshot',
   'turn.enqueue',
+  'turn.cancel',
   'event.listAfter',
 ]);
 
@@ -37,10 +39,17 @@ export const SessionCreatePayloadSchema = z
 export const SessionGetSnapshotPayloadSchema = z
   .object({ sessionId: NonEmptyStringSchema })
   .strict();
+export const SessionListPayloadSchema = z.object({}).strict();
 export const TurnEnqueuePayloadSchema = z
   .object({
     sessionId: NonEmptyStringSchema,
     prompt: z.string().min(1),
+  })
+  .strict();
+export const TurnCancelPayloadSchema = z
+  .object({
+    sessionId: NonEmptyStringSchema,
+    turnId: NonEmptyStringSchema,
   })
   .strict();
 export const EventListAfterPayloadSchema = z
@@ -69,7 +78,42 @@ export const SessionCreateResultSchema = z
   })
   .strict();
 export const SessionGetSnapshotResultSchema = SessionSnapshotSchema;
+export const SessionSummarySchema = z
+  .object({
+    id: NonEmptyStringSchema,
+    title: z.string(),
+    runtimeStatus: SessionRuntimeStatusSchema,
+    currentTurnId: NonEmptyStringSchema.nullable(),
+    queuedTurnCount: NonNegativeIntegerSchema,
+    updatedAt: NonEmptyStringSchema,
+  })
+  .strict();
+export const SessionListResultSchema = z
+  .object({ sessions: z.array(SessionSummarySchema) })
+  .strict()
+  .superRefine((result, context) => {
+    result.sessions.forEach((session, index) => {
+      const previous = result.sessions[index - 1];
+      if (
+        previous &&
+        (previous.updatedAt < session.updatedAt ||
+          (previous.updatedAt === session.updatedAt && previous.id < session.id))
+      ) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Sessions must be ordered by updatedAt and id descending',
+          path: ['sessions', index],
+        });
+      }
+    });
+  });
 export const TurnEnqueueResultSchema = z.object({ turnId: NonEmptyStringSchema }).strict();
+export const TurnCancelResultSchema = z
+  .object({
+    turnId: NonEmptyStringSchema,
+    status: z.literal('canceled'),
+  })
+  .strict();
 export const EventListAfterResultSchema = z
   .object({
     events: z.array(RendererSessionEventEnvelopeSchema),
@@ -227,11 +271,36 @@ export const SessionGetSnapshotRequestSchema = z
       });
     }
   });
+export const SessionListRequestSchema = z
+  .object({
+    ...UnscopedRequestBaseShape,
+    method: z.literal('session.list'),
+    payload: SessionListPayloadSchema,
+    clientRequestId: z.null(),
+  })
+  .strict();
 export const TurnEnqueueRequestSchema = z
   .object({
     ...SessionScopedRequestBaseShape,
     method: z.literal('turn.enqueue'),
     payload: TurnEnqueuePayloadSchema,
+    clientRequestId: NonEmptyStringSchema,
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (request.sessionId !== request.payload.sessionId) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Top-level sessionId must match payload.sessionId',
+        path: ['sessionId'],
+      });
+    }
+  });
+export const TurnCancelRequestSchema = z
+  .object({
+    ...SessionScopedRequestBaseShape,
+    method: z.literal('turn.cancel'),
+    payload: TurnCancelPayloadSchema,
     clientRequestId: NonEmptyStringSchema,
   })
   .strict()
@@ -267,8 +336,10 @@ export const RpcRequestSchema = z.discriminatedUnion('method', [
   AppHealthRequestSchema,
   WorkspaceRegisterRequestSchema,
   SessionCreateRequestSchema,
+  SessionListRequestSchema,
   SessionGetSnapshotRequestSchema,
   TurnEnqueueRequestSchema,
+  TurnCancelRequestSchema,
   EventListAfterRequestSchema,
 ]);
 
@@ -404,15 +475,20 @@ export type AuthRespondPayload = z.infer<typeof AuthRespondPayloadSchema>;
 export type AppHealthPayload = z.infer<typeof AppHealthPayloadSchema>;
 export type WorkspaceRegisterPayload = z.infer<typeof WorkspaceRegisterPayloadSchema>;
 export type SessionCreatePayload = z.infer<typeof SessionCreatePayloadSchema>;
+export type SessionListPayload = z.infer<typeof SessionListPayloadSchema>;
 export type SessionGetSnapshotPayload = z.infer<typeof SessionGetSnapshotPayloadSchema>;
 export type TurnEnqueuePayload = z.infer<typeof TurnEnqueuePayloadSchema>;
+export type TurnCancelPayload = z.infer<typeof TurnCancelPayloadSchema>;
 export type EventListAfterPayload = z.infer<typeof EventListAfterPayloadSchema>;
 export type AuthRespondResult = z.infer<typeof AuthRespondResultSchema>;
 export type AppHealthResult = z.infer<typeof AppHealthResultSchema>;
 export type WorkspaceRegisterResult = z.infer<typeof WorkspaceRegisterResultSchema>;
 export type SessionCreateResult = z.infer<typeof SessionCreateResultSchema>;
+export type SessionListResult = z.infer<typeof SessionListResultSchema>;
+export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 export type SessionGetSnapshotResult = z.infer<typeof SessionGetSnapshotResultSchema>;
 export type TurnEnqueueResult = z.infer<typeof TurnEnqueueResultSchema>;
+export type TurnCancelResult = z.infer<typeof TurnCancelResultSchema>;
 export type EventListAfterResult = z.infer<typeof EventListAfterResultSchema>;
 export type RpcRequestEnvelope = z.infer<typeof RpcRequestEnvelopeSchema>;
 export type RpcRequest = z.infer<typeof RpcRequestSchema>;

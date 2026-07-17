@@ -155,6 +155,7 @@ describe('request envelopes', () => {
       null,
     ],
     ['turn.enqueue', { sessionId: 'session-1', prompt: 'Continue' }, 'session-1'],
+    ['turn.cancel', { sessionId: 'session-1', turnId: 'turn-1' }, 'session-1'],
   ])('requires a non-empty clientRequestId for %s', (method, payload, sessionId) => {
     const schema = getSchema('RpcRequestSchema');
     const request = { ...baseRequest, sessionId, method, payload };
@@ -168,6 +169,7 @@ describe('request envelopes', () => {
   it.each([
     ['auth.respond', { nonce: 'nonce-1', mac: 'mac-1' }, null],
     ['app.health', {}, null],
+    ['session.list', {}, null],
     ['session.getSnapshot', { sessionId: 'session-1' }, 'session-1'],
     ['event.listAfter', { sessionId: 'session-1', afterSeq: 0, limit: 100 }, 'session-1'],
   ])('requires null clientRequestId for %s', (method, payload, sessionId) => {
@@ -181,6 +183,7 @@ describe('request envelopes', () => {
   it.each([
     ['auth.respond', { nonce: 'nonce-1', mac: 'mac-1' }, null],
     ['app.health', {}, null],
+    ['session.list', {}, null],
     ['workspace.register', { path: '/tmp/workspace' }, 'client-1'],
     [
       'session.create',
@@ -205,6 +208,7 @@ describe('request envelopes', () => {
   it.each([
     ['session.getSnapshot', { sessionId: 'session-1' }, null],
     ['turn.enqueue', { sessionId: 'session-1', prompt: 'Continue' }, 'client-1'],
+    ['turn.cancel', { sessionId: 'session-1', turnId: 'turn-1' }, 'client-1'],
     ['event.listAfter', { sessionId: 'session-1', afterSeq: 0, limit: 100 }, null],
   ])('binds top-level Session scope to the %s payload', (method, payload, clientRequestId) => {
     const schema = getSchema('RpcRequestSchema');
@@ -291,6 +295,26 @@ describe('response envelopes', () => {
     expect(schema.safeParse({ ...baseResponse, ok: false, result }).success).toBe(false);
   });
 
+  it('requires session.list results to be ordered by updatedAt then id descending', () => {
+    const schema = getSchema('SessionListResultSchema');
+    const later = {
+      id: 'session-z',
+      title: 'Later',
+      runtimeStatus: 'queued',
+      currentTurnId: null,
+      queuedTurnCount: 1,
+      updatedAt: '2026-07-17T01:00:00.000Z',
+    };
+    const earlier = {
+      ...later,
+      id: 'session-a',
+      updatedAt: '2026-07-17T00:00:00.000Z',
+    };
+
+    expect(schema.safeParse({ sessions: [later, earlier] }).success).toBe(true);
+    expect(schema.safeParse({ sessions: [earlier, later] }).success).toBe(false);
+  });
+
   it('validates the canonical cross-process ErrorEnvelope without inline details', () => {
     const schema = getSchema('ErrorEnvelopeSchema');
 
@@ -320,6 +344,23 @@ describe('response envelopes', () => {
       { ...sessionSnapshot, highWaterSeq: 0 },
     ],
     ['TurnEnqueueResultSchema', { turnId: 'turn-1' }, { turnId: '' }],
+    [
+      'SessionListResultSchema',
+      {
+        sessions: [
+          {
+            id: 'session-1',
+            title: 'Session',
+            runtimeStatus: 'queued',
+            currentTurnId: null,
+            queuedTurnCount: 1,
+            updatedAt: '2026-07-14T00:00:00.000Z',
+          },
+        ],
+      },
+      { sessions: [{ id: 'session-1' }] },
+    ],
+    ['TurnCancelResultSchema', { turnId: 'turn-1', status: 'canceled' }, { turnId: 'turn-1' }],
     [
       'EventListAfterResultSchema',
       { events: [visibleEvent], highWaterSeq: 1 },

@@ -37,10 +37,20 @@ export class Router {
         this.notifier?.notify();
         return result;
       }
+      case 'session.list':
+        return this.sessions.listSessions();
       case 'session.getSnapshot':
         return this.sessions.getSnapshot(request.payload.sessionId);
       case 'turn.enqueue': {
         const result = this.sessions.enqueueTurn(
+          request.payload,
+          request.clientRequestId,
+        );
+        this.notifier?.notify();
+        return result;
+      }
+      case 'turn.cancel': {
+        const result = this.sessions.cancelTurn(
           request.payload,
           request.clientRequestId,
         );

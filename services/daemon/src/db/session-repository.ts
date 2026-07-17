@@ -3,6 +3,7 @@ import {
   MessageRowSchema,
   RendererSessionEventEnvelopeSchema,
   SessionRowSchema,
+  SessionListResultSchema,
   SessionSnapshotSchema,
   TurnRowSchema,
   createEventListAfterResultSchema,
@@ -11,6 +12,7 @@ import {
   type MessageRow,
   type RendererSessionEventEnvelope,
   type SessionRow,
+  type SessionListResult,
   type SessionSnapshot,
   type TurnRow,
 } from '@agent-workbench/protocol';
@@ -50,9 +52,50 @@ export interface EnqueuedTurnFacts {
   readonly now: string;
 }
 
+export interface CanceledTurnFacts {
+  readonly eventId: string;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly now: string;
+}
+
 type SessionAllocation = {
   readonly nextTurnOrdinal: number;
   readonly nextEventSeq: number;
+};
+
+type CancelSession = {
+  readonly nextEventSeq: number;
+  readonly runtimeStatus: string;
+  readonly queueBlockReason: string | null;
+  readonly recoveryEpisode: number;
+  readonly recoverySourceTurnId: string | null;
+  readonly currentTurnId: string | null;
+};
+
+type CancelTurn = {
+  readonly ordinal: number;
+  readonly queueKind: string;
+  readonly status: string;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly errorCode: string | null;
+  readonly errorMessage: string | null;
+  readonly resultMessageId: string | null;
+  readonly executionFence: number;
+};
+
+type CancelEvent = {
+  readonly sessionId: string;
+  readonly turnId: string | null;
+  readonly toolRunId: string | null;
+  readonly seq: number;
+  readonly type: string;
+  readonly actor: string;
+  readonly audience: string;
+  readonly payloadJson: string;
+  readonly blobId: string | null;
+  readonly createdAt: string;
 };
 
 type StoredEvent = {
@@ -254,6 +297,125 @@ export class SessionRepository {
     }
   }
 
+  listActiveSessions(): SessionListResult {
+    const sessions = this.database
+      .prepare(
+        `SELECT sessions.id,
+                sessions.title,
+                sessions.runtime_status AS runtimeStatus,
+                sessions.current_turn_id AS currentTurnId,
+                COUNT(turns.id) AS queuedTurnCount,
+                sessions.updated_at AS updatedAt
+         FROM sessions
+         LEFT JOIN turns
+           ON turns.session_id = sessions.id
+          AND turns.status = 'queued'
+          AND turns.queue_kind = 'normal'
+         WHERE sessions.lifecycle_status = 'active'
+         GROUP BY sessions.id
+         ORDER BY sessions.updated_at DESC, sessions.id DESC`,
+      )
+      .all();
+    return SessionListResultSchema.parse({ sessions });
+  }
+
+  cancelQueuedTurn(facts: CanceledTurnFacts): void {
+    const { session, turn } = this.readCancelTarget(facts.sessionId, facts.turnId);
+    this.assertConsistentRecoveryProjection(session);
+
+    if (turn.status === 'canceled') {
+      this.assertCanceledTurnCanReplay(facts.sessionId, facts.turnId, session, turn);
+      return;
+    }
+
+    if (!this.isCleanQueuedTurn(facts.turnId, turn, session)) {
+      throw domainErrors.turnNotCancellable();
+    }
+    if (this.hasExecutionFacts(facts.turnId)) {
+      throw domainErrors.turnNotCancellable();
+    }
+
+    const canceled = this.database
+      .prepare(
+        `UPDATE turns
+         SET status = 'canceled', finished_at = ?
+         WHERE id = ? AND session_id = ?
+           AND status = 'queued' AND queue_kind = 'normal'
+           AND started_at IS NULL AND finished_at IS NULL
+           AND error_code IS NULL AND error_message IS NULL
+           AND result_message_id IS NULL AND execution_fence = 0
+           AND NOT EXISTS (
+             SELECT 1 FROM sessions
+             WHERE sessions.id = turns.session_id
+               AND sessions.current_turn_id = turns.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM scheduler_slots WHERE owner_turn_id = turns.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM runner_leases WHERE current_turn_id = turns.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM session_events
+             WHERE turn_id = turns.id AND type = 'turn.started'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM model_calls WHERE turn_id = turns.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM model_attempts
+             JOIN model_calls ON model_calls.id = model_attempts.model_call_id
+             WHERE model_calls.turn_id = turns.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM tool_runs WHERE turn_id = turns.id
+           )`,
+      )
+      .run(facts.now, facts.turnId, facts.sessionId);
+    if (canceled.changes !== 1) {
+      throw domainErrors.turnNotCancellable();
+    }
+
+    this.insertEvent({
+      id: facts.eventId,
+      sessionId: facts.sessionId,
+      turnId: facts.turnId,
+      seq: session.nextEventSeq,
+      type: 'turn.canceled',
+      payload: { ordinal: turn.ordinal, queueKind: 'normal' },
+      now: facts.now,
+    });
+    const projection = this.database
+      .prepare(
+        `UPDATE sessions
+         SET next_event_seq = next_event_seq + 1,
+             revision = revision + 1,
+             updated_at = ?,
+             runtime_status = CASE
+               WHEN queue_block_reason = 'recovery_review' THEN 'recovering'
+               WHEN current_turn_id IS NOT NULL THEN runtime_status
+               WHEN EXISTS (
+                 SELECT 1 FROM turns
+                 WHERE turns.session_id = sessions.id
+                   AND turns.status = 'queued'
+                   AND turns.queue_kind = 'normal'
+               ) THEN 'queued'
+               ELSE 'idle'
+             END
+         WHERE id = ? AND next_event_seq = ?`,
+      )
+      .run(facts.now, facts.sessionId, session.nextEventSeq);
+    if (projection.changes !== 1) {
+      throw new Error('Session allocation changed during cancel');
+    }
+  }
+
+  verifyCanceledTurnCanReplay(sessionId: string, turnId: string): void {
+    const { session, turn } = this.readCancelTarget(sessionId, turnId);
+    this.assertConsistentRecoveryProjection(session);
+    this.assertCanceledTurnCanReplay(sessionId, turnId, session, turn);
+  }
+
   getSnapshot(sessionId: string): SessionSnapshot {
     const readSnapshot = this.database.transaction(() => {
       const session = this.readSession(sessionId);
@@ -303,6 +465,197 @@ export class SessionRepository {
       });
     });
     return EventListAfterResultSchema.parse(readPage.deferred());
+  }
+
+  private readCancelTarget(
+    sessionId: string,
+    turnId: string,
+  ): { readonly session: CancelSession; readonly turn: CancelTurn } {
+    const session = this.database
+      .prepare(
+        `SELECT next_event_seq AS nextEventSeq, runtime_status AS runtimeStatus,
+                queue_block_reason AS queueBlockReason,
+                recovery_episode AS recoveryEpisode,
+                recovery_source_turn_id AS recoverySourceTurnId,
+                current_turn_id AS currentTurnId
+         FROM sessions WHERE id = ?`,
+      )
+      .get(sessionId) as CancelSession | undefined;
+    if (!session) {
+      throw domainErrors.sessionNotFound();
+    }
+
+    const turn = this.database
+      .prepare(
+        `SELECT ordinal, queue_kind AS queueKind, status,
+                started_at AS startedAt, finished_at AS finishedAt,
+                error_code AS errorCode, error_message AS errorMessage,
+                result_message_id AS resultMessageId,
+                execution_fence AS executionFence
+         FROM turns WHERE id = ? AND session_id = ?`,
+      )
+      .get(turnId, sessionId) as CancelTurn | undefined;
+    if (!turn) {
+      throw domainErrors.turnNotFound();
+    }
+    return { session, turn };
+  }
+
+  private isCleanQueuedTurn(
+    turnId: string,
+    turn: CancelTurn,
+    session: CancelSession,
+  ): boolean {
+    return (
+      turn.status === 'queued' &&
+      turn.queueKind === 'normal' &&
+      turn.startedAt === null &&
+      turn.finishedAt === null &&
+      turn.errorCode === null &&
+      turn.errorMessage === null &&
+      turn.resultMessageId === null &&
+      turn.executionFence === 0 &&
+      session.currentTurnId !== turnId
+    );
+  }
+
+  private assertCanceledTurnCanReplay(
+    sessionId: string,
+    turnId: string,
+    session: CancelSession,
+    turn: CancelTurn,
+  ): void {
+    if (
+      turn.status !== 'canceled' ||
+      turn.queueKind !== 'normal' ||
+      turn.startedAt !== null ||
+      turn.finishedAt === null ||
+      turn.errorCode !== null ||
+      turn.errorMessage !== null ||
+      turn.resultMessageId !== null ||
+      turn.executionFence !== 0 ||
+      session.currentTurnId === turnId ||
+      !this.hasCanonicalCanceledEvent(sessionId, turnId, session, turn) ||
+      this.hasExecutionFacts(turnId)
+    ) {
+      throw domainErrors.turnNotCancellable();
+    }
+  }
+
+  private hasExecutionFacts(turnId: string): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT (
+           EXISTS (SELECT 1 FROM scheduler_slots WHERE owner_turn_id = @turnId)
+           OR EXISTS (SELECT 1 FROM runner_leases WHERE current_turn_id = @turnId)
+           OR EXISTS (
+             SELECT 1 FROM session_events
+             WHERE turn_id = @turnId AND type = 'turn.started'
+           )
+           OR EXISTS (SELECT 1 FROM model_calls WHERE turn_id = @turnId)
+           OR EXISTS (
+             SELECT 1 FROM model_attempts
+             JOIN model_calls ON model_calls.id = model_attempts.model_call_id
+             WHERE model_calls.turn_id = @turnId
+           )
+           OR EXISTS (SELECT 1 FROM tool_runs WHERE turn_id = @turnId)
+         ) AS hasExecutionFacts`,
+      )
+      .get({ turnId }) as { readonly hasExecutionFacts: number };
+    return row.hasExecutionFacts === 1;
+  }
+
+  private assertConsistentRecoveryProjection(session: CancelSession): void {
+    const hasRecoveryMarker =
+      session.runtimeStatus === 'recovering' ||
+      session.queueBlockReason !== null ||
+      session.recoveryEpisode !== 0 ||
+      session.recoverySourceTurnId !== null;
+    const consistentRecovery =
+      session.runtimeStatus === 'recovering' &&
+      session.queueBlockReason === 'recovery_review' &&
+      session.currentTurnId === null &&
+      session.recoveryEpisode > 0 &&
+      session.recoverySourceTurnId !== null;
+    if (hasRecoveryMarker && !consistentRecovery) {
+      throw domainErrors.turnNotCancellable();
+    }
+  }
+
+  private hasCanonicalCanceledEvent(
+    sessionId: string,
+    turnId: string,
+    session: CancelSession,
+    turn: CancelTurn,
+  ): boolean {
+    const events = this.database
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId, tool_run_id AS toolRunId,
+                seq, type, actor, audience, payload_json AS payloadJson,
+                blob_id AS blobId, created_at AS createdAt
+         FROM session_events
+         WHERE session_id = ?
+         ORDER BY seq`,
+      )
+      .all(sessionId) as CancelEvent[];
+    const canceledEvents = this.database
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId, tool_run_id AS toolRunId,
+                seq, type, actor, audience, payload_json AS payloadJson,
+                blob_id AS blobId, created_at AS createdAt
+         FROM session_events
+         WHERE turn_id = ? AND type = 'turn.canceled'`,
+      )
+      .all(turnId) as CancelEvent[];
+    if (
+      canceledEvents.length !== 1 ||
+      events.length !== session.nextEventSeq - 1 ||
+      events.some((event, index) => event.seq !== index + 1)
+    ) {
+      return false;
+    }
+
+    const canceled = canceledEvents[0];
+    if (
+      !canceled ||
+      canceled.sessionId !== sessionId ||
+      canceled.turnId !== turnId ||
+      canceled.type !== 'turn.canceled' ||
+      canceled.actor !== 'daemon' ||
+      canceled.audience !== 'both' ||
+      canceled.toolRunId !== null ||
+      canceled.blobId !== null ||
+      canceled.createdAt !== turn.finishedAt ||
+      !this.hasCanonicalCanceledPayload(canceled.payloadJson, turn.ordinal)
+    ) {
+      return false;
+    }
+
+    const queuedEvents = events.filter(
+      (event) =>
+        event.turnId === turnId && event.type === 'turn.queued' && event.seq < canceled.seq,
+    );
+    return queuedEvents.length === 1;
+  }
+
+  private hasCanonicalCanceledPayload(payloadJson: string, ordinal: number): boolean {
+    try {
+      const payload = JSON.parse(payloadJson) as unknown;
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+        return false;
+      }
+      const record = payload as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      return (
+        keys.length === 2 &&
+        keys[0] === 'ordinal' &&
+        keys[1] === 'queueKind' &&
+        record.ordinal === ordinal &&
+        record.queueKind === 'normal'
+      );
+    } catch {
+      return false;
+    }
   }
 
   private insertEvent(event: {

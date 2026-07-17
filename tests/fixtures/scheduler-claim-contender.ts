@@ -9,7 +9,7 @@ const requireFromDaemon = createRequire(
 );
 const Database = requireFromDaemon('better-sqlite3') as typeof import('better-sqlite3');
 
-const [databasePath, daemonEpoch] = process.argv.slice(2);
+const [databasePath, daemonEpoch, mode] = process.argv.slice(2);
 if (!databasePath || !daemonEpoch) {
   throw new Error('Scheduler contender requires a database path and daemon epoch');
 }
@@ -17,14 +17,43 @@ if (!databasePath || !daemonEpoch) {
 const database = new Database(databasePath);
 configureDatabase(database);
 writeSync(1, `${JSON.stringify({ event: 'contender_ready' })}\n`);
-const release = Buffer.alloc(1);
-if (readSync(0, release, 0, 1, null) !== 1) {
-  throw new Error('Scheduler contender release barrier closed');
-}
+const readBarrier = (): void => {
+  const release = Buffer.alloc(1);
+  if (readSync(0, release, 0, 1, null) !== 1) {
+    throw new Error('Scheduler contender release barrier closed');
+  }
+};
+
+readBarrier();
 
 try {
-  const claim = new Scheduler(database, { daemonEpoch }).claimNext();
-  writeSync(1, `${JSON.stringify({ event: 'claim_result', claim })}\n`);
+  const scheduler = new Scheduler(database, { daemonEpoch });
+  if (mode === 'barrier') {
+    database.exec('BEGIN IMMEDIATE');
+    let committed = false;
+    try {
+      writeSync(1, `${JSON.stringify({ event: 'contender_locked' })}\n`);
+      readBarrier();
+      const claim = (
+        scheduler as unknown as { claimWithinTransaction(): unknown }
+      ).claimWithinTransaction();
+      database.exec('COMMIT');
+      committed = true;
+      writeSync(1, `${JSON.stringify({ event: 'claim_result', claim })}\n`);
+    } finally {
+      if (!committed) {
+        try {
+          database.exec('ROLLBACK');
+        } catch (rollbackError) {
+          void rollbackError;
+        }
+      }
+    }
+  } else {
+    writeSync(1, `${JSON.stringify({ event: 'contender_attempting' })}\n`);
+    const claim = scheduler.claimNext();
+    writeSync(1, `${JSON.stringify({ event: 'claim_result', claim })}\n`);
+  }
 } finally {
   database.close();
 }

@@ -153,4 +153,91 @@ describe('SessionRepository read transactions', () => {
       readerDatabase.close();
     }
   });
+
+  it('lists active Sessions by recency with queued normal Turns behind a running Turn', async () => {
+    runtime = createTempRuntime();
+    const workspacePath = join(runtime.rootDir, 'workspace');
+    mkdirSync(workspacePath);
+    const database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    const first = createInitialSession(service, workspacePath);
+    const queued = service.enqueueTurn(
+      { sessionId: first.sessionId, prompt: 'Queued behind the active Turn' },
+      'list-queued',
+    );
+    const workspace = service.registerWorkspace({ path: workspacePath }, 'list-workspace');
+    const second = service.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Archived transaction',
+        prompt: 'Archived prompt',
+      },
+      'list-archived-session',
+    );
+    const third = service.createSession(
+      {
+        workspaceId: workspace.workspaceId,
+        title: 'Tie transaction',
+        prompt: 'Tie prompt',
+      },
+      'list-tie-session',
+    );
+
+    try {
+      database
+        .prepare(
+          `UPDATE turns
+           SET status = 'running', started_at = '2026-07-17T08:00:00.000Z', execution_fence = 1
+           WHERE id = ?`,
+        )
+        .run(first.turnId);
+      database
+        .prepare(
+          `UPDATE sessions
+           SET runtime_status = 'running', current_turn_id = ?, updated_at = '2026-07-17T09:00:00.000Z'
+           WHERE id = ?`,
+        )
+        .run(first.turnId, first.sessionId);
+      database
+        .prepare(
+          `UPDATE sessions
+           SET lifecycle_status = 'archived', updated_at = '2026-07-17T10:00:00.000Z'
+           WHERE id = ?`,
+        )
+        .run(second.sessionId);
+      database
+        .prepare(`UPDATE sessions SET updated_at = '2026-07-17T09:00:00.000Z' WHERE id = ?`)
+        .run(third.sessionId);
+
+      const listed = service.listSessions();
+      expect(listed.sessions.map((session) => session.id)).toEqual(
+        [first.sessionId, third.sessionId].sort().reverse(),
+      );
+      expect(listed.sessions).toEqual(
+        expect.arrayContaining([
+          {
+            id: first.sessionId,
+            title: 'Read transaction',
+            runtimeStatus: 'running',
+            currentTurnId: first.turnId,
+            queuedTurnCount: 1,
+            updatedAt: '2026-07-17T09:00:00.000Z',
+          },
+          {
+            id: third.sessionId,
+            title: 'Tie transaction',
+            runtimeStatus: 'queued',
+            currentTurnId: null,
+            queuedTurnCount: 1,
+            updatedAt: '2026-07-17T09:00:00.000Z',
+          },
+        ]),
+      );
+      expect(
+        database.prepare('SELECT status FROM turns WHERE id = ?').get(queued.turnId),
+      ).toEqual({ status: 'queued' });
+    } finally {
+      database.close();
+    }
+  });
 });

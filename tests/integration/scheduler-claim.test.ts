@@ -31,6 +31,9 @@ const MAX_CONTENDER_OUTPUT_BYTES = 64 * 1024;
 const claimContenderEntryPoint = fileURLToPath(
   new URL('../fixtures/scheduler-claim-contender.ts', import.meta.url),
 );
+const cancelContenderEntryPoint = fileURLToPath(
+  new URL('../fixtures/turn-cancel-contender.ts', import.meta.url),
+);
 
 type RuntimeDatabase = import('better-sqlite3').Database;
 
@@ -100,12 +103,15 @@ const captureFacts = (database: RuntimeDatabase): string =>
 type ClaimContender = {
   readonly child: ChildProcessWithoutNullStreams;
   readonly ready: Promise<void>;
+  readonly attempting: Promise<void>;
+  readonly locked: Promise<void>;
   readonly result: Promise<unknown>;
 };
 
 const spawnClaimContender = (
   databasePath: string,
   daemonEpoch: string,
+  barrier = false,
 ): ClaimContender => {
   const child = spawn(
     process.execPath,
@@ -116,6 +122,7 @@ const spawnClaimContender = (
       claimContenderEntryPoint,
       databasePath,
       daemonEpoch,
+      ...(barrier ? ['barrier'] : []),
     ],
     {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
@@ -129,13 +136,29 @@ const spawnClaimContender = (
   let stdout = '';
   let stderr = '';
   let becameReady = false;
+  let beganAttempt = false;
+  let acquiredLock = false;
   let resolveReady!: () => void;
+  let resolveAttempting!: () => void;
+  let resolveLocked!: () => void;
   let rejectReady!: (error: Error) => void;
+  let rejectAttempting!: (error: Error) => void;
+  let rejectLocked!: (error: Error) => void;
   const ready = new Promise<void>((resolvePromise, rejectPromise) => {
     resolveReady = resolvePromise;
     rejectReady = rejectPromise;
   });
+  const attempting = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveAttempting = resolvePromise;
+    rejectAttempting = rejectPromise;
+  });
+  const locked = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveLocked = resolvePromise;
+    rejectLocked = rejectPromise;
+  });
   void ready.catch(() => undefined);
+  void attempting.catch(() => undefined);
+  void locked.catch(() => undefined);
   const appendBoundedOutput = (current: string, chunk: string): string => {
     const next = current + chunk;
     if (Buffer.byteLength(next, 'utf8') > MAX_CONTENDER_OUTPUT_BYTES) {
@@ -152,6 +175,14 @@ const spawnClaimContender = (
       becameReady = true;
       resolveReady();
     }
+    if (!beganAttempt && stdout.includes('"event":"contender_attempting"')) {
+      beganAttempt = true;
+      resolveAttempting();
+    }
+    if (!acquiredLock && stdout.includes('"event":"contender_locked"')) {
+      acquiredLock = true;
+      resolveLocked();
+    }
   });
   child.stderr.on('data', (chunk: string) => {
     stderr = appendBoundedOutput(stderr, chunk);
@@ -164,6 +195,12 @@ const spawnClaimContender = (
           `Scheduler contender exited before ready: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
         ),
       );
+    }
+    if (!beganAttempt) {
+      rejectAttempting(new Error('Scheduler contender exited before attempting its transaction'));
+    }
+    if (!acquiredLock) {
+      rejectLocked(new Error('Scheduler contender exited before acquiring its transaction lock'));
     }
   });
   const result = (async (): Promise<unknown> => {
@@ -187,7 +224,130 @@ const spawnClaimContender = (
     return resultLine.claim;
   })();
   void result.catch(() => undefined);
-  return { child, ready, result };
+  return { child, ready, attempting, locked, result };
+};
+
+type CancelContenderResult =
+  | { readonly ok: true; readonly result: { readonly turnId: string; readonly status: 'canceled' } }
+  | { readonly ok: false; readonly code: string };
+
+type CancelContender = {
+  readonly child: ChildProcessWithoutNullStreams;
+  readonly ready: Promise<void>;
+  readonly attempting: Promise<void>;
+  readonly locked: Promise<void>;
+  readonly result: Promise<CancelContenderResult>;
+};
+
+const spawnCancelContender = (
+  databasePath: string,
+  sessionId: string,
+  turnId: string,
+  barrier = false,
+): CancelContender => {
+  const child = spawn(
+    process.execPath,
+    [
+      '--conditions=development',
+      '--import',
+      'tsx',
+      cancelContenderEntryPoint,
+      databasePath,
+      sessionId,
+      turnId,
+      ...(barrier ? ['barrier'] : []),
+    ],
+    {
+      cwd: fileURLToPath(new URL('../../', import.meta.url)),
+      env: process.env,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  let stdout = '';
+  let stderr = '';
+  let becameReady = false;
+  let beganAttempt = false;
+  let acquiredLock = false;
+  let resolveReady!: () => void;
+  let resolveAttempting!: () => void;
+  let resolveLocked!: () => void;
+  let rejectReady!: (error: Error) => void;
+  let rejectAttempting!: (error: Error) => void;
+  let rejectLocked!: (error: Error) => void;
+  const ready = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveReady = resolvePromise;
+    rejectReady = rejectPromise;
+  });
+  const attempting = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveAttempting = resolvePromise;
+    rejectAttempting = rejectPromise;
+  });
+  const locked = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveLocked = resolvePromise;
+    rejectLocked = rejectPromise;
+  });
+  void ready.catch(() => undefined);
+  void attempting.catch(() => undefined);
+  void locked.catch(() => undefined);
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk;
+    if (!becameReady && stdout.includes('"event":"contender_ready"')) {
+      becameReady = true;
+      resolveReady();
+    }
+    if (!beganAttempt && stdout.includes('"event":"contender_attempting"')) {
+      beganAttempt = true;
+      resolveAttempting();
+    }
+    if (!acquiredLock && stdout.includes('"event":"contender_locked"')) {
+      acquiredLock = true;
+      resolveLocked();
+    }
+  });
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+  child.once('error', rejectReady);
+  child.once('close', (code, signal) => {
+    if (!becameReady) {
+      rejectReady(
+        new Error(
+          `Cancel contender exited before ready: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+        ),
+      );
+    }
+    if (!beganAttempt) {
+      rejectAttempting(new Error('Cancel contender exited before attempting its transaction'));
+    }
+    if (!acquiredLock) {
+      rejectLocked(new Error('Cancel contender exited before acquiring its transaction lock'));
+    }
+  });
+  const result = (async (): Promise<CancelContenderResult> => {
+    const [code, signal] = (await once(child, 'close')) as [
+      number | null,
+      NodeJS.Signals | null,
+    ];
+    if (code !== 0 || signal !== null) {
+      throw new Error(
+        `Cancel contender failed: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+      );
+    }
+    const resultLine = stdout
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { readonly event?: string; readonly result?: unknown })
+      .find((event) => event.event === 'cancel_result');
+    if (!resultLine) {
+      throw new Error('Cancel contender did not publish a cancel result');
+    }
+    return resultLine.result as CancelContenderResult;
+  })();
+  void result.catch(() => undefined);
+  return { child, ready, attempting, locked, result };
 };
 
 describe('two-slot Scheduler claim', () => {
@@ -375,21 +535,158 @@ describe('two-slot Scheduler claim', () => {
     ).toEqual({ count: 0 });
   });
 
-  it('does not let a canceled ordinal block a later queued Session head', async () => {
+  it('keeps canceled middle ordinals and skips them in Session FIFO order', async () => {
     runtime = createTempRuntime();
     database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
     const service = new SessionService(database);
     const created = createSession(runtime, service, 'canceled-head');
-    const later = service.enqueueTurn(
-      { sessionId: created.sessionId, prompt: 'Later prompt' },
+    const middle = service.enqueueTurn(
+      { sessionId: created.sessionId, prompt: 'Middle prompt' },
       'enqueue-canceled-head-2',
     );
-    database
-      .prepare("UPDATE turns SET status = 'canceled', finished_at = ? WHERE id = ?")
-      .run(NOW, created.turnId);
+    const later = service.enqueueTurn(
+      { sessionId: created.sessionId, prompt: 'Later prompt' },
+      'enqueue-canceled-head-3',
+    );
+    service.cancelTurn(
+      { sessionId: created.sessionId, turnId: middle.turnId },
+      'cancel-canceled-head-2',
+    );
+    service.cancelTurn(
+      { sessionId: created.sessionId, turnId: created.turnId },
+      'cancel-canceled-head-1',
+    );
 
     expect(createScheduler(database).claimNext()?.turnId).toBe(later.turnId);
+    expect(
+      database
+        .prepare('SELECT ordinal, status FROM turns WHERE id = ?')
+        .get(later.turnId),
+    ).toEqual({ ordinal: 3, status: 'running' });
   });
+
+  it('commits a deterministic cancel-win after cancel holds the immediate transaction', async () => {
+    runtime = createTempRuntime();
+    database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    const created = createSession(runtime, service, 'cancel-win-race');
+    const cancel = spawnCancelContender(
+      join(runtime.dataDir, 'runtime.sqlite3'),
+      created.sessionId,
+      created.turnId,
+      true,
+    );
+    const claim = spawnClaimContender(
+      join(runtime.dataDir, 'runtime.sqlite3'),
+      DAEMON_EPOCH,
+    );
+    try {
+      await Promise.all([cancel.ready, claim.ready]);
+      cancel.child.stdin.write(Buffer.from([1]));
+      await cancel.locked;
+      claim.child.stdin.end(Buffer.from([1]));
+      await claim.attempting;
+      cancel.child.stdin.end(Buffer.from([1]));
+      const [canceled, claimed] = await Promise.all([cancel.result, claim.result]);
+      const turn = database
+        .prepare(
+          `SELECT status, started_at AS startedAt, execution_fence AS executionFence
+           FROM turns WHERE id = ?`,
+        )
+        .get(created.turnId);
+      const leaseCount = database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM runner_leases
+           WHERE status = 'active' AND current_turn_id = ?`,
+        )
+        .get(created.turnId);
+      const startedCount = database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM session_events
+           WHERE turn_id = ? AND type = 'turn.started'`,
+        )
+        .get(created.turnId);
+
+      expect(canceled).toEqual({
+        ok: true,
+        result: { turnId: created.turnId, status: 'canceled' },
+      });
+      expect(claimed).toBeNull();
+      expect(turn).toEqual({ status: 'canceled', startedAt: null, executionFence: 0 });
+      expect(leaseCount).toEqual({ count: 0 });
+      expect(startedCount).toEqual({ count: 0 });
+    } finally {
+      for (const contender of [cancel, claim]) {
+        contender.child.stdin.destroy();
+        if (contender.child.exitCode === null && contender.child.signalCode === null) {
+          contender.child.kill('SIGKILL');
+        }
+      }
+      await Promise.allSettled([cancel.result, claim.result]);
+    }
+  }, 10_000);
+
+  it('commits a deterministic claim-win after claim holds the immediate transaction', async () => {
+    runtime = createTempRuntime();
+    database = await openRuntimeDatabase({ dataDir: runtime.dataDir });
+    const service = new SessionService(database);
+    const created = createSession(runtime, service, 'claim-win-race');
+    const claim = spawnClaimContender(
+      join(runtime.dataDir, 'runtime.sqlite3'),
+      DAEMON_EPOCH,
+      true,
+    );
+    const cancel = spawnCancelContender(
+      join(runtime.dataDir, 'runtime.sqlite3'),
+      created.sessionId,
+      created.turnId,
+    );
+    try {
+      await Promise.all([claim.ready, cancel.ready]);
+      claim.child.stdin.write(Buffer.from([1]));
+      await claim.locked;
+      cancel.child.stdin.end(Buffer.from([1]));
+      await cancel.attempting;
+      claim.child.stdin.end(Buffer.from([1]));
+      const [claimed, canceled] = await Promise.all([claim.result, cancel.result]);
+      const turn = database
+        .prepare(
+          `SELECT status, started_at AS startedAt, execution_fence AS executionFence
+           FROM turns WHERE id = ?`,
+        )
+        .get(created.turnId);
+      const leaseCount = database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM runner_leases
+           WHERE status = 'active' AND current_turn_id = ?`,
+        )
+        .get(created.turnId);
+      const startedCount = database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM session_events
+           WHERE turn_id = ? AND type = 'turn.started'`,
+        )
+        .get(created.turnId);
+
+      expect(claimed).toMatchObject({ turnId: created.turnId, executionFence: 1 });
+      expect(canceled).toEqual({ ok: false, code: 'TURN_NOT_CANCELLABLE' });
+      expect(turn).toEqual({
+        status: 'running',
+        startedAt: expect.any(String),
+        executionFence: 1,
+      });
+      expect(leaseCount).toEqual({ count: 1 });
+      expect(startedCount).toEqual({ count: 1 });
+    } finally {
+      for (const contender of [claim, cancel]) {
+        contender.child.stdin.destroy();
+        if (contender.child.exitCode === null && contender.child.signalCode === null) {
+          contender.child.kill('SIGKILL');
+        }
+      }
+      await Promise.allSettled([claim.result, cancel.result]);
+    }
+  }, 10_000);
 
   it.each([
     {

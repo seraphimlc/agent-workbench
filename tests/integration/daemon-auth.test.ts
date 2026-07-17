@@ -228,6 +228,30 @@ describe('daemon authentication', () => {
     await client.waitForClose();
   });
 
+  it.each([
+    ['session.list', {}, null, null],
+    ['turn.cancel', { sessionId: 'session-1', turnId: 'turn-1' }, 'session-1', 'cancel-key'],
+  ])(
+    'rejects unauthenticated %s before it can read, mutate, or wake execution',
+    async (method, payload, sessionId, clientRequestId) => {
+      runtime = createTempRuntime();
+      const daemon = runtime.spawnDaemon();
+      await daemon.waitForReady();
+      client = await connectRpcClient(runtime.socketPath);
+      await client.waitForChallenge();
+      const request = {
+        ...client.createRequest(method as 'session.list' | 'turn.cancel', payload),
+        sessionId,
+        clientRequestId,
+      };
+
+      const response = await client.sendRequest(request);
+
+      expectAuthFailure(response, request);
+      await client.waitForClose();
+    },
+  );
+
   it('full-closes an allow-half-open peer after flushing a canonical authentication failure', async () => {
     runtime = createTempRuntime();
     directServer = new DaemonServer({

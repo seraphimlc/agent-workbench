@@ -57,6 +57,18 @@ export const domainErrors = {
       'Session was not found',
       'Refresh and choose an existing session',
     ),
+  turnNotFound: (): DomainError =>
+    domainFailure(
+      'TURN_NOT_FOUND',
+      'Turn was not found in this session',
+      'Refresh the session and choose an existing turn',
+    ),
+  turnNotCancellable: (): DomainError =>
+    domainFailure(
+      'TURN_NOT_CANCELLABLE',
+      'Only queued turns can be canceled',
+      'Wait for the current turn to finish or choose a queued turn',
+    ),
   eventCursorAhead: (): DomainError =>
     domainFailure(
       'EVENT_CURSOR_AHEAD',
