@@ -180,6 +180,11 @@ export const runDaemon = async (
           ? createRunnerExecutionDriver({
               dataDir: options.dataDir,
               ...dependencies.runner,
+              secrets: [
+                ...(dependencies.runner.secrets ?? []),
+                bootstrapSecret.toString('hex'),
+                bootstrapSecret.toString('base64'),
+              ],
             })
           : createUnavailableExecutionDriver());
   const server = new DaemonServer({

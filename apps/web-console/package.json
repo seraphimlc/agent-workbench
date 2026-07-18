@@ -1,0 +1,38 @@
+{
+  "name": "@agent-workbench/web-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --conditions=development --import tsx src/server/index.ts",
+    "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
+    "typecheck:client": "tsc -p tsconfig.client.json --noEmit",
+    "typecheck": "pnpm typecheck:server && pnpm typecheck:client",
+    "build:server": "rm -rf dist && tsc -p tsconfig.server.json --outDir dist --sourceMap",
+    "build:client": "vite build",
+    "build": "pnpm build:server && pnpm build:client",
+    "test": "vitest --root ../.. --config vitest.config.ts run apps/web-console/src/server"
+  },
+  "dependencies": {
+    "@agent-workbench/daemon": "workspace:*",
+    "@agent-workbench/protocol": "workspace:*",
+    "@agent-workbench/session-runner": "workspace:*",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@agent-workbench/testkit": "workspace:*",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "jsdom": "^29.1.1",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "vite": "8.1.4",
+    "vitest": "4.1.10"
+  }
+}

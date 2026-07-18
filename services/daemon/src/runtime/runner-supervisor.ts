@@ -13,7 +13,12 @@ import {
 import type Database from 'better-sqlite3';
 
 import { openRuntimeDatabase } from '../db/database.js';
-import { ModelGateway, type ModelAdapter } from '../model/model-gateway.js';
+import {
+  ModelGateway,
+  selectBuiltinToolDefinitions,
+  type ModelAdapter,
+} from '../model/model-gateway.js';
+import { redactAndLimit } from '../security/secret-redactor.js';
 import { ToolGateway } from '../tools/tool-gateway.js';
 import type { ExecutionDriver, ExecutionRun } from './execution-coordinator.js';
 import { RunnerChannel } from './runner-channel.js';
@@ -119,13 +124,7 @@ const outputText = (
   chunks: readonly Buffer[],
   secrets: readonly string[],
   limit: number,
-): string => {
-  let value = Buffer.concat(chunks).toString('utf8');
-  for (const secret of secrets) {
-    if (secret.length > 0) value = value.split(secret).join('[REDACTED]');
-  }
-  return Buffer.from(value, 'utf8').subarray(0, limit).toString('utf8');
-};
+): string => redactAndLimit(Buffer.concat(chunks).toString('utf8'), secrets, limit);
 
 const runnerErrorCode = (stderr: string): string | undefined => {
   for (const line of stderr.trim().split('\n').reverse()) {
@@ -558,6 +557,8 @@ const errorCodeOf = (error: unknown): string =>
 class RunnerExecutionDriver implements ExecutionDriver {
   private readonly supervisor: RunnerSupervisor;
   private readonly hooks: DriverHooks;
+  private readonly modelTools: readonly unknown[];
+  private readonly secrets: readonly string[];
   private databasePromise: Promise<Database.Database> | undefined;
   private database: Database.Database | undefined;
   private pendingStart: DriverPendingStart | undefined;
@@ -585,17 +586,22 @@ class RunnerExecutionDriver implements ExecutionDriver {
           }) => Promise<{ readonly content: string }>
         >
       >;
+      readonly secrets: readonly string[];
       readonly hooks: DriverHooks;
     },
   ) {
     this.hooks = options.hooks;
+    this.modelTools = selectBuiltinToolDefinitions(Object.keys(options.toolHandlers));
+    this.secrets = Object.freeze([
+      ...new Set([options.provider.apiKey, ...options.secrets].filter((secret) => secret.length > 0)),
+    ]);
     this.supervisor = new RunnerSupervisor({
       runnerEntryPoint: options.runnerEntryPoint,
       readyTimeoutMs: 5_000,
       heartbeatIntervalMs: 5_000,
       heartbeatExpiryMs: 20_000,
       maxCycles: 64,
-      secrets: [options.provider.apiKey],
+      secrets: this.secrets,
       onHeartbeat: (binding) => this.persistHeartbeat(binding),
       beforeBind: async (binding, identity) => {
         await this.persistExecutorIdentity(binding, identity);
@@ -719,10 +725,12 @@ class RunnerExecutionDriver implements ExecutionDriver {
             const gateway = new ModelGateway(database, {
               adapter: this.options.modelAdapter,
               provider: this.options.provider,
+              secrets: this.secrets,
+              tools: this.modelTools,
             });
             const result = await gateway.call({
               binding: active.claim,
-              messages: request.payload.messages as unknown as never,
+              messages: request.payload.messages,
               signal: abort.signal,
               abortDisposition: 'external_interrupt',
             });
@@ -736,6 +744,7 @@ class RunnerExecutionDriver implements ExecutionDriver {
           const database = await this.getDatabase();
           const gateway = new ToolGateway(database, {
             handlers: this.options.toolHandlers,
+            secrets: this.secrets,
           });
           const result = await gateway.execute({
             binding: active.claim,
@@ -962,6 +971,7 @@ export const createRunnerExecutionDriver = (options: {
       }) => Promise<{ readonly content: string }>
     >
   >;
+  readonly secrets?: readonly string[];
   readonly hooks?: DriverHooks;
 }): ExecutionDriver =>
   new RunnerExecutionDriver({
@@ -970,5 +980,6 @@ export const createRunnerExecutionDriver = (options: {
     modelAdapter: options.modelAdapter,
     provider: options.provider,
     toolHandlers: options.toolHandlers ?? {},
+    secrets: options.secrets ?? [],
     hooks: options.hooks ?? {},
   });

@@ -1,16 +1,15 @@
 import { createHash } from 'node:crypto';
 
+import type { RunnerModelMessage } from '@agent-workbench/protocol';
 import type Database from 'better-sqlite3';
 import { v7 as uuidv7 } from 'uuid';
 
 import { ExecutionRepository } from '../db/execution-repository.js';
 import { SessionEventWriter } from '../db/session-event-writer.js';
 import type { Claim } from '../runtime/scheduler.js';
+import { redactSecrets } from '../security/secret-redactor.js';
 
-export type ModelMessage = {
-  readonly role: 'system' | 'user';
-  readonly content: string;
-};
+export type ModelMessage = RunnerModelMessage;
 
 export type ProviderToolCall = {
   readonly logicalCallId: string;
@@ -56,8 +55,8 @@ type ValidatedToolCall = ProviderToolCall & {
   readonly normalizedInputHash: string;
 };
 
-const BUILTIN_TOOLS = [
-  {
+export const BUILTIN_TOOL_DEFINITIONS = Object.freeze({
+  'fs.read_text': {
     toolId: 'fs.read_text',
     type: 'function',
     function: {
@@ -70,7 +69,7 @@ const BUILTIN_TOOLS = [
       },
     },
   },
-  {
+  'fs.write_text': {
     toolId: 'fs.write_text',
     type: 'function',
     function: {
@@ -86,7 +85,31 @@ const BUILTIN_TOOLS = [
       },
     },
   },
-] as const;
+} as const);
+
+type BuiltinToolId = keyof typeof BUILTIN_TOOL_DEFINITIONS;
+
+export const selectBuiltinToolDefinitions = (
+  toolIds: readonly string[],
+): readonly unknown[] =>
+  toolIds.map((toolId) => {
+    if (!Object.hasOwn(BUILTIN_TOOL_DEFINITIONS, toolId)) {
+      throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id is not allowlisted');
+    }
+    return BUILTIN_TOOL_DEFINITIONS[toolId as BuiltinToolId];
+  });
+
+const DEFAULT_BUILTIN_TOOLS = Object.freeze(
+  selectBuiltinToolDefinitions(Object.keys(BUILTIN_TOOL_DEFINITIONS)),
+);
+
+const toolDefinitionId = (definition: unknown): string | undefined => {
+  if (typeof definition !== 'object' || definition === null || Array.isArray(definition)) {
+    return undefined;
+  }
+  const toolId = (definition as Record<string, unknown>).toolId;
+  return typeof toolId === 'string' && toolId.length > 0 ? toolId : undefined;
+};
 
 const sha256 = (value: string): string =>
   createHash('sha256').update(value, 'utf8').digest('hex');
@@ -111,6 +134,37 @@ const parseObject = (json: string): Record<string, unknown> => {
   }
   return parsed as Record<string, unknown>;
 };
+
+const redactJsonValue = (value: unknown, secrets: readonly string[]): unknown => {
+  if (typeof value === 'string') return redactSecrets(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => redactJsonValue(item, secrets));
+  if (typeof value !== 'object' || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, redactJsonValue(item, secrets)]),
+  );
+};
+
+const redactArgumentsJson = (
+  argumentsJson: string,
+  secrets: readonly string[],
+): string => JSON.stringify(redactJsonValue(parseObject(argumentsJson), secrets));
+
+const redactProviderResult = (
+  result: ProviderResult,
+  secrets: readonly string[],
+): ProviderResult => ({
+  ...result,
+  content: result.content === null ? null : redactSecrets(result.content, secrets),
+  toolCalls: result.toolCalls.map((toolCall) => ({
+    logicalCallId: redactSecrets(toolCall.logicalCallId, secrets),
+    toolId: redactSecrets(toolCall.toolId, secrets),
+    argumentsJson: redactArgumentsJson(toolCall.argumentsJson, secrets),
+  })),
+  providerRequestId:
+    result.providerRequestId === null
+      ? null
+      : redactSecrets(result.providerRequestId, secrets),
+});
 
 const validateArguments = (toolId: string, argumentsJson: string): void => {
   const input = parseObject(argumentsJson);
@@ -138,7 +192,10 @@ const validateArguments = (toolId: string, argumentsJson: string): void => {
   throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id is not allowlisted');
 };
 
-const validateProviderResult = (result: ProviderResult): ValidatedToolCall[] => {
+const validateProviderResult = (
+  result: ProviderResult,
+  authorizedToolIds: ReadonlySet<string>,
+): ValidatedToolCall[] => {
   if (result.finishReason === 'stop') {
     if (
       result.content === null ||
@@ -161,6 +218,9 @@ const validateProviderResult = (result: ProviderResult): ValidatedToolCall[] => 
     ) {
       throw new ModelGatewayError('MODEL_RESPONSE_INVALID', 'Tool Call identity is invalid');
     }
+    if (!authorizedToolIds.has(toolCall.toolId)) {
+      throw new ModelGatewayError('MODEL_TOOL_UNAUTHORIZED', 'Tool id was not advertised');
+    }
     logicalIds.add(toolCall.logicalCallId);
     validateArguments(toolCall.toolId, toolCall.argumentsJson);
     return {
@@ -180,6 +240,9 @@ export class ModelGateway {
     readonly modelId: string;
     readonly apiKey: string;
   };
+  private readonly tools: readonly unknown[];
+  private readonly authorizedToolIds: ReadonlySet<string>;
+  private readonly secrets: readonly string[];
   private readonly now: () => Date;
   private readonly createId: () => string;
 
@@ -192,12 +255,21 @@ export class ModelGateway {
         readonly modelId: string;
         readonly apiKey: string;
       };
+      readonly tools?: readonly unknown[];
+      readonly secrets?: readonly string[];
       readonly now?: () => Date;
       readonly createId?: () => string;
     },
   ) {
     this.adapter = options.adapter;
     this.provider = { ...options.provider };
+    this.tools = Object.freeze([...(options.tools ?? DEFAULT_BUILTIN_TOOLS)]);
+    this.authorizedToolIds = new Set(
+      this.tools
+        .map((tool) => toolDefinitionId(tool))
+        .filter((toolId): toolId is string => toolId !== undefined),
+    );
+    this.secrets = Object.freeze([...(options.secrets ?? [])]);
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? uuidv7;
     this.repository = new ExecutionRepository(database);
@@ -224,7 +296,7 @@ export class ModelGateway {
         endpoint: this.provider.endpoint,
         modelId: this.provider.modelId,
         messages: input.messages,
-        tools: BUILTIN_TOOLS,
+        tools: this.tools,
       }),
     );
 
@@ -315,7 +387,7 @@ export class ModelGateway {
         modelId: this.provider.modelId,
         apiKey: this.provider.apiKey,
         messages: input.messages,
-        tools: BUILTIN_TOOLS,
+        tools: this.tools,
         ...(input.signal ? { signal: input.signal } : {}),
       });
     } catch (error) {
@@ -331,9 +403,11 @@ export class ModelGateway {
       throw new ModelGatewayError(code, error instanceof Error ? error.message : code);
     }
 
+    let safeProviderResult: ProviderResult;
     let toolCalls: ValidatedToolCall[];
     try {
-      toolCalls = validateProviderResult(providerResult);
+      safeProviderResult = redactProviderResult(providerResult, this.secrets);
+      toolCalls = validateProviderResult(safeProviderResult, this.authorizedToolIds);
     } catch (error) {
       const code = errorCode(error) ?? 'MODEL_RESPONSE_INVALID';
       this.commitFailure(input.binding, modelCallId, modelAttemptId, operationKey, code);
@@ -342,9 +416,9 @@ export class ModelGateway {
 
     const finishedAt = this.now().toISOString();
     const normalizedResult = {
-      finishReason: providerResult.finishReason,
-      content: providerResult.content,
-      toolCalls: providerResult.toolCalls,
+      finishReason: safeProviderResult.finishReason,
+      content: safeProviderResult.content,
+      toolCalls: safeProviderResult.toolCalls,
     };
     try {
       this.database.transaction(() => {
@@ -377,9 +451,9 @@ export class ModelGateway {
                AND finished_at IS NULL`,
           )
           .run(
-            providerResult.providerRequestId,
+            safeProviderResult.providerRequestId,
             JSON.stringify(normalizedResult),
-            providerResult.finishReason,
+            safeProviderResult.finishReason,
             usage?.inputTokens ?? null,
             usage?.outputTokens ?? null,
             usage?.cachedTokens ?? null,
@@ -422,7 +496,7 @@ export class ModelGateway {
             operationKey,
             JSON.stringify({
               status: 'succeeded',
-              providerRequestId: providerResult.providerRequestId,
+              providerRequestId: safeProviderResult.providerRequestId,
             }),
             finishedAt,
           );
@@ -433,9 +507,9 @@ export class ModelGateway {
 
     return {
       modelAttemptId,
-      finishReason: providerResult.finishReason,
-      content: providerResult.content,
-      toolCalls: providerResult.toolCalls,
+      finishReason: safeProviderResult.finishReason,
+      content: safeProviderResult.content,
+      toolCalls: safeProviderResult.toolCalls,
     };
   }
 

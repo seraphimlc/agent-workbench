@@ -11,11 +11,13 @@ export type ScriptedChunk =
 
 export type FakeOpenAiScript = {
   readonly expectedRequest: {
-    readonly method: 'POST';
-    readonly path: '/v1/chat/completions';
+    readonly method: 'GET' | 'POST';
+    readonly path: string;
     readonly headers: Readonly<Record<string, string>>;
-    readonly jsonBody: unknown;
+    readonly jsonBody?: unknown;
   };
+  readonly onRequestMatched?: () => void;
+  readonly onRequestAborted?: () => void;
   readonly response: {
     readonly status?: number;
     readonly headers?: Readonly<Record<string, string>>;
@@ -59,6 +61,7 @@ export const startFakeOpenAiServer = async (input: {
   let resolveCompleted!: () => void;
   let rejectCompleted!: (error: unknown) => void;
   let completionSettled = false;
+  let unexpectedRequestError: Error | undefined;
   const completed = new Promise<void>((resolve, reject) => {
     resolveCompleted = resolve;
     rejectCompleted = reject;
@@ -82,11 +85,18 @@ export const startFakeOpenAiServer = async (input: {
     const script = scripts.shift();
     if (!script) {
       const error = new Error('Fake OpenAI Server received an unexpected request');
+      unexpectedRequestError ??= error;
       fail(error);
       response.writeHead(500).end(error.message);
       return;
     }
     activeRequests += 1;
+    let requestAborted = false;
+    const handleResponseClose = (): void => {
+      if (response.writableEnded || requestAborted) return;
+      requestAborted = true;
+      script.onRequestAborted?.();
+    };
 
     try {
       const body = await readBody(request);
@@ -102,18 +112,24 @@ export const startFakeOpenAiServer = async (input: {
           throw new Error(`Expected request header ${name}=${expected}, received ${String(actual)}`);
         }
       }
-      let jsonBody: unknown;
-      try {
-        jsonBody = JSON.parse(body.toString('utf8')) as unknown;
-      } catch {
-        throw new Error('Fake OpenAI Server request body is not valid JSON');
-      }
-      if (stableJson(jsonBody) !== stableJson(script.expectedRequest.jsonBody)) {
-        throw new Error(
-          `Unexpected request JSON: ${stableJson(jsonBody)} expected ${stableJson(script.expectedRequest.jsonBody)}`,
-        );
+      if (Object.hasOwn(script.expectedRequest, 'jsonBody')) {
+        let jsonBody: unknown;
+        try {
+          jsonBody = JSON.parse(body.toString('utf8')) as unknown;
+        } catch {
+          throw new Error('Fake OpenAI Server request body is not valid JSON');
+        }
+        if (stableJson(jsonBody) !== stableJson(script.expectedRequest.jsonBody)) {
+          throw new Error(
+            `Unexpected request JSON: ${stableJson(jsonBody)} expected ${stableJson(script.expectedRequest.jsonBody)}`,
+          );
+        }
+      } else if (body.byteLength !== 0) {
+        throw new Error('Fake OpenAI Server request body was not expected');
       }
 
+      response.once('close', handleResponseClose);
+      script.onRequestMatched?.();
       response.writeHead(script.response.status ?? 200, script.response.headers ?? {});
       for (const chunk of script.response.chunks) {
         const scripted = chunk instanceof Uint8Array ? { bytes: chunk } : chunk;
@@ -131,6 +147,7 @@ export const startFakeOpenAiServer = async (input: {
       }
       response.end(error instanceof Error ? error.message : 'Fake OpenAI Server failed');
     } finally {
+      response.off('close', handleResponseClose);
       activeRequests -= 1;
       settleCompleted();
     }
@@ -172,6 +189,9 @@ export const startFakeOpenAiServer = async (input: {
         }
       });
       await closePromise;
+      if (unexpectedRequestError !== undefined) {
+        throw unexpectedRequestError;
+      }
     },
   };
 };
